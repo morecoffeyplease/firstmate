@@ -23,6 +23,8 @@ Expect periodic stale escalations on a healthy Codex worker and reconcile them b
 
 ## Launch gates
 
+Gate sequence, selection defaults, and option text verified on 2026-09-09 with codex-cli 0.153.4.
+
 A first run for a repository root can present two gates in sequence, and the launch is not underway until both are cleared.
 Clearing only the first leaves the agent parked with its launch brief unread.
 
@@ -32,11 +34,12 @@ The decision persists for the repository, so later worktrees of the same project
 
 The second appears when that root's `.codex/hooks.json` is new or changed: "Hooks need review", offering `1. Review hooks`, `2. Trust all and continue`, and `3. Continue without trusting (hooks won't run)`.
 Its selection starts on `1. Review hooks`, so Enter alone opens the review rather than accepting, and accepting requires moving the selection first.
-Firstmate's own key plane carries only Enter, Escape, and C-c with no selection movement, so it cannot answer this gate; move the selection through the backend's own key facility, or hand the gate to the operator.
+Firstmate's own key plane carries no selection movement - `../../../bin/fm-control-lib.sh` accepts only Enter, Escape, C-c, and C-u - so it cannot answer this gate; move the selection through the backend's own key facility, or hand the gate to the operator.
 
 Read the hooks before choosing rather than trusting blind.
 For a Firstmate-launched worker or secondmate these are Firstmate's own tracked hooks - session start, the Bash pre-tool checks, and the turn-end guard - each anchored to a Firstmate-shaped root and written to exit 0 when anything is missing.
-`3. Continue without trusting` is the costly wrong answer: the agent runs, but its turn-end guard never fires, so that worker ends turns with no supervision backstop and nothing announces the loss.
+Codex's own option text declares that declining leaves hooks unrun, and the turn-end guard is one of the hooks that gate registers, so `3. Continue without trusting` launches a worker whose turn-end backstop is not installed.
+That consequence follows from the option's declared behavior and the registered hook set; it has not been separately exercised, and nothing in the pane announces it after the choice is made.
 
 ## Skill popup
 
