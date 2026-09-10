@@ -347,6 +347,11 @@ test_active_dispatch_profile_allows_explicit_harness() {
   launch=$(cat "$LAUNCH_LOG")
   assert_contains "$launch" "codex --model 'gpt-5' -c 'model_reasoning_effort=\"high\"' --dangerously-bypass-approvals-and-sandbox" \
     "explicit harness launch did not thread model and effort"
+  # A dropped hook-trust flag is invisible in a launch diff and parks the worker
+  # on a menu firstmate's key plane cannot answer, so it is asserted rather than
+  # assumed.
+  assert_contains "$launch" "--dangerously-bypass-hook-trust" \
+    "codex crewmate launch lost the hook-trust bypass; the worker will park on the hooks-review dialog"
   pass "active crew-dispatch profile allows an explicit resolved harness"
 }
 

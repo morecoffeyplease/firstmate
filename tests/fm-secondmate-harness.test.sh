@@ -858,6 +858,10 @@ test_spawn_explicit_harness_does_not_inherit_secondmate_harness_tokens() {
   launch=$(cat "$launchlog")
   assert_contains "$launch" "codex --dangerously-bypass-approvals-and-sandbox" \
     "explicit-harness-no-tokens: launch did not use codex"
+  # Same guard on the secondmate template: the two templates are separate
+  # strings and a flag added to one can silently miss the other.
+  assert_contains "$launch" "--dangerously-bypass-hook-trust" \
+    "explicit-harness-no-tokens: secondmate launch lost the hook-trust bypass"
   assert_not_contains "$launch" "--model" "explicit-harness-no-tokens: launch must not carry a --model flag"
   assert_not_contains "$launch" "model_reasoning_effort" \
     "explicit-harness-no-tokens: launch must not carry a codex effort flag"
