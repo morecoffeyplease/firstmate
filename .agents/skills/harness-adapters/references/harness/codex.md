@@ -35,9 +35,25 @@ A Codex secondmate is deliberately excluded from pre-registration because its ho
 
 The second appears when that root's `.codex/hooks.json` is new or changed: "Hooks need review", offering `1. Review hooks`, `2. Trust all and continue`, and `3. Continue without trusting (hooks won't run)`.
 Its selection starts on `1. Review hooks`, so Enter alone opens the review rather than accepting, and accepting requires moving the selection first.
-Firstmate's own key plane carries no selection movement - `../../../bin/fm-control-lib.sh` accepts only Enter, Escape, C-c, and C-u - so it cannot answer this gate; move the selection through the backend's own key facility, or hand the gate to the operator.
+Firstmate's own key plane carries no selection movement - `../../../bin/fm-control-lib.sh` accepts only Enter, Escape, C-c, and C-u - so it cannot answer this gate.
 
-Read the hooks before choosing rather than trusting blind.
+**A Firstmate-launched Codex worker no longer meets this gate.** Both launch templates in
+`../../../bin/fm-spawn.sh` pass `--dangerously-bypass-hook-trust`, which Codex documents as running
+enabled hooks without requiring persisted hook trust for that invocation.
+So the gate is bypassed rather than answered, and the guidance below applies only where that flag is
+absent: a raw launch command (`RAW_LAUNCH`), a manual `codex resume <session-id>`, or a remote host not
+yet running this revision.
+In those cases move the selection through the backend's own key facility, or hand the gate to the
+operator.
+
+The flag's own help scopes it to automation that already vets its hook sources, and per-worktree hook
+trust is not an available alternative: the store is keyed
+`<absolute hooks.json path>:<event>:<group>:<index>` with a `trusted_hash`, and six candidate hash
+inputs were tested against every stored entry without a match, so the value is not reproducible from
+outside Codex. The precondition is therefore carried as a recorded rule rather than a mechanism, and
+reading a project's tracked `.codex/hooks.json` at registration is the open follow-up.
+
+Read the hooks before relying on that bypass rather than trusting blind.
 For a Firstmate-launched worker or secondmate these are Firstmate's own tracked hooks - session start, the Bash pre-tool checks, and the turn-end guard - each anchored to a Firstmate-shaped root and written to exit 0 when anything is missing.
 Codex's own option text declares that declining leaves hooks unrun, and the turn-end guard is one of the hooks that gate registers, so `3. Continue without trusting` launches a worker whose turn-end backstop is not installed.
 That consequence follows from the option's declared behavior and the registered hook set; it has not been separately exercised, and nothing in the pane announces it after the choice is made.
