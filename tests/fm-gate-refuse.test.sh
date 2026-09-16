@@ -21,10 +21,6 @@
 # those runs stand in a controlled NON-gate repo, so the suite is hermetic even
 # when it is itself executed inside the real no-mistakes gate (whose process has
 # NO_MISTAKES_GATE=1 and a gate-worktree cwd).
-#
-# Finally, assert firstmate's TRACKED .no-mistakes.yaml parses and sets
-# disable_project_settings: true (the trusted-only opt-out that neutralizes gate
-# agents' project instructions on the no-mistakes side).
 set -u
 
 # shellcheck source=tests/fixtures.sh
