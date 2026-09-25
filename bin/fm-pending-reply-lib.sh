@@ -1436,7 +1436,7 @@ fm_pending_reply_tick_one() {  # <state-dir> <corr_id> <busy_state> [secondmate-
 # state, and optional secondmate-home wrong-home path checks.
 fm_pending_reply_tick() {  # <state-dir>
   local state=$1 dir rec corr task_id phase delivered meta backend target label busy sm_home harness remote_host
-  local observation observation_task found i
+  local observation observation_task found i progress_hook=${2-}
   local -a observation_tasks=() observation_values=()
   dir=$(fm_pending_reply_dir "$state")
   [ -d "$dir" ] || return 0
@@ -1538,6 +1538,11 @@ fm_pending_reply_tick() {  # <state-dir>
           fi
           observation_tasks+=("$task_id")
           observation_values+=("$observation")
+          # Watcher callers may publish liveness after each completed endpoint
+          # observation. A stalled observation itself does not refresh the beat.
+          if [ -n "$progress_hook" ] && declare -F "$progress_hook" >/dev/null 2>&1; then
+            "$progress_hook"
+          fi
         fi
         busy=$(fm_pending_reply_busy_state_from_observation "$rec" "$observation")
       fi

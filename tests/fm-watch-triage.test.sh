@@ -69,10 +69,9 @@ wait_live() {
 # machine a short fixed budget can reap a round before the cycle it asserts on
 # ever ran - and then every "no wake, no marker" assertion passes vacuously
 # while every "marker written" assertion fails spuriously.
-# The liveness beacon is touched at the TOP of every poll, so this drops any
-# beacon left by an earlier round, waits for THIS watcher to write a fresh one
-# (some poll's top), then waits for that one to advance (the next poll's top) -
-# and the whole cycle in between is what the caller's assertions describe.
+# The liveness beacon is touched at the top of every poll and after completed
+# work units. Drop any earlier beacon, wait for this watcher to write a fresh
+# one, then wait for a later one before checking cycle effects.
 # 0 if the watcher is still alive after a completed cycle, 1 if it exited.
 wait_poll_cycle() {  # <state> <pid> [limit-ticks]
   local state=$1 pid=$2 limit=${3:-300} beat first now i=0
@@ -5084,6 +5083,65 @@ test_paused_until_that_passed_is_rechecked_before_the_cadence() {
   pass "a declared wait whose until time has passed is rechecked at once, then held to the cadence"
 }
 
+test_slow_cycle_beats_after_completed_windows() {
+  local dir state fakebin out marker capture pid i guard
+  dir=$(make_case slow-cycle-progress); state="$dir/state"; fakebin="$dir/fakebin"
+  out="$dir/watch.out"; marker="$dir/captures"; capture="$dir/pane.txt"
+  : > "$marker"
+  printf 'fixture pane\n' > "$capture"
+  for id in a b c d; do
+    printf 'window=fixture:fm-%s\nkind=ship\n' "$id" > "$state/$id.meta"
+  done
+  PATH="$fakebin:$PATH" FM_HOME="$dir" FM_STATE_OVERRIDE="$state" \
+    FM_FAKE_TMUX_CAPTURE="$capture" FM_FAKE_TMUX_CAPTURE_SLEEP=0.9 \
+    FM_FAKE_TMUX_CAPTURE_MARKER="$marker" FM_POLL=1 FM_SIGNAL_GRACE=1 \
+    FM_CHECK_INTERVAL=999999 FM_HEARTBEAT=999999 "$WATCH" > "$out" 2>&1 &
+  pid=$!
+  i=0
+  while [ "$(wc -l < "$marker" 2>/dev/null | tr -d '[:space:]')" != 4 ] && [ "$i" -lt 200 ]; do
+    kill -0 "$pid" 2>/dev/null || { reap "$pid"; fail "watcher exited during the slow cycle"; }
+    sleep 0.05
+    i=$((i + 1))
+  done
+  [ "$i" -lt 200 ] || { reap "$pid"; fail "watcher did not reach its fourth slow window"; }
+  sleep 0.4
+  guard=$(FM_HOME="$dir" FM_STATE_OVERRIDE="$state" FM_GUARD_GRACE=3 \
+    FM_SUPERVISION_MODEL=persistent "$ROOT/bin/fm-guard.sh" 2>&1)
+  assert_not_contains "$guard" 'WATCHER DOWN - SUPERVISION IS OFF' \
+    "completed slow windows should keep the live watcher beacon fresh"
+  reap "$pid"
+  pass "slow multi-window cycles publish fresh beats at completed-window boundaries"
+}
+
+test_hung_window_does_not_refresh_watcher_beat() {
+  local dir state fakebin out marker capture release pid i guard
+  dir=$(make_case hung-window); state="$dir/state"; fakebin="$dir/fakebin"
+  out="$dir/watch.out"; marker="$dir/captures"; capture="$dir/pane.txt"; release="$dir/release-capture"
+  : > "$marker"
+  printf 'fixture pane\n' > "$capture"
+  printf 'window=fixture:fm-hung\nkind=ship\n' > "$state/hung.meta"
+  PATH="$fakebin:$PATH" FM_HOME="$dir" FM_STATE_OVERRIDE="$state" \
+    FM_FAKE_TMUX_CAPTURE="$capture" FM_FAKE_TMUX_CAPTURE_BLOCK_FILE="$release" \
+    FM_FAKE_TMUX_CAPTURE_MARKER="$marker" FM_POLL=1 FM_SIGNAL_GRACE=1 \
+    FM_CHECK_INTERVAL=999999 FM_HEARTBEAT=999999 "$WATCH" > "$out" 2>&1 &
+  pid=$!
+  i=0
+  while [ ! -s "$marker" ] && [ "$i" -lt 100 ]; do
+    kill -0 "$pid" 2>/dev/null || { reap "$pid"; fail "watcher exited before the hung capture"; }
+    sleep 0.05
+    i=$((i + 1))
+  done
+  [ -s "$marker" ] || { reap "$pid"; fail "watcher did not enter the blocking backend capture"; }
+  sleep 2.2
+  guard=$(FM_HOME="$dir" FM_STATE_OVERRIDE="$state" FM_GUARD_GRACE=2 \
+    FM_SUPERVISION_MODEL=persistent "$ROOT/bin/fm-guard.sh" 2>&1)
+  assert_contains "$guard" 'WATCHER DOWN - SUPERVISION IS OFF' \
+    "a blocked backend call must still age out as a stale watcher"
+  : > "$release"
+  reap "$pid"
+  pass "a watcher blocked inside one window receives no synthetic liveness refresh"
+}
+
 
 test_status_span_actionable_classifier
 test_status_span_survives_a_later_routine_append
@@ -5201,3 +5259,5 @@ test_afk_one_shot_never_hands_off_captain_held_under_away_record
 test_paused_until_near_future_is_quiet_before_the_cadence
 test_paused_until_wrong_year_is_bounded_by_the_cadence
 test_paused_until_that_passed_is_rechecked_before_the_cadence
+test_slow_cycle_beats_after_completed_windows
+test_hung_window_does_not_refresh_watcher_beat

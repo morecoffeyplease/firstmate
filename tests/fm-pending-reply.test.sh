@@ -1018,13 +1018,15 @@ test_kimi_capture_fallback_uses_recorded_harness() (
 
 test_tick_skips_terminal_and_reuses_target_observation() {
   (
-    local home state open1 open2 resolved escalated rec probe_log probes scan_log scans snapshot
+    local home state open1 open2 resolved escalated rec probe_log probes scan_log scans snapshot progress_log progress_count
     home=$(setup_parent observation-cache)
     state="$home/state"
     probe_log="$home/backend-probes.log"
     scan_log="$home/status-scans.log"
+    progress_log="$home/progress.log"
     : > "$probe_log"
     : > "$scan_log"
+    : > "$progress_log"
     # This fixture clock is intentionally scoped to the isolated subshell.
     # shellcheck disable=SC2030,SC2031
     export FM_PENDING_REPLY_NOW=10100
@@ -1065,9 +1067,14 @@ test_tick_skips_terminal_and_reuses_target_observation() {
       done < "$status_file"
       return 0
     }
-    fm_pending_reply_tick "$state"
+    # shellcheck disable=SC2329
+    pending_progress() { printf 'completed\n' >> "$progress_log"; }
+    fm_pending_reply_tick "$state" pending_progress
     probes=$(wc -l < "$probe_log" | tr -d ' ')
     [ "$probes" = 1 ] || fail "two open records for one target should use one probe, got $probes"
+    progress_count=$(wc -l < "$progress_log" | tr -d ' ')
+    [ "$progress_count" = 1 ] \
+      || fail "one shared endpoint observation should publish one progress callback, got $progress_count"
     rec=$(fm_pending_reply_path "$state" "$open1")
     [ "$(fm_pending_reply_get "$rec" turn_seen_busy)" = 1 ] \
       || fail "cached observation should update the first open record"

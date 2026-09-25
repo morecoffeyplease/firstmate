@@ -209,12 +209,14 @@ fi
 # turn-ended signature, annotation staleness checks, and guarded bookkeeping writes.
 
 POLL=${FM_POLL:-15}                   # seconds between cycles
-# The liveness beacon is touched once per cycle, immediately before the
-# terminal wait below (event_wait_or_sleep) as well as at the top of the next
-# one, so a healthy cycle's beacon can legitimately age up to POLL seconds
-# between touches. fm_poll_derived_grace (bin/fm-wake-lib.sh, already sourced
-# transitively above) is the single owner of the max(300, poll+60)
-# derivation - see docs/turnend-guard.md "Guard grace and the poll cadence".
+# The liveness beacon is touched at cycle start, after completed backend
+# observations and window triage, and once before the terminal wait. A single
+# blocked operation receives no refresh, while a cycle with several slow but
+# completed operations publishes genuine progress as it advances. The poll
+# interval still bounds the normal idle gap between the final beat and the next
+# cycle. fm_poll_derived_grace (bin/fm-wake-lib.sh, already sourced transitively
+# above) owns the max(300, poll+60) derivation - see docs/turnend-guard.md
+# "Guard grace and the poll cadence".
 # This recomputes the library default above now that the real configured
 # POLL is known.
 WATCHER_STALE_GRACE=${FM_WATCHER_STALE_GRACE:-${FM_GUARD_GRACE:-$(fm_poll_derived_grace "$POLL")}}
@@ -451,13 +453,18 @@ inbox_steer_check() {  # <window> <task>
   esac
   backend=$(window_backend "$w")
   agent_state=$(fm_backend_agent_state "$backend" "$w" 2>/dev/null || true)
+  watcher_beat
   case "$agent_state" in
     dead|missing)
       inbox_steer_escalate_unavailable "$w" "$task" "$rec"
       return 0
       ;;
   esac
-  tail40=$(fm_backend_capture "$backend" "$w" 40 "$(window_label "$w")" 2>/dev/null) || tail40=
+  if tail40=$(fm_backend_capture "$backend" "$w" 40 "$(window_label "$w")" 2>/dev/null); then
+    watcher_beat
+  else
+    tail40=
+  fi
   if window_is_busy "$w" "$tail40"; then
     return 0
   fi
@@ -1485,6 +1492,14 @@ age_of() {  # seconds since file mtime; "due immediately" if missing
   echo $(( now - m ))
 }
 
+# Publish liveness only after a unit of watcher work has completed. A long
+# cycle may contain several slow backend observations; each completed window
+# keeps the guard informed, while a single wedged observation leaves the
+# beacon aging so the existing dead-watcher detection still fires.
+watcher_beat() {
+  touch "$STATE/.last-watcher-beat"
+}
+
 # Layer 2 + 3 signal scan: status files and turn-end markers.
 # Each file is compared against its persisted reported signature in .seen-* rather
 # than mtime-vs-a-startup-touch, so signals that land while no watcher is running
@@ -2105,7 +2120,7 @@ while :; do
   # parent reports, observe backend busy/idle turn completion, send one recovery
   # repost after grace, and escalate once if the recovery turn is also missed.
   # No conversation scraping; unresolved records are never silently expired.
-  fm_pending_reply_tick "$STATE" || true
+  fm_pending_reply_tick "$STATE" watcher_beat || true
 
   # A live secondmate endpoint does not prove that its own wake loop is alive.
   # Observe the foreign queue before the rest of this cycle so an aged row wakes
@@ -2606,6 +2621,9 @@ EOF
         clear_pause_tracking "$key"
       fi
     fi
+    # This window's complete triage is a genuine progress boundary. A single
+    # stalled backend call above still leaves the beacon aging normally.
+    watcher_beat
   done < <(recorded_windows)
 
   # Heartbeat: the watcher runs a cheap fleet-scan at a regular cadence no matter
@@ -2649,5 +2667,6 @@ EOF
 
   # Terminal wait: a bounded native-event wait for push-capable homes (herdr),
   # else the blind poll sleep. See event_wait_or_sleep.
+  watcher_beat
   event_wait_or_sleep
 done
