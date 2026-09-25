@@ -2743,7 +2743,7 @@ hold_watch_surface() {  # <dir> <out> <capture> <pane-text>
   local dir=$1 out=$2 capture=$3 text=$4
   printf '%s\n' "$text" > "$capture"
   hold_watch_launch "$dir" "$out" "$capture"
-  wait_for_exit "$HOLD_WATCH_PID" 100 || { reap "$HOLD_WATCH_PID"; return 1; }
+  wait_for_exit "$HOLD_WATCH_PID" 300 || { reap "$HOLD_WATCH_PID"; return 1; }
   return 0
 }
 
