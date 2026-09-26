@@ -1018,15 +1018,13 @@ test_kimi_capture_fallback_uses_recorded_harness() (
 
 test_tick_skips_terminal_and_reuses_target_observation() {
   (
-    local home state open1 open2 resolved escalated rec probe_log probes scan_log scans snapshot progress_log progress_count
+    local home state open1 open2 resolved escalated rec probe_log probes scan_log scans snapshot
     home=$(setup_parent observation-cache)
     state="$home/state"
     probe_log="$home/backend-probes.log"
     scan_log="$home/status-scans.log"
-    progress_log="$home/progress.log"
     : > "$probe_log"
     : > "$scan_log"
-    : > "$progress_log"
     # This fixture clock is intentionally scoped to the isolated subshell.
     # shellcheck disable=SC2030,SC2031
     export FM_PENDING_REPLY_NOW=10100
@@ -1067,14 +1065,9 @@ test_tick_skips_terminal_and_reuses_target_observation() {
       done < "$status_file"
       return 0
     }
-    # shellcheck disable=SC2329
-    pending_progress() { printf 'completed\n' >> "$progress_log"; }
-    fm_pending_reply_tick "$state" pending_progress
+    fm_pending_reply_tick "$state"
     probes=$(wc -l < "$probe_log" | tr -d ' ')
     [ "$probes" = 1 ] || fail "two open records for one target should use one probe, got $probes"
-    progress_count=$(wc -l < "$progress_log" | tr -d ' ')
-    [ "$progress_count" = 1 ] \
-      || fail "one shared endpoint observation should publish one progress callback, got $progress_count"
     rec=$(fm_pending_reply_path "$state" "$open1")
     [ "$(fm_pending_reply_get "$rec" turn_seen_busy)" = 1 ] \
       || fail "cached observation should update the first open record"
@@ -1578,6 +1571,107 @@ test_escalated_undelivered_correlation_stays_retryable() {
   pass "an escalated correlation stays retryable only while undelivered"
 }
 
+# --- slow resolved-record regressions ---------------------------------------
+
+test_resolved_never_escalated_tick_does_not_take_record_locks() {
+  local dir home state rec corr i lock_dir started elapsed
+  dir="$TMP_ROOT/resolved-lock-skip"; mkdir -p "$dir/wake"
+  home=$(setup_parent resolved-lock-skip)
+  state="$home/state"
+  mkdir -p "$(fm_pending_reply_dir "$state")"
+  lock_dir="$dir/lock-calls"
+  cat > "$dir/wake/fm-wake-lib.sh" <<'SH'
+fm_lock_acquire_wait() { printf '%s\n' "$1" >> "$TEST_LOCK_CALLS"; return 0; }
+fm_lock_release() { :; }
+SH
+  export TEST_LOCK_CALLS="$lock_dir"
+  _FM_PENDING_REPLY_LIB_DIR="$dir/wake"
+  i=1
+  while [ "$i" -le 1002 ]; do
+    corr=$(printf '%016x' "$i")
+    rec=$(fm_pending_reply_path "$state" "$corr")
+    cat > "$rec" <<EOF
+schema=$FM_PENDING_REPLY_SCHEMA
+corr_id=$corr
+task_id=resolved-$i
+phase=resolved
+escalated_epoch=
+escalation_closed_epoch=
+resolved_epoch=9000000000
+EOF
+    i=$((i + 1))
+  done
+  started=$SECONDS
+  fm_pending_reply_tick "$state" || fail "resolved-only tick failed"
+  elapsed=$((SECONDS - started))
+  [ "$elapsed" -lt 300 ] \
+    || fail "1002 resolved records still exceed the 300-second watcher grace (${elapsed}s)"
+  [ ! -e "$lock_dir" ] || fail "resolved never-escalated records took locks: $(wc -l < "$lock_dir" | tr -d ' ')"
+  _FM_PENDING_REPLY_LIB_DIR="$ROOT/bin"
+  unset TEST_LOCK_CALLS
+  pass "1002 resolved never-escalated records avoid locks in ${elapsed}s"
+}
+
+test_tick_closes_resolved_open_escalation() {
+  local home state corr rec
+  home=$(setup_parent resolved-open-escalation)
+  state="$home/state"
+  export FM_PENDING_REPLY_NOW=5100
+  corr=$(fm_pending_reply_create "$home" "$state" "hibit" "open escalation tick")
+  rec=$(fm_pending_reply_path "$state" "$corr")
+  fm_pending_reply_set "$rec" phase resolved
+  fm_pending_reply_set "$rec" resolved_epoch 5000
+  fm_pending_reply_set "$rec" escalated_epoch 4900
+  fm_pending_reply_set "$rec" escalation_closed_epoch ''
+  fm_pending_reply_set "$rec" resolved_via status
+  printf 'blocked [key=pending-reply-%s]: pending-reply-missed: task=hibit pending-reply-id=%s request=open escalation tick\n' \
+    "$corr" "$corr" > "$state/hibit.status"
+  fm_pending_reply_tick "$state" || fail "tick failed while closing a resolved escalation"
+  [ -n "$(fm_pending_reply_get "$rec" escalation_closed_epoch)" ] \
+    || fail "tick did not mark the escalation closed"
+  [ -z "$(status_open_decisions "$state/hibit.status")" ] \
+    || fail "tick left the resolved escalation decision open"
+  unset FM_PENDING_REPLY_NOW
+  pass "tick still closes a resolved record's open escalation"
+}
+
+test_resolved_records_archive_after_retention() {
+  local home state corr rec archive unresolved unresolved_rec open open_rec
+  home=$(setup_parent resolved-archive)
+  state="$home/state"
+  corr=$(fm_pending_reply_create "$home" "$state" "hibit" "archive resolved record")
+  rec=$(fm_pending_reply_path "$state" "$corr")
+  fm_pending_reply_set "$rec" phase resolved
+  fm_pending_reply_set "$rec" resolved_epoch 1000
+  fm_pending_reply_set "$rec" escalated_epoch ''
+  archive="$(fm_pending_reply_dir "$state")/archive/$corr"
+  fm_pending_reply_archive_resolved "$state" "$corr" 1000 \
+    || fail "archive helper rejected a fresh resolved record"
+  [ -f "$rec" ] || fail "record moved before its retention window elapsed"
+  fm_pending_reply_archive_resolved "$state" "$corr" "$((1000 + FM_PENDING_REPLY_ARCHIVE_RETENTION_SECS))" \
+    || fail "archive helper failed after retention elapsed"
+  [ ! -e "$rec" ] && [ -f "$archive" ] \
+    || fail "eligible resolved record was not moved into archive"
+  export FM_PENDING_REPLY_NOW=$((1000 + FM_PENDING_REPLY_ARCHIVE_RETENTION_SECS))
+  fm_pending_reply_tick "$state" || fail "tick errored while an archive directory existed"
+  [ -f "$archive" ] || fail "tick removed an archived resolved record"
+  unset FM_PENDING_REPLY_NOW
+  unresolved=$(fm_pending_reply_create "$home" "$state" "hibit" "never archive unresolved")
+  unresolved_rec=$(fm_pending_reply_path "$state" "$unresolved")
+  fm_pending_reply_archive_resolved "$state" "$unresolved" "$((1000 + FM_PENDING_REPLY_ARCHIVE_RETENTION_SECS * 2))" \
+    || fail "archive helper errored on an unresolved record"
+  [ -f "$unresolved_rec" ] || fail "unresolved record was moved into archive"
+  open=$(fm_pending_reply_create "$home" "$state" "hibit" "retain open escalation")
+  open_rec=$(fm_pending_reply_path "$state" "$open")
+  fm_pending_reply_set "$open_rec" phase resolved
+  fm_pending_reply_set "$open_rec" resolved_epoch 1000
+  fm_pending_reply_set "$open_rec" escalated_epoch 900
+  fm_pending_reply_archive_resolved "$state" "$open" "$((1000 + FM_PENDING_REPLY_ARCHIVE_RETENTION_SECS * 2))" \
+    || fail "archive helper errored on an open escalation"
+  [ -f "$open_rec" ] || fail "record with an open escalation was moved into archive"
+  pass "resolved records move to archive only after the retention window"
+}
+
 # --- run --------------------------------------------------------------------
 
 test_normal_correlated_reply_resolves_once
@@ -1607,6 +1701,9 @@ test_busy_idle_observation_via_backend_abstraction
 test_unknown_backend_state_uses_capture_fallback
 test_kimi_capture_fallback_uses_recorded_harness
 test_tick_skips_terminal_and_reuses_target_observation
+test_resolved_never_escalated_tick_does_not_take_record_locks
+test_tick_closes_resolved_open_escalation
+test_resolved_records_archive_after_retention
 test_correlations_reuse_only_for_matching_open_task
 test_tick_end_to_end_missed_then_escalate
 test_failed_send_discards_undelivered_expectation

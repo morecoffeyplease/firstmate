@@ -76,9 +76,6 @@ if [ "${1:-}" = "capture-pane" ]; then
   if [ -n "${FM_FAKE_TMUX_CAPTURE_BLOCK_FILE:-}" ]; then
     while [ ! -e "$FM_FAKE_TMUX_CAPTURE_BLOCK_FILE" ]; do sleep 0.05; done
   fi
-  if [ -n "${FM_FAKE_TMUX_CAPTURE_SLEEP:-}" ]; then
-    sleep "$FM_FAKE_TMUX_CAPTURE_SLEEP"
-  fi
   if [ -n "${FM_FAKE_TMUX_CAPTURE_COUNT_FILE:-}" ]; then
     _capture_count=$(cat "$FM_FAKE_TMUX_CAPTURE_COUNT_FILE" 2>/dev/null || echo 0)
     printf '%s\n' "$((_capture_count + 1))" > "$FM_FAKE_TMUX_CAPTURE_COUNT_FILE"
