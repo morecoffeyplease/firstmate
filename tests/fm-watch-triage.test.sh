@@ -207,6 +207,47 @@ test_status_span_actionable_classifier() {
   pass "status_span_has_actionable: benign absorbed, captain events surfaced, classified events not re-fired"
 }
 
+# status_span_all_confirmations (issue #18): 0 only when the span is nonempty
+# and EVERY line in it is a tagged delivery confirmation; any other recognized
+# verb in the same span - even one that is not itself captain-relevant, like
+# working: or note: - must still force 1, because that is the "one unrecognized
+# append" bin/fm-watch.sh's secondmate always-surface rule exists to protect.
+test_status_span_all_confirmations_classifier() {
+  local dir state offset
+  dir=$(make_case classify-confirmation-span); state="$dir/state"
+  printf 'done [confirmation]: relayed to Surfaces\n' > "$state/only.status"
+  status_span_all_confirmations "$state/only.status" 0 \
+    || fail "a span of only a tagged done: line was not all-confirmations"
+  printf 'done [confirmation]: relayed to Surfaces\ndone [confirmation]: recorded and cascaded\n' \
+    > "$state/multi.status"
+  status_span_all_confirmations "$state/multi.status" 0 \
+    || fail "a span of multiple tagged done: lines was not all-confirmations"
+  printf 'working: en route\ndone [confirmation]: relayed to Surfaces\n' > "$state/mixed.status"
+  status_span_all_confirmations "$state/mixed.status" 0 \
+    && fail "a span mixing a working: line with a confirmation was wrongly all-confirmations"
+  printf 'done: relayed to Surfaces\n' > "$state/untagged.status"
+  status_span_all_confirmations "$state/untagged.status" 0 \
+    && fail "a span of a bare done: line was wrongly all-confirmations"
+  printf 'note: fyi only\n' > "$state/note.status"
+  status_span_all_confirmations "$state/note.status" 0 \
+    && fail "a span of a note: line was wrongly all-confirmations"
+  : > "$state/empty.status"
+  status_span_all_confirmations "$state/empty.status" 0 \
+    && fail "an empty span was wrongly all-confirmations"
+  status_span_all_confirmations "$state/missing.status" 0 \
+    && fail "a missing status file was wrongly all-confirmations"
+  # A later, unrelated append after the offset must still be seen: the whole
+  # NEW span is scanned, not just its last line.
+  printf 'done [confirmation]: relayed to Surfaces\n' > "$state/later.status"
+  offset=$(size_of "$state/later.status")
+  printf 'needs-decision: pick one\n' >> "$state/later.status"
+  status_span_all_confirmations "$state/later.status" "$offset" \
+    && fail "a needs-decision: line appended after the offset was hidden from the span scan"
+  status_span_all_confirmations "$state/later.status" 0 \
+    && fail "an all-confirmations verdict ignored an earlier line outside the requested span start"
+  pass "status_span_all_confirmations: absorbable only when the whole new span is tagged confirmations"
+}
+
 # The reported bug, at the classifier: an actionable event followed by a ROUTINE
 # append must stay actionable, and must be reported as ITSELF rather than as the
 # routine line that happens to sit last.
@@ -340,6 +381,35 @@ test_classifier_primitives() {
   status_is_captain_relevant "merged" || fail "legacy bare merged free-text not captain-relevant"
   status_is_captain_relevant "PR ready https://x/pull/2" \
     || fail "legacy bare PR ready free-text not captain-relevant"
+  # issue #18: a done: line tagged [confirmation] is a secondmate delivery
+  # confirmation and must stop being captain-relevant, but the tag has NO
+  # EFFECT on any other verb - a misapplied tag must still wake the parent.
+  status_is_delivery_confirmation "done [confirmation]: relayed to Surfaces" \
+    || fail "a tagged done: line was not recognized as a delivery confirmation"
+  status_is_captain_relevant "done [confirmation]: relayed to Surfaces" \
+    && fail "a tagged done: line was still captain-relevant"
+  status_is_terminal_verb "done [confirmation]: relayed to Surfaces" \
+    || fail "a tagged done: line stopped being a terminal verb"
+  status_is_captain_relevant "done: relayed to Surfaces" \
+    || fail "an UNTAGGED done: line stopped being captain-relevant"
+  status_is_delivery_confirmation "done: relayed to Surfaces" \
+    && fail "an untagged done: line was wrongly recognized as a delivery confirmation"
+  status_is_delivery_confirmation "needs-decision [confirmation]: pick one" \
+    && fail "the confirmation tag had an effect on needs-decision:"
+  status_is_captain_relevant "needs-decision [confirmation]: pick one" \
+    || fail "a mistagged needs-decision: line stopped waking the parent"
+  status_is_captain_relevant "blocked [confirmation]: stuck" \
+    || fail "a mistagged blocked: line stopped waking the parent"
+  status_is_captain_relevant "failed [confirmation]: gave up" \
+    || fail "a mistagged failed: line stopped waking the parent"
+  status_is_captain_relevant "working [confirmation]: still going" \
+    && fail "the confirmation tag made a working: line captain-relevant"
+  status_is_captain_relevant "done corr=aaaa1111bbbb2222 [confirmation]: relayed" \
+    && fail "the confirmation tag did not read through a correlation token"
+  status_is_captain_relevant "done [confirmation] corr=aaaa1111bbbb2222: relayed" \
+    && fail "the confirmation tag was not recognized ahead of a correlation token"
+  status_is_captain_relevant "done: [confirmation] relayed" \
+    || fail "a [confirmation] token mentioned only in the note (after the colon) was wrongly recognized as the tag"
   [ "$(window_to_task "sess:fm-fix-login-k3")" = "fix-login-k3" ] || fail "window_to_task did not strip session+fm- prefix"
   fm_write_meta "$state/herdr-task.meta" "window=default:w1:p2" "backend=herdr"
   [ "$(window_to_task "default:w1:p2" "$state")" = "herdr-task" ] || fail "window_to_task did not resolve opaque backend target through metadata"
@@ -692,6 +762,48 @@ test_secondmate_status_signal_never_absorbed_classifier() {
     || fail "the secondmate rule leaked onto an ordinary crewmate status"
   unset FM_FAKE_CREW_STATE_sm FM_FAKE_CREW_STATE_crew
   pass "a secondmate's status signal is never absorbed as provably working; crewmates are unaffected"
+}
+
+# issue #18: a real watcher poll absorbs a secondmate's .status append when its
+# whole new span is tagged [confirmation] delivery confirmations - even though
+# the mate is NOT provably working, proving this carve-out is independent of
+# the busy-evidence proof the classifier test above shows it can never use.
+test_secondmate_confirmation_signal_absorbed() {
+  local dir state fakebin out pid
+  dir=$(make_case secondmate-confirmation-absorb); state="$dir/state"; fakebin="$dir/fakebin"; out="$dir/watch.out"
+  printf 'kind=secondmate\n' > "$state/sm.meta"
+  printf 'done [confirmation]: relayed to Surfaces\n' > "$state/sm.status"
+  export FM_FAKE_CREW_STATE_sm='state: unknown · source: none · no current-state source available'
+  watch_bg "$state" "$fakebin" "$out"
+  pid=$!
+  if ! wait_poll_cycle "$state" "$pid"; then
+    reap "$pid"; fail "watcher exited for a secondmate's confirmation-only signal (should absorb): $(cat "$out")"
+  fi
+  [ ! -s "$out" ] || fail "a secondmate confirmation-only signal printed a wake reason: $(cat "$out")"
+  [ ! -s "$state/.wake-queue" ] || fail "a secondmate confirmation-only signal enqueued a durable wake record"
+  reap "$pid"
+  unset FM_FAKE_CREW_STATE_sm
+  pass "a secondmate's confirmation-only status signal is absorbed regardless of busy evidence"
+}
+
+# A mixed span - a confirmation alongside a real decision the parent must
+# answer - must still surface in full: the confirmation tag never lets an
+# unrelated needs-decision: line in the same append go unnoticed.
+test_secondmate_mixed_confirmation_and_decision_surfaces() {
+  local dir state fakebin out drain_out pid
+  dir=$(make_case secondmate-confirmation-mixed); state="$dir/state"; fakebin="$dir/fakebin"
+  out="$dir/watch.out"; drain_out="$dir/drain.out"
+  printf 'kind=secondmate\n' > "$state/sm.meta"
+  printf 'done [confirmation]: relayed to Surfaces\nneeds-decision: which vendor?\n' > "$state/sm.status"
+  export FM_FAKE_CREW_STATE_sm='state: unknown · source: none · no current-state source available'
+  watch_bg "$state" "$fakebin" "$out"
+  pid=$!
+  wait_for_exit "$pid" 100 || fail "watcher did not surface a secondmate span mixing a confirmation with a real decision"
+  grep -F "signal: $state/sm.status" "$out" >/dev/null || fail "watcher did not print the surfaced mixed-span signal"
+  FM_STATE_OVERRIDE="$state" "$DRAIN" > "$drain_out" 2>/dev/null || fail "drain after the surfaced mixed span failed"
+  grep -F "$state/sm.status" "$drain_out" >/dev/null || fail "surfaced mixed span was not queued"
+  unset FM_FAKE_CREW_STATE_sm
+  pass "a secondmate span mixing a confirmation with a real decision still surfaces in full"
 }
 
 # --- benign wakes are absorbed ONLY when the crew is provably working ---------
@@ -5084,6 +5196,7 @@ test_paused_until_that_passed_is_rechecked_before_the_cadence() {
 }
 
 test_status_span_actionable_classifier
+test_status_span_all_confirmations_classifier
 test_status_span_survives_a_later_routine_append
 test_status_span_respects_decision_closure
 test_malformed_seen_signature_reads_the_whole_log
@@ -5098,6 +5211,8 @@ test_empty_write_prune_from_the_environment_widens_the_probe
 test_worktree_write_probe_is_wall_clock_bounded
 test_signal_crew_provably_working_classifier
 test_secondmate_status_signal_never_absorbed_classifier
+test_secondmate_confirmation_signal_absorbed
+test_secondmate_mixed_confirmation_and_decision_surfaces
 test_provably_working_signal_absorbed
 test_turn_ended_provably_working_absorbed
 test_turn_ended_not_working_surfaced

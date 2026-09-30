@@ -200,11 +200,40 @@ status_is_terminal_verb() {
   esac
 }
 
+# 0 when the "[confirmation]" delivery-confirmation tag sits in the documented
+# position before the line's first colon (or anywhere on a line with no colon
+# at all) - the same position rule "[key=...]" uses (_fm_key_before_colon).
+_fm_status_confirmation_tag() {  # <status-line>
+  case "${1%%:*}" in
+    *\[confirmation\]*) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+# 0 if <status-line> is a `done:` completion explicitly tagged [confirmation]:
+# a secondmate's delivery confirmation that a previously routed instruction was
+# carried out, with no outcome for the parent to act on (issue #18). Verb-gated
+# to `done` only - the tag has NO EFFECT on needs-decision, blocked, or failed,
+# so a misapplied tag on a real outcome still wakes the parent rather than
+# silently dropping it. status_is_captain_relevant is the only place this
+# predicate changes the wake verdict for an ordinary crewmate or scout;
+# bin/fm-watch.sh's signal_secondmate_confirmation_files (via
+# status_span_all_confirmations below) is the only place it lets a secondmate's
+# otherwise-always-surfaced .status append be absorbed.
+status_is_delivery_confirmation() {  # <status-line>
+  local line=$1 verb
+  [ -n "$line" ] || return 1
+  verb=$(status_line_verb "$line")
+  [ "$verb" = "done" ] || return 1
+  _fm_status_confirmation_tag "$line"
+}
+
 # 0 if the given (last) status line matches a captain-relevant verb.
 # Verb-aware by default: terminal verbs always match; nonterminal progress verbs
 # (working, resolved, captain-held) and paused never match from free-text prose;
 # only lines without those leading verbs may still match free-text tokens for
-# legacy bare lines such as "merged" or "PR ready".
+# legacy bare lines such as "merged" or "PR ready". A done: line explicitly
+# tagged [confirmation] is excluded the same way, regardless of FM_CAPTAIN_RE.
 status_is_captain_relevant() {
   local line=$1 verb
   [ -n "$line" ] || return 1
@@ -212,6 +241,9 @@ status_is_captain_relevant() {
   case "$verb" in
     working|resolved|captain-held|"${FM_CLASSIFY_PAUSED_VERB:-$FM_CLASSIFY_PAUSED_VERB_DEFAULT}")
       return 1
+      ;;
+    done)
+      status_is_delivery_confirmation "$line" && return 1
       ;;
   esac
   if [ -z "${FM_CAPTAIN_RE+x}" ]; then
@@ -1918,6 +1950,37 @@ status_span_has_actionable() {  # <status-file> <start-offset>
   status_span_first_actionable_record "$1" "${2:-0}" > /dev/null
 }
 
+# 0 when <status-file>'s span from <start-offset> to EOF is NONEMPTY and every
+# non-blank line in it is a delivery confirmation (status_is_delivery_confirmation);
+# 1 when the span is empty (nothing new since <start-offset>) or contains ANY
+# line that is not a tagged delivery confirmation - including every other
+# recognized verb (working, paused, note, resolved, captain-held), an untagged
+# done, and anything status_is_captain_relevant already treats as actionable. A
+# read or identity failure also returns 1, so an unclassifiable log surfaces
+# rather than silently absorbing (issue #18's fail-toward-waking requirement).
+# Offset-only, like status_span_first_actionable_record, so a caller with its
+# own seen-position bookkeeping (bin/fm-watch.sh's .seen-* markers) can reuse it
+# without this library knowing that format exists.
+status_span_all_confirmations() {  # <status-file> <start-offset>
+  local f=$1 start=${2:-0} size lines line seen=0
+  [ -f "$f" ] && [ -r "$f" ] && [ ! -L "$f" ] || return 1
+  size=$(_fm_status_file_size "$f") || return 1
+  size=${size//[[:space:]]/}
+  case "$size" in ''|*[!0-9]*) return 1 ;; esac
+  case "$start" in ''|*[!0-9]*) start=0 ;; esac
+  [ "$start" -le "$size" ] || start=0
+  [ "$start" -lt "$size" ] || return 1
+  lines=$(_fm_status_read_span "$f" "$start" "$((size - start))" 2>/dev/null) || return 1
+  while IFS= read -r line || [ -n "$line" ]; do
+    case "$line" in *[![:space:]]*) ;; *) continue ;; esac
+    status_is_delivery_confirmation "$line" || return 1
+    seen=1
+  done <<EOF
+$lines
+EOF
+  [ "$seen" -eq 1 ]
+}
+
 # Classify WHY an idle/stale crew MIGHT be safely absorbed instead of surfaced,
 # from bin/fm-crew-state.sh's one authoritative current-state line
 # ("state: <s> · source: <src> · <detail>"). Prints exactly one token:
@@ -2063,12 +2126,17 @@ crew_worktree_written_since() {  # <id> <state> <anchor-file>
 # Files are mapped to task ids by stripping the .status / .turn-ended suffix;
 # a no-verb wake with nothing
 # provably working must surface, so an empty/unresolvable list returns 1.
-# A kind=secondmate task's .status signal is never absorbable here regardless of
+# A kind=secondmate task's .status signal is never absorbable HERE regardless of
 # busy evidence: that stream is the mate's routed-reply channel, so every append
 # is parent-directed content the supervisor must read (a routed reply, a newly
 # raised decision, a mirrored remote line), and a busy mate agent makes its note
 # more current, not less deliverable. Scoped to .status files - a mate's bare
-# turn-ended ping still uses the ordinary provably-working absorb.
+# turn-ended ping still uses the ordinary provably-working absorb. The ONE
+# exception lives one layer up, in the caller: bin/fm-watch.sh's
+# signal_secondmate_confirmation_files filters a secondmate .status file out of
+# the batch THIS function sees when its whole unseen span is delivery
+# confirmations (status_span_all_confirmations), so it never reaches this
+# always-surface rule at all (issue #18).
 signal_crew_provably_working() {  # <file> ...
   local f base dir task seen=""
   for f in "$@"; do

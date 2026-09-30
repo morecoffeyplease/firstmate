@@ -47,6 +47,15 @@ The pending-reply guard may restate only the correlated line from a local mate's
 Other correlated mate-home status lines remain wrong-home evidence, while a remote home's routed `state/parent-replies.status` is already the parent channel and is not classified as wrong-home.
 A missed-reply escalation includes the complete first sighting path and line number in readable shell-escaped form.
 
+## Delivery-confirmation absorb
+
+The channel above is deliberately every append: today every line a mate writes to `state/<id>.status` wakes the parent, because the watcher cannot otherwise tell a routed reply or a newly raised decision from routine chatter (`bin/fm-classify-lib.sh`'s `signal_crew_provably_working`).
+During the ButterTrip Home campaign roughly half of the parent's wake-handling turns were a mate confirming it had carried out an instruction the parent had just sent - "relayed to Surfaces", "dispatched ..." - with nothing left for the parent to act on, each still costing a full drain, reconcile, and acknowledge cycle (issue #18).
+A mate marks exactly that case, and only that case, by tagging its `done:` line `done [confirmation]: {what you delivered}` (`bin/fm-brief.sh`'s charter text owns the exact wording a mate is told).
+`bin/fm-classify-lib.sh`'s `status_is_delivery_confirmation` and `status_span_all_confirmations` recognize the tag, and `bin/fm-watch.sh`'s `signal_secondmate_confirmation_files` is the one place that lets a confirmation-only span skip the always-surface rule above; every other verb, and an untagged `done:`, is unaffected and keeps surfacing exactly as before.
+The tag has no effect on `needs-decision:`, `blocked:`, or `failed:`, so a mate that mistags a real outcome still wakes the parent rather than silently dropping it.
+The line still lands in `state/<id>.status` and reads back in the fleet-state digest tail; only the immediate wake is skipped.
+
 ## What is deliberately not built
 
 - No mirror of the mate's chat: chat can mix outcomes with other conversation, so choosing which sentence is an outcome would itself be model behavior, and every harness exposes turn text differently.
@@ -62,6 +71,7 @@ A missed-reply escalation includes the complete first sighting path and line num
 `tests/fm-teardown.test.sh` covers teardown delivering a child's final line and refusing when the channel cannot be written.
 `tests/fm-brief.test.sh` pins the charter's channel rule.
 `tests/fm-pending-reply.test.sh` covers helper-selected local routing, remote-channel classification, same-basename restatement before false escalation, readable wrong-home diagnostics, and the rule that arbitrary mate-home sightings never acknowledge a reply.
+`tests/fm-classify-corr-token.test.sh` and `tests/fm-watch-triage.test.sh` cover the `[confirmation]` tag: an untagged `done:` and a tagged `needs-decision:`/`blocked:`/`failed:` still wake, a tagged `done:` does not, and a real watcher poll absorbs a confirmation-only secondmate status append while still surfacing every other secondmate append and any mixed batch that also carries real content.
 
 ## Live verification
 

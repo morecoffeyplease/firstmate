@@ -541,6 +541,13 @@ test_secondmate_marked_request_reporting_contract() {
     "secondmate charter did not name a landed merge as a reporting trigger"
   assert_grep 'States: working, needs-decision, blocked, paused, done, failed.' "$brief" \
     "secondmate charter changed the preserved status vocabulary"
+  # issue #18: the charter must tell a mate how to mark a pure delivery
+  # confirmation so the watcher can absorb it, and that the tag never applies
+  # to a real outcome verb.
+  assert_grep 'done [confirmation]: {what you delivered}' "$brief" \
+    "secondmate charter lost the delivery-confirmation tag"
+  assert_grep 'The tag has NO EFFECT on `needs-decision:`, `blocked:`, or `failed:`' "$brief" \
+    "secondmate charter did not scope the confirmation tag away from real outcomes"
   pass "fm-brief.sh: marked requests avoid generic acknowledgements and preserve material reporting"
 }
 

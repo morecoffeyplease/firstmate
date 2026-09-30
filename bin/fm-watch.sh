@@ -1718,6 +1718,32 @@ signal_files_actionable() {  # <status-file> ...
   return "$found"
 }
 
+# Space-separated subset of the given status-file batch that
+# signal_crew_provably_working's secondmate always-surface rule may safely skip:
+# a kind=secondmate .status file whose entire unseen span (the same .seen-*
+# offset signal_files_actionable just classified) is delivery confirmations
+# (status_span_all_confirmations, fm-classify-lib.sh). Every other secondmate
+# .status file - any span carrying a working:, paused:, note:, resolved:,
+# captain-held:, or untagged done: line - is deliberately excluded, so that
+# task keeps forcing a surface exactly as before (docs/secondmate-parent-
+# channel.md: nobody reads a mate's chat, so an unrecognized append must still
+# reach the parent). Call only after signal_files_actionable has already ruled
+# the whole batch non-actionable; a captain-relevant span always surfaces
+# regardless of this list (issue #18).
+signal_secondmate_confirmation_files() {  # <status-file> ...
+  local f task meta kind
+  for f in "$@"; do
+    case "$f" in *.status) ;; *) continue ;; esac
+    [ -e "$f" ] || [ -L "$f" ] || continue
+    task=$(basename "$f"); task="${task%.status}"
+    meta="${f%.status}.meta"
+    kind=$(grep '^kind=' "$meta" 2>/dev/null | tail -1 | cut -d= -f2-)
+    [ "$kind" = secondmate ] || continue
+    status_span_all_confirmations "$f" "$(fm_wake_signal_seen_size "$STATE" "$f")" \
+      && printf '%s ' "$f"
+  done
+}
+
 # Surfaced-marker bookkeeping for the heartbeat backstop is owned by
 # fm-push-transition-lib.sh because push and poll paths must write one format.
 # Mark each actionable status log through the endpoint captured by the heartbeat
@@ -2333,9 +2359,31 @@ EOF
     # fm-primary-pi-watch.ts), and the away daemon, whose handle_durable_wakes
     # passes it to handle_wake (see the comment above handle_wake in
     # bin/fm-supervise-daemon.sh).
+    # remaining_files drops any secondmate .status file whose whole unseen span
+    # is a delivery confirmation (signal_secondmate_confirmation_files, issue
+    # #18) before the provably-working/churn evidence below ever sees it, so
+    # that file's task can never force a surface on its own; if every file in
+    # the batch drops out this way, remaining_files is empty and the batch
+    # absorbs outright. Skipped whenever a short-circuited branch already
+    # decided the outcome, matching the existing cost-ordering comment above.
+    remaining_files=$files
+    if ! afk_present && [ "$signal_actionable" -ne 0 ]; then
+      # shellcheck disable=SC2086  # same space-separated status-path list
+      confirmation_files=$(signal_secondmate_confirmation_files $files)
+      if [ -n "$confirmation_files" ]; then
+        remaining_files=''
+        for f in $files; do
+          case " $confirmation_files " in
+            *" $f "*) ;;
+            *) remaining_files="$remaining_files $f" ;;
+          esac
+        done
+      fi
+    fi
     # shellcheck disable=SC2086  # same space-separated status-path list
     if afk_present || [ "$signal_actionable" -eq 0 ] \
-      || { ! signal_crew_provably_working $files && ! signal_turnend_panes_churned $files; }; then
+      || { [ -n "$remaining_files" ] \
+        && { ! signal_crew_provably_working $remaining_files && ! signal_turnend_panes_churned $remaining_files; }; }; then
       while IFS=$(printf '\t') read -r sf sig f; do
         [ -n "$sf" ] || continue
         file_reason="$reason"
