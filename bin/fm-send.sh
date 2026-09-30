@@ -467,10 +467,13 @@ fi
 # message exactly as before, so ordinary sends are byte-identical.
 RESOLVE_KEYS=
 FIRE_AND_FORGET_ID=
-# Set instead of FIRE_AND_FORGET_ID by --fire-and-forget-auto: generation is
-# deferred past every input-validated structural refusal (wrong target kind,
-# --resolve-key/--key combined, empty message, malformed remote budget) so a
-# printed id is never handed to a caller whose send was actually refused.
+# Set instead of FIRE_AND_FORGET_ID by --fire-and-forget-auto. The id is
+# generated after every input-validated structural refusal (wrong target
+# kind, --resolve-key/--key combined, empty message, malformed remote
+# budget), but printing is deferred further still, past the plane-specific
+# metadata-lock and route revalidation, to immediately before the transport
+# or inbox write - see fm_send_fire_and_forget_print - so a printed id is
+# never handed to a caller whose send was actually refused.
 FIRE_AND_FORGET_REQUESTED=0
 fm_send_add_resolve_key() { # <key>
   local k=$1
@@ -800,17 +803,24 @@ else
       ;;
     esac
   fi
-  # Generate only now: every input-validated structural refusal above (wrong
+  # Generate only now (every input-validated structural refusal above - wrong
   # target kind, --resolve-key/--key combined, an empty message, a malformed
-  # remote budget) has already passed, so a printed id always corresponds to
-  # a send that is actually attempted. A later failure specific to runtime
-  # state (a lost metadata lock, a retired or changed endpoint) can still
-  # occur after this point; that risk is identical for an explicit caller-
-  # supplied id and is not specific to generation.
+  # remote budget - has already passed), but do NOT print yet: the id must be
+  # embedded in MESSAGE below before the remote/inbox plane split, while the
+  # remaining refusals (a lost metadata lock, a retired or changed endpoint)
+  # are plane-specific and checked further down. fm_send_fire_and_forget_print
+  # prints it once, immediately before the transport or inbox write actually
+  # runs in each plane's branch, so a refusal from those later checks -
+  # deterministic (a mismatched FM_SEND_EXPECTED_REMOTE_HOST) or racy (a
+  # concurrent retirement) alike - never prints an id for a send that never
+  # happened.
   if [ "$FIRE_AND_FORGET_REQUESTED" = 1 ] && [ -z "$FIRE_AND_FORGET_ID" ]; then
     FIRE_AND_FORGET_ID=$(fm_pending_reply_new_id)
-    echo "fire-and-forget delivery id: $FIRE_AND_FORGET_ID"
   fi
+  fm_send_fire_and_forget_print() {
+    [ "$FIRE_AND_FORGET_REQUESTED" = 1 ] || return 0
+    echo "fire-and-forget delivery id: $FIRE_AND_FORGET_ID"
+  }
   # The pre-marker answer text, kept for the closing resolved note so the
   # durable ledger records the plain answer without marker or corr bytes.
   RESOLVE_ANSWER_TEXT=$MESSAGE
@@ -935,6 +945,7 @@ else
       echo "error: steer not sent to remote secondmate $TARGET_REMOTE_ID: its parent task retired or changed route during target resolution" >&2
       exit 1
     fi
+    fm_send_fire_and_forget_print
     remote_rc=0
     remote_completion_unknown=0
     REMOTE_SEND_ARGS=("$TARGET_REMOTE_ID" "$MESSAGE")
@@ -1040,6 +1051,7 @@ else
       echo "error: steer not sent to $INBOX_TASK_ID: the task retired or changed endpoint during target resolution" >&2
       exit 1
     fi
+    fm_send_fire_and_forget_print
     if [ "${FM_SEND_IDEMPOTENT:-0}" = 1 ]; then
       INBOX_RECORD=$(fm_task_inbox_write_idempotent "$STATE" "$INBOX_TASK_ID" "$MESSAGE" \
         "${FIRE_AND_FORGET_ID:+fire-and-forget}") || inbox_write_rc=$?

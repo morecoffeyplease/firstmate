@@ -458,6 +458,33 @@ test_remote_fire_and_forget_generated_id_not_printed_on_invalid_budget() {
   pass "fm-send remote: an invalid remote budget refuses before id generation, printing nothing"
 }
 
+test_remote_fire_and_forget_generated_id_not_printed_on_expected_host_mismatch() {
+  local dir fb ssh_log home rhome rc out
+  # The final route-revalidation refusal (a stale FM_SEND_EXPECTED_REMOTE_HOST)
+  # is deterministic, not a race, but it still runs after the id would have
+  # been generated. It must still print nothing: the id is generated early
+  # (to embed in the message) but only printed immediately before the actual
+  # transport, which this refusal precedes.
+  dir="$TMP_ROOT/remote-fire-and-forget-host-mismatch"; mkdir -p "$dir"
+  fb=$(make_stubs "$dir"); ssh_log="$dir/ssh.log"; : > "$ssh_log"
+  rhome=$(setup_remote_secondmate_home remote-fire-and-forget-host-mismatch)
+  home=$(setup_remote_parent_home remote-fire-and-forget-host-mismatch "$rhome")
+
+  rc=0
+  send_env "$fb" "$home" "$ssh_log" \
+    FM_SEND_EXPECTED_SPAWN_GEN="" FM_SEND_EXPECTED_REMOTE_HOST=retired-mac \
+    "$SEND" rsm --fire-and-forget-auto "reconcile your own books" \
+    >"$dir/out" 2>"$dir/err" || rc=$?
+  [ "$rc" -ne 0 ] || fail "a mismatched expected remote host must still refuse with a generated id requested"
+  out=$(cat "$dir/out")
+  [ -z "$out" ] || fail "a send refused for a mismatched expected remote host must not print a generated delivery id: $out"
+  assert_contains "$(cat "$dir/err")" "retired or changed route" \
+    "the refusal should report the route replacement"
+  [ "$(find "$rhome/state/parent-route/rsm.inbox" -name '*.msg' 2>/dev/null | wc -l | tr -d ' ')" = 0 ] \
+    || fail "a refused send for a mismatched expected remote host still landed a remote record"
+  pass "fm-send remote: a final-route refusal (expected-host mismatch) prints no generated id"
+}
+
 test_remote_send_revalidates_after_retirement_lock() {
   local dir rhome meta lock ready release rc sender_pid holder_pid
   dir="$TMP_ROOT/remote-retire-race"; mkdir -p "$dir"
@@ -846,6 +873,7 @@ test_remote_retry_failure_preserves_ambiguous_expectation
 test_remote_fire_and_forget_never_arms_reply_recovery
 test_remote_fire_and_forget_generated_id_reuses_printed_id_on_retry
 test_remote_fire_and_forget_generated_id_not_printed_on_invalid_budget
+test_remote_fire_and_forget_generated_id_not_printed_on_expected_host_mismatch
 test_remote_send_revalidates_after_retirement_lock
 test_remote_send_revalidates_parent_route_after_retirement_lock
 test_remote_expected_host_revalidates_final_route
