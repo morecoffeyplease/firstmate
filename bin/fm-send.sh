@@ -1,7 +1,10 @@
 #!/usr/bin/env bash
 # Steer a task by durable record: write the message into the task's steering
 # inbox and ring a constant doorbell line into its terminal, best-effort.
-# Usage: fm-send.sh <target> [--resolve-key <key>]... [--fire-and-forget <delivery-id>] <text...>
+# Usage: fm-send.sh <target> [--resolve-key <key>]... [--fire-and-forget [<delivery-id>]] <text...>
+#   --fire-and-forget with no id generates one (same 16-hex shape as an
+#   explicit id) and prints it to stdout before sending; reuse that printed
+#   id for an idempotent retry, the same as a caller-supplied id.
 #   <target> may be an exact task id, a legacy fm-<id> task label resolved
 #   through this home's state/<id>.meta, or an explicit well-formed backend
 #   target. fm-send refuses unresolved guesses rather than falling back to a
@@ -483,16 +486,22 @@ while :; do
     shift
     ;;
   --fire-and-forget)
-    [ $# -ge 2 ] || {
-      echo "error: --fire-and-forget requires a delivery id" >&2
-      exit 1
-    }
     [ -z "$FIRE_AND_FORGET_ID" ] || {
       echo "error: duplicate --fire-and-forget" >&2
       exit 1
     }
-    FIRE_AND_FORGET_ID=$2
-    shift 2
+    if [ $# -ge 2 ] && printf '%s' "$2" | grep -Eq '^[A-Za-z0-9]{16}$'; then
+      # Same-length alnum token: an attempted id, valid or not. Consume it so a
+      # malformed attempt (wrong case, non-hex letter) still fails loudly on
+      # the existing hex-shape check below instead of being swallowed as the
+      # start of the message text.
+      FIRE_AND_FORGET_ID=$2
+      shift 2
+    else
+      FIRE_AND_FORGET_ID=$(fm_pending_reply_new_id)
+      echo "fire-and-forget delivery id: $FIRE_AND_FORGET_ID"
+      shift
+    fi
     ;;
   --fire-and-forget=*)
     [ -z "$FIRE_AND_FORGET_ID" ] || {
