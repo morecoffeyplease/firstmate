@@ -303,8 +303,13 @@ test_rejected_decision_line_surfaces_once_through_backstop() {
   pass "captain-facing decisions rejected by the fold surface once"
 }
 
-test_rejected_decision_line_prints_in_full() {
-  local dir state out line expected note
+# Issue #19 shape review, Verdict B (data/rev25-astra/report.md): the routine
+# per-line cut applies here too, with no decision-verb exemption; the malformed
+# -key event's complete payload instead lands in the same content-addressed
+# attachment OPEN DECISIONS publishes, built from the event this backstop
+# already selected (no second scan of the raw status log).
+test_rejected_decision_line_is_capped_with_an_attachment_pointer() {
+  local dir state out line note attach_path attach_line
   dir=$(make_case rejected-decision-long)
   state="$dir/state"
   out="$dir/drain.out"
@@ -321,39 +326,57 @@ test_rejected_decision_line_prints_in_full() {
   [ -n "$line" ] || fail "a long rejected decision was lost: $(cat "$out")"
   # A malformed-key blocked/needs-decision line has no OPEN DECISIONS
   # representation, so this backstop is its only presentation path; it must
-  # print byte-for-byte, not cut to the routine per-item budget (issue #19).
-  expected="rejected-long blocked [key=bad/value]: $note"
-  [ "$line" = "$expected" ] \
-    || fail "a long rejected decision did not print byte-for-byte: got [$line]"
-  pass "a rejected decision line prints in full, byte-for-byte, through the backstop instead of being cut"
+  # be capped to the routine per-item budget, same as every other verb, with
+  # its complete payload recorded in the attachment (issue #19).
+  case "$line" in
+    *' [truncated] (full: L'*')') : ;;
+    *) fail "a long rejected decision was not capped with an attachment-line reference: $line" ;;
+  esac
+
+  attach_path=$(grep -F 'full payloads:' "$out" | awk '{print $NF}')
+  [ -n "$attach_path" ] && [ -f "$attach_path" ] \
+    || fail "no readable attachment path was printed for the rejected decision: $(cat "$out")"
+  attach_line=${line##*'(full: L'}
+  attach_line=${attach_line%')'}
+  [ "$(sed -n "${attach_line}p" "$attach_path")" = "[backstop-event] task rejected-long blocked: blocked [key=bad/value]: $note" ] \
+    || fail "the attachment's referenced line did not hold the complete, byte-for-byte rejected decision"
+  pass "a rejected decision line is capped to the routine per-item budget, with its complete payload in the attachment"
 }
 
-test_rejected_decision_line_too_large_for_the_section_points_at_its_byte_offset() {
-  local dir state out line expected_prefix
-  dir=$(make_case rejected-decision-huge)
+test_many_oversized_rejected_decisions_stay_within_the_section_budget() {
+  local dir state out i section_bytes count attach_path attach_lines
+  dir=$(make_case rejected-decision-many)
   state="$dir/state"
   out="$dir/drain.out"
+  # 20 distinct malformed-key backstop events, each with a 5,000-character
+  # note: each is individually capped by the routine per-item budget, but the
+  # section itself must also stay bounded regardless of how many are open -
+  # the regression issue #19's shape review flagged in the prior (now-replaced)
+  # design.
+  i=1
+  while [ "$i" -le 20 ]; do
+    awk -v n="$i" 'BEGIN { printf "blocked [key=bad/value-%d]: ", n; while (j++ < 5000) printf "x"; printf "\n" }' n="$i" \
+      > "$state/rejected-$i.status"
+    i=$((i + 1))
+  done
 
-  # 5,000 'x' characters clears the section's whole 4,000-byte budget on its
-  # own; the fallback must be an exact byte-offset pointer (from this event's
-  # own snapshot read), not a bare "read this file" (issue #19 review finding
-  # P1: an ambiguous pointer cannot tell which of several same-key lines is
-  # current).
-  awk 'BEGIN { printf "blocked [key=bad/value]: "; while (i++ < 5000) printf "x"; printf "\n" }' \
-    > "$state/rejected-huge.status"
+  FM_STATE_OVERRIDE="$state" "$DRAIN" > "$out" || fail "drain failed on many rejected decisions"
 
-  FM_STATE_OVERRIDE="$state" "$DRAIN" > "$out" || fail "rejected-decision drain failed"
-  line=$(backstop_body "$out" | grep -F 'rejected-huge')
-  [ -n "$line" ] || fail "a section-busting rejected decision was lost: $(cat "$out")"
-  case "$line" in
-    *xxxxxxxxxx*) fail "a section-busting rejected decision printed inline instead of falling back to a pointer: $line" ;;
-  esac
-  expected_prefix="rejected-huge blocked: too long to print in full here (5025 chars) - read it in full at $state/rejected-huge.status (event ends at byte offset "
-  case "$line" in
-    "$expected_prefix"*')') : ;;
-    *) fail "a section-busting rejected decision's pointer did not match the expected exact-locator shape: $line" ;;
-  esac
-  pass "a rejected decision too large for the section points at its exact byte offset instead of being dropped"
+  section_bytes=$(awk '/^STATUS OUTCOME BACKSTOP \(/{f=1} f{print} /^(OPEN DECISIONS|RECORD DIVERGENCE|UNREAD STATUS|WAKE_ACK_REQUIRED)/{exit}' "$out" | wc -c | tr -d ' ')
+  [ "$section_bytes" -le 4000 ] \
+    || fail "STATUS OUTCOME BACKSTOP grew past its 4,000-byte budget with many rejected decisions: $section_bytes bytes"
+  count=$(backstop_body "$out" | grep -c '^rejected-[0-9]* blocked \[key=')
+  [ "$count" -gt 0 ] && [ "$count" -lt 20 ] \
+    || fail "unexpected number of individually-printed rejected decisions: $count"
+
+  attach_path=$(grep -F 'full payloads:' "$out" | awk '{print $NF}')
+  [ -n "$attach_path" ] && [ -f "$attach_path" ] \
+    || fail "no readable attachment path was printed: $(cat "$out")"
+  attach_lines=$(wc -l < "$attach_path" | tr -d ' ')
+  [ "$attach_lines" -eq 20 ] \
+    || fail "the attachment did not hold all 20 rejected decisions in full: $attach_lines lines"
+
+  pass "many oversized rejected decisions stay within the backstop's byte budget, with every one recoverable from the attachment"
 }
 
 test_missing_index_self_heals_on_first_drain() {
@@ -568,8 +591,8 @@ test_successful_backstop_is_idempotent_without_consuming_delayed_annotation
 test_output_failure_does_not_commit_the_backstop_receipt
 test_receipt_commit_failure_repeats_the_already_presented_backstop
 test_rejected_decision_line_surfaces_once_through_backstop
-test_rejected_decision_line_prints_in_full
-test_rejected_decision_line_too_large_for_the_section_points_at_its_byte_offset
+test_rejected_decision_line_is_capped_with_an_attachment_pointer
+test_many_oversized_rejected_decisions_stay_within_the_section_budget
 test_missing_index_self_heals_on_first_drain
 test_uncovered_event_surfaces_on_first_drain_without_index
 test_malformed_outcome_store_fails_closed_without_pi_advice

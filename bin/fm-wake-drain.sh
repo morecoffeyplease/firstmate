@@ -301,10 +301,94 @@ EOF
   BRANCH_OUTCOME_INDEX_IDENT=$ident
 }
 
+# Issue #19 shape review (Verdict B, data/rev25-astra/report.md): OPEN
+# DECISIONS and STATUS OUTCOME BACKSTOP stay short, bounded previews - the
+# routine per-line cut applies to every verb, with no decision-verb exemption
+# - and each selected decision's COMPLETE payload instead goes into one
+# immutable, content-addressed attachment file this drain publishes from the
+# same selection pass (no second scan of status history, no source-line
+# search). A truncated preview row names its own line inside that attachment;
+# the section footer names the shared attachment path once. This replaces the
+# inline-full-text / source-locator / omitted-identifier-list design from the
+# prior two commits on this branch, which a first-round review already showed
+# regressed to unbounded sections, an ambiguous fold-rejecting locator, and a
+# character/byte budget conflation - see the linked review reports.
+
+# Byte length of <string>, independent of the ambient locale's multibyte
+# character width. The two sections' byte budgets below must be measured in
+# real bytes (issue #19 review: a UTF-8 locale otherwise lets emoji or other
+# multibyte text blow the budget while `${#line}` still reports "under 4000").
+# fm_cap_line_var's own per-item truncation stays locale-aware on purpose - it
+# must never cut a multibyte character in half - so this function scopes
+# LC_ALL=C to only its own dynamic extent (confirmed empirically to take
+# effect without exec'ing a subprocess) rather than changing it for the caller.
+_fm_byte_len() {  # <string> -> byte count
+  local LC_ALL=C s=$1
+  printf '%s' "${#s}"
+}
+
+# sha256 of <file>, printed as lowercase hex. Several bin/ scripts already
+# carry this identical shasum/sha256sum fallback (fm-check-lib.sh,
+# fm-backlog-handoff.sh, fm-backlog-receive.sh, fm-config-inherit-lib.sh); this
+# is one more instance of that same pre-existing pattern rather than a new one
+# this fix introduces, and fixing that duplication is out of this issue's scope.
+_fm_drain_sha256() {  # <file>
+  if command -v shasum >/dev/null 2>&1; then
+    shasum -a 256 "$1" 2>/dev/null | awk '{print $1}'
+  elif command -v sha256sum >/dev/null 2>&1; then
+    sha256sum "$1" 2>/dev/null | awk '{print $1}'
+  else
+    return 1
+  fi
+}
+
+# <dir> exists, is a plain directory (never a symlink to elsewhere), and is
+# ready to hold published attachments.
+_fm_drain_attach_dir_ready() {  # <dir>
+  [ ! -L "$1" ] || return 1
+  mkdir -p "$1" 2>/dev/null || return 1
+  [ -d "$1" ] && [ ! -L "$1" ]
+}
+
+# Publish the already-populated, already-mode-0600 <staged-file> as
+# <dir>/<sha256-of-its-content>.txt, the durable full-payload attachment for
+# one drain section. Content-addressing makes this idempotent across drains:
+# an unchanged set of open decisions reuses the same path instead of writing a
+# new file every wake, and a concurrent publish of identical content races
+# harmlessly (whichever mv completes second still lands the same bytes at the
+# same path). Rejects a symlink or non-regular object already occupying the
+# destination rather than following or overwriting it - the immutability
+# guarantee upstream code relies on requires that this function never adopts
+# an object it did not just write. Always consumes <staged-file> (renames or
+# removes it); the caller never touches it again after this call. Prints the
+# published path on success.
+fm_drain_publish_attachment() {  # <dir> <staged-file>
+  local dir=$1 staged=$2 hash dest
+  _fm_drain_attach_dir_ready "$dir" || { rm -f -- "$staged"; return 1; }
+  hash=$(_fm_drain_sha256 "$staged") || { rm -f -- "$staged"; return 1; }
+  case "$hash" in
+    [0-9a-f][0-9a-f]*) ;;
+    *) rm -f -- "$staged"; return 1 ;;
+  esac
+  dest="$dir/$hash.txt"
+  if [ -e "$dest" ] || [ -L "$dest" ]; then
+    rm -f -- "$staged"
+    [ -f "$dest" ] && [ ! -L "$dest" ] || return 1
+    printf '%s' "$dest"
+    return 0
+  fi
+  if ! mv -f -- "$staged" "$dest"; then
+    rm -f -- "$staged"
+    return 1
+  fi
+  printf '%s' "$dest"
+}
+
 print_status_outcome_backstop_section() {  # <task-and-endpoint-snapshot>
   local snapshot=$1 task endpoint ident event event_endpoint line verb key receipt store lock ready
   local output='' used=0 shown=0 omitted=0 bytes item_bytes=220 global_bytes=4000 rc=0
-  local omitted_decisions=''
+  local attach_dir="$STATE/drain-decisions" attach_tmp='' attach_path='' attach_lineno=0
+  local candidates='' cand_line total=0 total_decisions=0 footer_reserve row_budget heading
   [ "$ACTOR" = main ] || return 0
 
   store="$STATE/branch-outcomes.jsonl"
@@ -329,7 +413,10 @@ print_status_outcome_backstop_section() {  # <task-and-endpoint-snapshot>
     fi
   fi
 
-  STATUS_OUTCOME_BACKSTOP_ACKNOWLEDGED=
+  if _fm_drain_attach_dir_ready "$attach_dir"; then
+    attach_tmp=$(mktemp "$attach_dir/.attach.XXXXXX") && chmod 0600 "$attach_tmp" || attach_tmp=
+  fi
+
   while IFS=$(printf '\t') read -r task endpoint ident; do
     [ -n "$task" ] || continue
     receipt=$(status_outcome_backstop_cursor_offset "$STATE/$task.status") || { rc=1; break; }
@@ -362,63 +449,123 @@ print_status_outcome_backstop_section() {  # <task-and-endpoint-snapshot>
       continue
     fi
 
+    total=$((total + 1))
+    # Only a decision (needs-decision/blocked with a malformed key - the only
+    # kind that ever reaches this backstop, per the `case` above) goes into
+    # the attachment: issue #19 is about decisions, and a routine done/failed
+    # event omitted here has always simply been a routine loss, unrelated to
+    # this fix (issue #19 shape review point 1).
+    case "$verb" in
+      needs-decision|blocked)
+        total_decisions=$((total_decisions + 1))
+        if [ -n "$attach_tmp" ]; then
+          attach_lineno=$((attach_lineno + 1))
+          printf '[backstop-event] task %s %s: %s\n' "$task" "$verb" "$event" >> "$attach_tmp" \
+            || { rm -f -- "$attach_tmp"; attach_tmp=; }
+        fi
+        ;;
+    esac
+
     line="$task $event"
-    # A needs-decision/blocked event reaching here has a malformed key (the
-    # OPEN DECISIONS fold already owns every parseable one, per the `case`
-    # above), so this is its only presentation path - the routine per-line cut
-    # never applies to it, same rule as OPEN DECISIONS (issue #19).
-    fm_cap_status_line_var "$line" "$verb" $((item_bytes - 1))
-    line=$FM_LINE_CAP_LINE
-    if [ "${#line}" -ge "$global_bytes" ] && fm_line_cap_is_decision_verb "$verb"; then
-      # This single event alone could not fit the section's own byte budget
-      # even uncapped: point at its exact source instead of printing 4KB+ of
-      # inline text. event_endpoint is the byte-exact end offset this event's
-      # own snapshot read already computed, so the pointer needs no separate
-      # locator scan the way OPEN DECISIONS' fold-derived note does.
-      line="$task $verb: too long to print in full here (${#event} chars) - read it in full at $STATE/$task.status (event ends at byte offset $event_endpoint)"
-    fi
-    bytes=$(( ${#line} + 1 ))
-    if [ $((used + bytes)) -gt "$global_bytes" ]; then
-      # The section's byte budget is a real bound: an item that does not fit
-      # the REMAINING budget is omitted here exactly as a routine event is,
-      # even a decision-verb one - only an item too large for the WHOLE budget
-      # (above) gets a pointer instead of inline text. A decision omitted this
-      # way still gets an exact retrieval route: its task id joins the printed
-      # summary list rather than vanishing into a bare count.
-      omitted=$((omitted + 1))
-      fm_line_cap_is_decision_verb "$verb" && omitted_decisions="$omitted_decisions$task, "
-      continue
-    fi
-    output="$output$line
+    fm_cap_line_var "$line" $((item_bytes - 1))
+    cand_line=$FM_LINE_CAP_LINE
+    case "$verb" in
+      needs-decision|blocked)
+        if [ -n "$attach_tmp" ] && [ "${#line}" -gt $((item_bytes - 1)) ]; then
+          cand_line="$cand_line (full: L$attach_lineno)"
+        fi
+        ;;
+    esac
+    candidates="$candidates$cand_line$(printf '\t')$task$(printf '\t')$event_endpoint
 "
-    STATUS_OUTCOME_BACKSTOP_ACKNOWLEDGED="$STATUS_OUTCOME_BACKSTOP_ACKNOWLEDGED$task$(printf '\t')$event_endpoint
-"
-    used=$((used + bytes))
-    shown=$((shown + 1))
   done <<EOF
 $snapshot
 EOF
 
   if [ -e "$store" ] || [ -L "$store" ]; then fm_lock_release "$lock"; fi
-  if [ "$rc" -eq 1 ]; then return 1; fi
+  if [ "$rc" -eq 1 ]; then rm -f -- "$attach_tmp"; return 1; fi
   if [ "$rc" -eq 2 ]; then
+    rm -f -- "$attach_tmp"
     printf 'STATUS OUTCOME BACKSTOP SKIPPED: a bounded task outcome index could not be read safely; repair it before relying on drain recovery.\n'
     STATUS_OUTCOME_BACKSTOP_ACKNOWLEDGED=
     return 0
   fi
-  [ "$shown" -gt 0 ] || [ "$omitted" -gt 0 ] || return 0
-  printf 'STATUS OUTCOME BACKSTOP (newest captain-facing task event has no covering branch outcome):\n' || return 1
+  if [ "$total" -eq 0 ]; then
+    rm -f -- "$attach_tmp"
+    return 0
+  fi
+
+  if [ "$total_decisions" -gt 0 ]; then
+    attach_path=$(fm_drain_publish_attachment "$attach_dir" "$attach_tmp") || attach_path=
+    if [ -z "$attach_path" ]; then
+      # A decision or blocker's full payload has no durable pointer this
+      # drain, so none of this section's events are acknowledged - they
+      # remain eligible to try again, in full, on the next drain (issue #19
+      # shape review point 5).
+      STATUS_OUTCOME_BACKSTOP_ACKNOWLEDGED=
+      printf 'STATUS OUTCOME BACKSTOP SKIPPED: %d decision(s) could not be recorded to a durable attachment; retry on the next drain.\n' "$total_decisions" || return 1
+      return 0
+    fi
+  else
+    rm -f -- "$attach_tmp"
+  fi
+
+  heading='STATUS OUTCOME BACKSTOP (newest captain-facing task event has no covering branch outcome):
+'
+  # Reserve the footer's worst-case width - its wording, the attachment path
+  # when there is one, and up to $total's own digit count for the omitted
+  # number - before deciding how many preview rows fit, so the footer itself
+  # can never be the thing that blows the section's budget (issue #19 shape
+  # review point 4).
+  if [ -n "$attach_path" ]; then
+    footer_reserve=$(( $(_fm_byte_len "$attach_path") + ${#total} + 80 ))
+  else
+    footer_reserve=$(( ${#total} + 40 ))
+  fi
+  row_budget=$(( global_bytes - $(_fm_byte_len "$heading") - footer_reserve ))
+  if [ "$row_budget" -lt 0 ]; then
+    STATUS_OUTCOME_BACKSTOP_ACKNOWLEDGED=
+    if [ -n "$attach_path" ]; then
+      printf 'STATUS OUTCOME BACKSTOP SKIPPED: the durable attachment path is too long to present within budget; %d decision(s) recorded in full at %s\n' \
+        "$total_decisions" "$attach_path" || return 1
+    else
+      printf 'STATUS OUTCOME BACKSTOP SKIPPED: budget exhausted before any event could be presented.\n' || return 1
+    fi
+    return 0
+  fi
+
+  STATUS_OUTCOME_BACKSTOP_ACKNOWLEDGED=
+  while IFS=$(printf '\t') read -r cand_line task event_endpoint; do
+    [ -n "$cand_line" ] || continue
+    bytes=$(( $(_fm_byte_len "$cand_line") + 1 ))
+    if [ $((used + bytes)) -gt "$row_budget" ]; then
+      omitted=$((omitted + 1))
+      continue
+    fi
+    output="$output$cand_line
+"
+    # Keep the current rule exactly: a backstop event omitted from its preview
+    # is not acknowledged here, so it resurfaces (in full, again) on a later
+    # drain - the attachment does not expand this patch's acknowledgment
+    # semantics (issue #19 shape review point 5).
+    STATUS_OUTCOME_BACKSTOP_ACKNOWLEDGED="$STATUS_OUTCOME_BACKSTOP_ACKNOWLEDGED$task$(printf '\t')$event_endpoint
+"
+    used=$((used + bytes))
+    shown=$((shown + 1))
+  done <<EOF
+$candidates
+EOF
+
+  printf '%s' "$heading" || return 1
   printf '%s' "$output" || return 1
   if [ "$omitted" -gt 0 ]; then
-    if [ -n "$omitted_decisions" ]; then
-      # Task ids, not fold-derived note prose, so no routine per-line cut here
-      # either: cutting it would silently drop the retrieval route it exists
-      # to guarantee (issue #19).
-      printf 'STATUS OUTCOME BACKSTOP: %d more omitted (byte cap); read these in full at their own state/<id>.status: %s\n' \
-        "$omitted" "${omitted_decisions%, }" || return 1
+    if [ -n "$attach_path" ]; then
+      printf 'STATUS OUTCOME BACKSTOP: %d more not previewed (byte cap); full payloads: %s\n' "$omitted" "$attach_path" || return 1
     else
       printf 'STATUS OUTCOME BACKSTOP: %d more omitted (byte cap)\n' "$omitted" || return 1
     fi
+  elif [ -n "$attach_path" ]; then
+    printf 'STATUS OUTCOME BACKSTOP: full payloads: %s\n' "$attach_path" || return 1
   fi
 }
 
@@ -471,8 +618,9 @@ EOF
 # common case.
 print_open_decisions_section() {
   local snapshot=${1:-} open task key verb note line item_bytes=220 global_bytes=4000
-  local output='' used=0 shown=0 omitted=0 bytes locator lineno locstart
-  local omitted_decisions=''
+  local output='' used=0 shown=0 omitted=0 bytes
+  local attach_dir="$STATE/drain-decisions" attach_tmp='' attach_path='' attach_lineno=0
+  local candidates='' cand_line total=0 footer_reserve row_budget heading hint
 
   if [ -n "$snapshot" ]; then
     open=$(scan_open_decisions_snapshot "$STATE" "$snapshot") || return 1
@@ -481,72 +629,93 @@ print_open_decisions_section() {
   fi
   [ -n "$open" ] || return 0
 
+  if _fm_drain_attach_dir_ready "$attach_dir"; then
+    attach_tmp=$(mktemp "$attach_dir/.attach.XXXXXX") && chmod 0600 "$attach_tmp" || attach_tmp=
+  fi
+
   while IFS=$(printf '\t') read -r task key verb note; do
     [ -n "$task" ] || continue
+    total=$((total + 1))
+    if [ -n "$attach_tmp" ]; then
+      attach_lineno=$((attach_lineno + 1))
+      printf '[open-decision] task %s%s %s: %s\n' \
+        "$task" "$([ "$key" = default ] && printf '' || printf ' [key=%s]' "$key")" "$verb" "$note" \
+        >> "$attach_tmp" || { rm -f -- "$attach_tmp"; attach_tmp=; }
+    fi
+
     line="$task"
     [ "$key" = default ] || line="$line [key=$key]"
     line="$line $verb: $note"
-    # Every row here is needs-decision or blocked by construction (this fold's
-    # whole contract): the captain needs the full context, options, and
-    # recommendation to relay onward, so the routine per-line cut never
-    # applies here (issue #19).
-    fm_cap_status_line_var "$line" "$verb" $((item_bytes - 1))
-    line=$FM_LINE_CAP_LINE
-    if [ "${#line}" -ge "$global_bytes" ]; then
-      # Even uncapped, this single decision alone could not fit the section's
-      # byte budget: point at its exact source line (never just "read this
-      # file", which is ambiguous once a key reopens more than once in the same
-      # log - status_decision_locator reuses the fold's own key/verb parsing to
-      # find the line that opened this key's CURRENT state).
-      line="$task"
-      [ "$key" = default ] || line="$line [key=$key]"
-      if locator=$(status_decision_locator "$STATE/$task.status" "$key"); then
-        lineno=${locator%%$'\t'*}
-        locstart=${locator#*$'\t'}
-        locstart=${locstart%%$'\t'*}
-        line="$line $verb: too long to print in full here (${#note} chars) - read it in full at $STATE/$task.status:$lineno (byte offset $locstart)"
-      else
-        line="$line $verb: too long to print in full here (${#note} chars) - read it in full at $STATE/$task.status"
-      fi
+    # The shared cut counts the item's own characters; the trailing newline this
+    # section's global budget also pays for is this caller's, so the per-item
+    # allowance passed down is one short of the cap.
+    fm_cap_line_var "$line" $((item_bytes - 1))
+    cand_line=$FM_LINE_CAP_LINE
+    if [ -n "$attach_tmp" ] && [ "${#line}" -gt $((item_bytes - 1)) ]; then
+      cand_line="$cand_line (full: L$attach_lineno)"
     fi
-    bytes=$(( ${#line} + 1 ))
-    if [ $((used + bytes)) -gt "$global_bytes" ]; then
-      # The section's byte budget is a real bound, unchanged from before this
-      # fix: an item that does not fit the REMAINING budget is omitted here,
-      # even a decision - only an item too large for the WHOLE budget (above)
-      # gets a pointer instead of inline text. A decision omitted this way
-      # still gets an exact retrieval route: its task id joins the printed
-      # summary list below rather than vanishing into a bare count.
-      omitted=$((omitted + 1))
-      omitted_decisions="$omitted_decisions$task"
-      [ "$key" = default ] || omitted_decisions="$omitted_decisions [key=$key]"
-      omitted_decisions="$omitted_decisions, "
-      continue
-    fi
-    output="$output$line
+    candidates="$candidates$cand_line
 "
-    used=$((used + bytes))
-    shown=$((shown + 1))
   done <<EOF
 $open
 EOF
 
-  [ "$shown" -gt 0 ] || [ "$omitted" -gt 0 ] || return 0
-  printf 'OPEN DECISIONS (still open, folded from the durable status logs - not just the latest line):\n' || return 1
+  if [ "$total" -eq 0 ]; then
+    rm -f -- "$attach_tmp"
+    return 0
+  fi
+
+  if [ -n "$attach_tmp" ]; then
+    attach_path=$(fm_drain_publish_attachment "$attach_dir" "$attach_tmp") || attach_path=
+  fi
+  if [ -z "$attach_path" ]; then
+    printf 'OPEN DECISIONS SKIPPED: %d decision(s) could not be recorded to a durable attachment; retry on the next drain.\n' "$total" || return 1
+    return 0
+  fi
+
+  heading='OPEN DECISIONS (still open, folded from the durable status logs - not just the latest line):
+'
+  hint="OPEN DECISIONS: close one by answering it: bin/fm-send.sh <task> --resolve-key <key> '<answer>'
+"
+  # Reserve the footer's worst-case width - its wording, the attachment path,
+  # and up to $total's own digit count for the omitted number - before
+  # deciding how many preview rows fit, so the footer itself can never be the
+  # thing that blows the section's budget (issue #19 shape review point 4).
+  footer_reserve=$(( $(_fm_byte_len "$attach_path") + ${#total} + 80 ))
+  row_budget=$(( global_bytes - $(_fm_byte_len "$heading") - $(_fm_byte_len "$hint") - footer_reserve ))
+  if [ "$row_budget" -lt 0 ]; then
+    printf 'OPEN DECISIONS SKIPPED: the durable attachment path is too long to present within budget; %d decision(s) recorded in full at %s\n' \
+      "$total" "$attach_path" || return 1
+    return 0
+  fi
+
+  while IFS= read -r cand_line || [ -n "$cand_line" ]; do
+    [ -n "$cand_line" ] || continue
+    bytes=$(( $(_fm_byte_len "$cand_line") + 1 ))
+    if [ $((used + bytes)) -gt "$row_budget" ]; then
+      omitted=$((omitted + 1))
+      continue
+    fi
+    output="$output$cand_line
+"
+    used=$((used + bytes))
+    shown=$((shown + 1))
+  done <<EOF
+$candidates
+EOF
+
+  printf '%s' "$heading" || return 1
   printf '%s' "$output" || return 1
   if [ "$omitted" -gt 0 ]; then
-    # This list is task/key identifiers, not fold-derived note prose, so it
-    # never takes the routine per-line cut either: cutting it would silently
-    # drop the very retrieval route it exists to guarantee (issue #19). It
-    # stays cheap even at fleet scale - dozens of short ids, not note text.
-    printf 'OPEN DECISIONS: %d more omitted (byte cap); read each in full at its own state/<id>.status: %s\n' \
-      "$omitted" "${omitted_decisions%, }" || return 1
+    printf 'OPEN DECISIONS: %d more not previewed (byte cap); full payloads: %s\n' "$omitted" "$attach_path" || return 1
+  else
+    printf 'OPEN DECISIONS: full payloads: %s\n' "$attach_path" || return 1
   fi
   # Answerer-closes hint, printed at exactly the moment an answer gets written:
   # the send that answers a listed decision also closes it, so closure never
   # depends on the busy worker writing a matching resolved line (contract:
   # bin/fm-send.sh header).
-  printf "OPEN DECISIONS: close one by answering it: bin/fm-send.sh <task> --resolve-key <key> '<answer>'\n" || return 1
+  printf '%s' "$hint" || return 1
 }
 
 # Print the RECORD DIVERGENCE section: every captain call whose two records

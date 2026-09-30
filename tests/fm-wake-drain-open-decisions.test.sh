@@ -178,18 +178,19 @@ test_status_symlink_is_not_followed() {
   pass "the fleet-wide decision scan does not follow status symlinks"
 }
 
-# The per-item cut comes from bin/fm-line-cap-lib.sh's fm_cap_line_var, the
-# single owner also used by bin/fm-session-start.sh's status tails, so one
-# truncation marker means the same thing wherever an agent meets it.
-# fm_cap_status_line_var wraps that shared cut with the needs-decision/blocked
-# exemption this drain section alone needs (session-start's tail is a
-# bounded-length preview by design and keeps the routine cut for every verb).
-# These tests pin the drain's own end of that contract (issue #19): a decision
-# line past the routine bound still prints whole, and one too large for the
-# section's own byte budget falls back to a pointer instead of being silently
-# dropped.
-test_over_long_decision_note_prints_in_full() {
-  local dir state out line expected note
+# Issue #19 shape review, Verdict B (data/rev25-astra/report.md): the routine
+# per-line cut (bin/fm-line-cap-lib.sh's fm_cap_line_var, unchanged, no
+# decision-verb exemption) still applies to every OPEN DECISIONS row, and the
+# section stays a short bounded preview. What issue #19 actually asks for -
+# every selected decision's complete payload readable from the drain output
+# alone, or via one precise pointer - is met by a separate, unbounded,
+# content-addressed attachment file this drain publishes from the SAME
+# selection pass (no second scan of status history, so a rejected or
+# since-superseded line in the raw log can never be mistaken for the current
+# one). A truncated preview row names its own line inside that attachment; the
+# section's footer names the shared attachment path once.
+test_over_long_decision_note_is_capped_with_an_attachment_pointer() {
+  local dir state out line note attach_path attach_line
   dir=$(make_case long-note)
   state="$dir/state"
   out="$dir/drain.out"
@@ -202,15 +203,20 @@ test_over_long_decision_note_prints_in_full() {
 
   FM_STATE_OVERRIDE="$state" "$DRAIN" > "$out" || fail "drain failed on an over-long decision note"
 
-  # A needs-decision line carries the context, options, and recommendation the
-  # captain must relay onward verbatim, so it is exempt from the routine
-  # per-line cut - past the old 220-character bound but nowhere near the
-  # section's own byte budget, it prints whole, byte-for-byte, with no
-  # truncation marker (issue #19).
-  expected="task-long [key=api-shape] needs-decision: $note"
   line=$(grep -F 'task-long' "$out")
-  [ "$line" = "$expected" ] \
-    || fail "an over-long decision note did not print byte-for-byte: got [$line]"
+  case "$line" in
+    *' [truncated] (full: L'*')') : ;;
+    *) fail "an over-long decision note was not capped with an attachment-line reference: $line" ;;
+  esac
+  [ "${#line}" -le 260 ] || fail "a capped decision item ran unexpectedly long: ${#line} chars: $line"
+
+  attach_path=$(grep -F 'full payloads:' "$out" | awk '{print $NF}')
+  [ -n "$attach_path" ] && [ -f "$attach_path" ] \
+    || fail "no readable attachment path was printed for the over-long decision: $(cat "$out")"
+  attach_line=${line##*'(full: L'}
+  attach_line=${attach_line%')'}
+  [ "$(sed -n "${attach_line}p" "$attach_path")" = "[open-decision] task task-long [key=api-shape] needs-decision: $note" ] \
+    || fail "the attachment's referenced line did not hold the complete, byte-for-byte decision"
 
   printf 'needs-decision [key=short]: brief enough to keep whole\n' > "$state/task-short.status"
   FM_STATE_OVERRIDE="$state" "$DRAIN" > "$out" || fail "drain failed on a short decision note"
@@ -219,60 +225,25 @@ test_over_long_decision_note_prints_in_full() {
   if grep -F 'brief enough to keep whole [truncated]' "$out" >/dev/null; then
     fail "a decision note already under the cap was marked truncated"
   fi
+  if grep -F 'task-short' "$out" | grep -F '(full: L' >/dev/null; then
+    fail "a decision note already under the cap carried an unnecessary attachment reference"
+  fi
 
-  pass "an over-long open decision prints in full, byte-for-byte, instead of being cut to the routine per-item budget"
+  pass "an over-long open decision is capped to the routine per-item budget, with its complete payload in the attachment"
 }
 
-test_decision_note_too_large_for_the_section_budget_points_at_its_source() {
-  local dir state out line expected_prefix lineno byteoff content
-  dir=$(make_case huge-note)
-  state="$dir/state"
-  out="$dir/drain.out"
-  # 5000 'x' characters clears the section's whole 4000-byte budget on its
-  # own, so it cannot be printed in full without starving every other
-  # section item; the acceptance bar is "readable in full, or via one
-  # printed pointer" (issue #19), so this is the pointer path - and that
-  # pointer must be exact (a file plus line number and byte offset), not just
-  # "read this file", which issue #19's own review flagged as ambiguous once a
-  # key can open more than once in the same log.
-  awk 'BEGIN { printf "needs-decision [key=huge]: "; while (i++ < 5000) printf "x"; printf "\n" }' \
-    > "$state/task-huge.status"
-
-  FM_STATE_OVERRIDE="$state" "$DRAIN" > "$out" || fail "drain failed on a section-busting decision note"
-
-  line=$(grep -F 'task-huge' "$out")
-  [ -n "$line" ] || fail "a section-busting decision note produced no OPEN DECISIONS line at all: $(cat "$out")"
-  case "$line" in
-    *xxxxxxxxxx*) fail "a section-busting decision note printed inline instead of falling back to a pointer: $line" ;;
-  esac
-  expected_prefix="task-huge [key=huge] needs-decision: too long to print in full here (5000 chars) - read it in full at $state/task-huge.status:"
-  case "$line" in
-    "$expected_prefix"*) : ;;
-    *) fail "a section-busting decision note's pointer did not match the expected exact-locator shape: $line" ;;
-  esac
-  lineno=${line#"$expected_prefix"}
-  lineno=${lineno%% *}
-  [ "$lineno" = 1 ] || fail "the pointer named the wrong line number: $line"
-  byteoff=$(printf '%s' "$line" | grep -oE 'byte offset [0-9]+' | grep -oE '[0-9]+')
-  [ "$byteoff" = 0 ] || fail "the pointer named the wrong byte offset for the file's only line: $line"
-  content=$(dd if="$state/task-huge.status" bs=1 skip="$byteoff" count=27 2>/dev/null)
-  [ "$content" = 'needs-decision [key=huge]: ' ] \
-    || fail "the pointer's byte offset did not land on the decision line: got [$content]"
-
-  pass "a decision note too large for the section budget points at its exact source line instead of being dropped"
-}
-
-test_reopened_key_pointer_locates_the_current_decision() {
-  local dir state out line lineno note2
+test_reopened_key_attachment_holds_the_current_note() {
+  local dir state out line attach_path note2
   dir=$(make_case reopened-key)
   state="$dir/state"
   out="$dir/drain.out"
   # Two DISTINCT 5,000-character needs-decision events share one key with no
   # resolution between them (a legal reopen - see
-  # _fm_decision_key_transition_allowed). A bare "read this file" pointer
-  # cannot tell the captain which of the two is current; the exact-locator
-  # pointer must name the SECOND (currently open) line, not the first
-  # (issue #19 review finding P1).
+  # _fm_decision_key_transition_allowed). The attachment is built from the
+  # fold's own already-selected note, never a second scan of the raw log, so
+  # it can never be misled into recording the superseded first line
+  # (issue #19 review finding P1 against the source-locator design this
+  # replaces).
   note2=$(awk 'BEGIN { while (i++ < 5000) printf "m" }')
   {
     awk 'BEGIN { printf "needs-decision [key=ambiguous]: "; while (i++ < 5000) printf "n"; printf "\n" }'
@@ -284,32 +255,29 @@ test_reopened_key_pointer_locates_the_current_decision() {
 
   line=$(grep -F 'multi' "$out")
   [ -n "$line" ] || fail "a reopened decision key produced no OPEN DECISIONS line: $(cat "$out")"
-  case "$line" in
-    *"(5000 chars)"*) : ;;
-    *) fail "reopened-key pointer did not report the current (second) note's length: $line" ;;
-  esac
-  case "$line" in
-    *"$state/multi.status:3 "*) : ;;
-    *) fail "reopened-key pointer did not name line 3 (the current, second needs-decision): $line" ;;
-  esac
-  lineno=$(sed -n '3p' "$state/multi.status")
-  [ "$lineno" = "needs-decision [key=ambiguous]: $note2" ] \
-    || fail "test fixture's line 3 is not the second needs-decision event"
+  attach_path=$(grep -F 'full payloads:' "$out" | awk '{print $NF}')
+  [ -n "$attach_path" ] && [ -f "$attach_path" ] \
+    || fail "no readable attachment path was printed for the reopened key: $(cat "$out")"
+  grep -qF "[open-decision] task multi [key=ambiguous] needs-decision: $note2" "$attach_path" \
+    || fail "the attachment did not hold the current (second) note in full"
+  if grep -qF 'nnnnnnnnnn' "$attach_path"; then
+    fail "the attachment held the superseded first note instead of only the current one"
+  fi
 
-  pass "a decision key reopened without an intervening resolution points at its current line, not an earlier one"
+  pass "a decision key reopened without an intervening resolution records only the current note"
 }
 
 test_many_oversized_decisions_stay_within_the_section_budget() {
-  local dir state out i section_bytes count
+  local dir state out i section_bytes count attach_path attach_lines
   dir=$(make_case many-huge)
   state="$dir/state"
   out="$dir/drain.out"
-  # 32 distinct 5,000-character decisions: individually each falls back to a
-  # pointer (above the section's own 4,000-byte budget), but printing every
-  # pointer unconditionally would still let the section grow without bound -
-  # exactly the regression issue #19's review flagged (P2). The section must
-  # stay near its advertised budget regardless of how many oversized decisions
-  # are open, and every decision omitted past that must still be named.
+  # 32 distinct 5,000-character decisions: individually each is capped in the
+  # preview, but the section itself must also stay bounded regardless of how
+  # many decisions are open - the regression issue #19's shape review flagged
+  # in the prior (now-replaced) design. Every decision not shown in the
+  # preview must still be recoverable in full from the one attachment file, a
+  # scalar count, and no per-omitted-item identifier list.
   i=1
   while [ "$i" -le 32 ]; do
     awk -v n="$i" 'BEGIN { printf "needs-decision [key=k]: "; while (j++ < 5000) printf "x"; printf "\n" }' \
@@ -320,30 +288,91 @@ test_many_oversized_decisions_stay_within_the_section_budget() {
   FM_STATE_OVERRIDE="$state" "$DRAIN" > "$out" || fail "drain failed on many oversized decisions"
 
   section_bytes=$(awk '/^OPEN DECISIONS \(/{f=1} f{print} /answering it:/{exit}' "$out" | wc -c | tr -d ' ')
-  [ "$section_bytes" -lt 6000 ] \
-    || fail "OPEN DECISIONS grew unbounded with many oversized decisions: $section_bytes bytes"
-  grep -F 'OPEN DECISIONS:' "$out" | grep -F 'more omitted (byte cap)' >/dev/null \
+  [ "$section_bytes" -le 4000 ] \
+    || fail "OPEN DECISIONS grew past its 4,000-byte budget with many oversized decisions: $section_bytes bytes"
+  grep -F 'OPEN DECISIONS:' "$out" | grep -F 'more not previewed (byte cap)' >/dev/null \
     || fail "an over-budget section of oversized decisions did not report bounded omission: $(cat "$out")"
   count=$(grep -c '^task-[0-9]* \[key=k\] needs-decision:' "$out")
   [ "$count" -gt 0 ] && [ "$count" -lt 32 ] \
     || fail "unexpected number of individually-printed decisions: $count"
-  # Every task must appear either as a printed pointer or in the omitted list -
-  # never neither.
+
+  attach_path=$(grep -F 'full payloads:' "$out" | awk '{print $NF}')
+  [ -n "$attach_path" ] && [ -f "$attach_path" ] \
+    || fail "no readable attachment path was printed: $(cat "$out")"
+  attach_lines=$(wc -l < "$attach_path" | tr -d ' ')
+  [ "$attach_lines" -eq 32 ] \
+    || fail "the attachment did not hold all 32 decisions in full: $attach_lines lines"
   i=1
   while [ "$i" -le 32 ]; do
-    grep -qF "task-$i " "$out" || grep -qF "task-$i]" "$out" || grep -qF "task-$i," "$out" \
-      || fail "task-$i is missing from both the printed decisions and the omitted list"
+    grep -qF "[open-decision] task task-$i [key=k] needs-decision:" "$attach_path" \
+      || fail "task-$i's complete decision is missing from the attachment"
     i=$((i + 1))
   done
 
-  pass "many oversized open decisions stay within the section's byte budget, with every one still findable"
+  pass "many oversized open decisions stay within the section's byte budget, with every one recoverable from the attachment"
+}
+
+test_multibyte_decision_note_stays_within_the_byte_budget() {
+  local dir state out section_bytes attach_path
+  dir=$(make_case multibyte)
+  state="$dir/state"
+  out="$dir/drain.out"
+  # 2,000 emoji (4 bytes each in UTF-8) is 2,000 characters but 8,000+ bytes -
+  # under the old character-counted budget this fit "under 4000" while
+  # actually running 8KB+ (issue #19 shape review P2). The section's own
+  # accounting must be in real bytes even though the per-item cut itself stays
+  # locale-aware (never splitting a codepoint).
+  python3 -c "print('needs-decision [key=emoji]: ' + chr(0x1F600) * 2000)" > "$state/task-emoji.status" \
+    || fail "could not generate the multibyte fixture"
+
+  FM_STATE_OVERRIDE="$state" LC_ALL=en_US.UTF-8 "$DRAIN" > "$out" || fail "drain failed on a multibyte decision note"
+
+  section_bytes=$(awk '/^OPEN DECISIONS \(/{f=1} f{print} /answering it:/{exit}' "$out" | wc -c | tr -d ' ')
+  [ "$section_bytes" -le 4000 ] \
+    || fail "a multibyte decision blew the section's byte budget: $section_bytes bytes"
+  python3 -c "open('$out','rb').read().decode('utf-8')" \
+    || fail "the section output was not valid UTF-8 - the per-item cut split a multibyte character"
+
+  attach_path=$(grep -F 'full payloads:' "$out" | awk '{print $NF}')
+  [ -n "$attach_path" ] && [ -f "$attach_path" ] \
+    || fail "no readable attachment path was printed for the multibyte decision: $(cat "$out")"
+  python3 -c "
+d = open('$attach_path', 'rb').read()
+d.decode('utf-8')
+assert d.count('\U0001F600'.encode()) == 2000, 'expected 2000 emoji in the attachment, counted ' + str(d.count('\U0001F600'.encode()))
+" || fail "the attachment did not hold all 2,000 emoji, intact and valid UTF-8"
+
+  pass "a multibyte decision note stays within the section's real byte budget with its full payload intact in the attachment"
+}
+
+test_unchanged_decision_set_reuses_the_same_attachment() {
+  local dir state out1 out2 path1 path2
+  dir=$(make_case attachment-reuse)
+  state="$dir/state"
+  out1="$dir/drain1.out"
+  out2="$dir/drain2.out"
+  awk 'BEGIN { printf "needs-decision [key=k]: "; while (i++ < 5000) printf "x"; printf "\n" }' \
+    > "$state/task-stable.status"
+
+  FM_STATE_OVERRIDE="$state" "$DRAIN" > "$out1" || fail "first drain failed"
+  FM_STATE_OVERRIDE="$state" "$DRAIN" > "$out2" || fail "second drain failed"
+
+  path1=$(grep -F 'full payloads:' "$out1" | awk '{print $NF}')
+  path2=$(grep -F 'full payloads:' "$out2" | awk '{print $NF}')
+  [ -n "$path1" ] && [ "$path1" = "$path2" ] \
+    || fail "an unchanged decision set published a new attachment instead of reusing the existing one: $path1 vs $path2"
+  [ "$(find "$state/drain-decisions" -type f -name '*.txt' | wc -l | tr -d ' ')" = 1 ] \
+    || fail "an unchanged decision set left more than one attachment file behind"
+
+  pass "an unchanged decision set reuses its already-published attachment instead of writing a new one"
 }
 
 test_buried_decision_still_surfaces
-test_over_long_decision_note_prints_in_full
-test_decision_note_too_large_for_the_section_budget_points_at_its_source
-test_reopened_key_pointer_locates_the_current_decision
+test_over_long_decision_note_is_capped_with_an_attachment_pointer
+test_reopened_key_attachment_holds_the_current_note
 test_many_oversized_decisions_stay_within_the_section_budget
+test_multibyte_decision_note_stays_within_the_byte_budget
+test_unchanged_decision_set_reuses_the_same_attachment
 test_explicit_resolution_closes_it
 test_later_unrelated_terminal_line_does_not_close_it
 test_reserved_key_namespace_is_owned_by_its_library
