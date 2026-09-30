@@ -178,13 +178,16 @@ test_status_symlink_is_not_followed() {
   pass "the fleet-wide decision scan does not follow status symlinks"
 }
 
-# The per-item cut (and its exemption for needs-decision/blocked verbs) comes
-# from bin/fm-line-cap-lib.sh's fm_cap_status_line_var, shared with
-# bin/fm-session-start.sh's status tails so one truncation marker means the
-# same thing wherever an agent meets it. These two tests pin the drain's own
-# end of that contract (issue #19): a decision line past the routine bound
-# still prints whole, and one too large for the section's own byte budget
-# falls back to a pointer instead of being silently dropped.
+# The per-item cut comes from bin/fm-line-cap-lib.sh's fm_cap_line_var, the
+# single owner also used by bin/fm-session-start.sh's status tails, so one
+# truncation marker means the same thing wherever an agent meets it.
+# fm_cap_status_line_var wraps that shared cut with the needs-decision/blocked
+# exemption this drain section alone needs (session-start's tail is a
+# bounded-length preview by design and keeps the routine cut for every verb).
+# These tests pin the drain's own end of that contract (issue #19): a decision
+# line past the routine bound still prints whole, and one too large for the
+# section's own byte budget falls back to a pointer instead of being silently
+# dropped.
 test_over_long_decision_note_prints_in_full() {
   local dir state out line expected note
   dir=$(make_case long-note)
@@ -242,7 +245,7 @@ test_decision_note_too_large_for_the_section_budget_points_at_its_source() {
   case "$line" in
     *xxxxxxxxxx*) fail "a section-busting decision note printed inline instead of falling back to a pointer: $line" ;;
   esac
-  expected_prefix="task-huge [key=huge] needs-decision: too long to print in full here (5000 bytes) - read it in full at $state/task-huge.status:"
+  expected_prefix="task-huge [key=huge] needs-decision: too long to print in full here (5000 chars) - read it in full at $state/task-huge.status:"
   case "$line" in
     "$expected_prefix"*) : ;;
     *) fail "a section-busting decision note's pointer did not match the expected exact-locator shape: $line" ;;
@@ -282,7 +285,7 @@ test_reopened_key_pointer_locates_the_current_decision() {
   line=$(grep -F 'multi' "$out")
   [ -n "$line" ] || fail "a reopened decision key produced no OPEN DECISIONS line: $(cat "$out")"
   case "$line" in
-    *"(5000 bytes)"*) : ;;
+    *"(5000 chars)"*) : ;;
     *) fail "reopened-key pointer did not report the current (second) note's length: $line" ;;
   esac
   case "$line" in

@@ -528,9 +528,12 @@ print_status_tail() {
   printf 'status tail (last %s line(s), each capped at %s characters, wake-EVENT history, not current state; full log: %s):\n' \
     "$STATUS_TAIL" "$FM_LINE_CAP_DEFAULT" "$status"
   # A crewmate writes its own status lines, so their length is unbounded: one
-  # observed line ran 865 characters. Cap each one the way the wake digest's
-  # OPEN DECISIONS section does; the lede carries the state word and the key,
-  # and the full log path above reaches the rest.
+  # observed line ran 865 characters. Cap each one with the shared routine cut
+  # (fm-line-cap-lib.sh); the lede carries the state word and the key, and the
+  # full log path above reaches the rest. Unlike the wake digest's OPEN
+  # DECISIONS section, this tail is a bounded-length preview by design, so it
+  # does not carry that section's needs-decision/blocked exemption (issue #19)
+  # - a decision needing its full text is read from the log path above.
   while IFS= read -r line || [ -n "$line" ]; do
     fm_cap_line "$line"
   done < <(tail -n "$STATUS_TAIL" "$status")

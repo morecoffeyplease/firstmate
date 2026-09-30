@@ -348,7 +348,7 @@ test_rejected_decision_line_too_large_for_the_section_points_at_its_byte_offset(
   case "$line" in
     *xxxxxxxxxx*) fail "a section-busting rejected decision printed inline instead of falling back to a pointer: $line" ;;
   esac
-  expected_prefix="rejected-huge blocked: too long to print in full here - read it in full at $state/rejected-huge.status (event ends at byte offset "
+  expected_prefix="rejected-huge blocked: too long to print in full here (5025 chars) - read it in full at $state/rejected-huge.status (event ends at byte offset "
   case "$line" in
     "$expected_prefix"*')') : ;;
     *) fail "a section-busting rejected decision's pointer did not match the expected exact-locator shape: $line" ;;

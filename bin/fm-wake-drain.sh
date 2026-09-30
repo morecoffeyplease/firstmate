@@ -369,17 +369,13 @@ print_status_outcome_backstop_section() {  # <task-and-endpoint-snapshot>
     # never applies to it, same rule as OPEN DECISIONS (issue #19).
     fm_cap_status_line_var "$line" "$verb" $((item_bytes - 1))
     line=$FM_LINE_CAP_LINE
-    if [ "${#line}" -ge "$global_bytes" ]; then
+    if [ "${#line}" -ge "$global_bytes" ] && fm_line_cap_is_decision_verb "$verb"; then
       # This single event alone could not fit the section's own byte budget
       # even uncapped: point at its exact source instead of printing 4KB+ of
       # inline text. event_endpoint is the byte-exact end offset this event's
       # own snapshot read already computed, so the pointer needs no separate
       # locator scan the way OPEN DECISIONS' fold-derived note does.
-      case "$verb" in
-        needs-decision|blocked)
-          line="$task $verb: too long to print in full here - read it in full at $STATE/$task.status (event ends at byte offset $event_endpoint)"
-          ;;
-      esac
+      line="$task $verb: too long to print in full here (${#event} chars) - read it in full at $STATE/$task.status (event ends at byte offset $event_endpoint)"
     fi
     bytes=$(( ${#line} + 1 ))
     if [ $((used + bytes)) -gt "$global_bytes" ]; then
@@ -390,9 +386,7 @@ print_status_outcome_backstop_section() {  # <task-and-endpoint-snapshot>
       # way still gets an exact retrieval route: its task id joins the printed
       # summary list rather than vanishing into a bare count.
       omitted=$((omitted + 1))
-      case "$verb" in
-        needs-decision|blocked) omitted_decisions="$omitted_decisions$task, " ;;
-      esac
+      fm_line_cap_is_decision_verb "$verb" && omitted_decisions="$omitted_decisions$task, "
       continue
     fi
     output="$output$line
@@ -510,9 +504,9 @@ print_open_decisions_section() {
         lineno=${locator%%$'\t'*}
         locstart=${locator#*$'\t'}
         locstart=${locstart%%$'\t'*}
-        line="$line $verb: too long to print in full here (${#note} bytes) - read it in full at $STATE/$task.status:$lineno (byte offset $locstart)"
+        line="$line $verb: too long to print in full here (${#note} chars) - read it in full at $STATE/$task.status:$lineno (byte offset $locstart)"
       else
-        line="$line $verb: too long to print in full here (${#note} bytes) - read it in full at $STATE/$task.status"
+        line="$line $verb: too long to print in full here (${#note} chars) - read it in full at $STATE/$task.status"
       fi
     fi
     bytes=$(( ${#line} + 1 ))

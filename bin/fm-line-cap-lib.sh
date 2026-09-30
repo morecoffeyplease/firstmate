@@ -22,12 +22,8 @@
 # task's full status log path, while every OPEN DECISIONS entry begins with the
 # task id that identifies its durable state/<id>.status source.
 #
-# needs-decision and blocked lines are exempt from the cut (fm_cap_status_line_var
-# below): they carry the context, options, and recommendation a captain must
-# relay onward verbatim, so cutting them at the routine bound only forces a grep
-# of the raw status file back out every time. A caller still owns its own global
-# byte budget for the section and falls back to a pointer at that source file
-# when even an uncapped decision line cannot fit it.
+# needs-decision and blocked lines get a second, exempt cut below
+# (fm_cap_status_line_var) - see that function's own comment for why.
 
 FM_LINE_CAP_DEFAULT=220
 FM_LINE_CAP_SUFFIX=' [truncated]'
