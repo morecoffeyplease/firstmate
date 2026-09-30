@@ -412,7 +412,7 @@ test_remote_fire_and_forget_generated_id_reuses_printed_id_on_retry() {
 
   rc=0
   send_env "$fb" "$home" "$ssh_log" FM_FAKE_SSH_AFTER_AMBIGUOUS_RC=1 \
-    "$SEND" rsm --fire-and-forget= "reconcile your own books" \
+    "$SEND" rsm --fire-and-forget-auto "reconcile your own books" \
     >"$dir/out" 2>"$dir/err" || rc=$?
   expect_code 3 "$rc" "an ambiguous generated-id fire-and-forget delivery must report unconfirmed"
   out=$(cat "$dir/out")
@@ -432,6 +432,30 @@ test_remote_fire_and_forget_generated_id_reuses_printed_id_on_retry() {
   count=$(find "$rhome/state/parent-route/rsm.inbox" -name '*.msg' | wc -l | tr -d ' ')
   [ "$count" = 1 ] || fail "reusing the printed generated id as an explicit retry id created a duplicate remote record"
   pass "fm-send remote: a generated fire-and-forget id is printed once and its reuse on retry is idempotent"
+}
+
+test_remote_fire_and_forget_generated_id_not_printed_on_invalid_budget() {
+  local dir fb ssh_log home rhome rc out
+  # A late but still input-only refusal (a malformed FM_SEND_REMOTE_BUDGET)
+  # must be caught before id generation: nothing was sent, so nothing should
+  # be printed to retry with (independent re-review of PR 26).
+  dir="$TMP_ROOT/remote-fire-and-forget-bad-budget"; mkdir -p "$dir"
+  fb=$(make_stubs "$dir"); ssh_log="$dir/ssh.log"; : > "$ssh_log"
+  rhome=$(setup_remote_secondmate_home remote-fire-and-forget-bad-budget)
+  home=$(setup_remote_parent_home remote-fire-and-forget-bad-budget "$rhome")
+
+  rc=0
+  send_env "$fb" "$home" "$ssh_log" FM_SEND_REMOTE_BUDGET=invalid \
+    "$SEND" rsm --fire-and-forget-auto "reconcile your own books" \
+    >"$dir/out" 2>"$dir/err" || rc=$?
+  [ "$rc" -ne 0 ] || fail "an invalid FM_SEND_REMOTE_BUDGET must refuse"
+  out=$(cat "$dir/out")
+  [ -z "$out" ] || fail "a send refused for an invalid remote budget must not print a generated delivery id: $out"
+  assert_contains "$(cat "$dir/err")" "FM_SEND_REMOTE_BUDGET must be a positive integer" \
+    "the refusal should name the invalid budget"
+  [ "$(find "$rhome/state/parent-route/rsm.inbox" -name '*.msg' 2>/dev/null | wc -l | tr -d ' ')" = 0 ] \
+    || fail "a refused send for an invalid remote budget still landed a remote record"
+  pass "fm-send remote: an invalid remote budget refuses before id generation, printing nothing"
 }
 
 test_remote_send_revalidates_after_retirement_lock() {
@@ -821,6 +845,7 @@ test_remote_rerun_is_idempotent
 test_remote_retry_failure_preserves_ambiguous_expectation
 test_remote_fire_and_forget_never_arms_reply_recovery
 test_remote_fire_and_forget_generated_id_reuses_printed_id_on_retry
+test_remote_fire_and_forget_generated_id_not_printed_on_invalid_budget
 test_remote_send_revalidates_after_retirement_lock
 test_remote_send_revalidates_parent_route_after_retirement_lock
 test_remote_expected_host_revalidates_final_route

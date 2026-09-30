@@ -331,8 +331,8 @@ test_fire_and_forget_no_id_generates_and_prints_one() {
   err="$dir/send.err"
   out="$dir/send.out"
   fm_write_secondmate_meta "$dir/home/state/domain.meta" "$dir/home" "sess:fm-domain"
-  run_send_capture_out "$dir" "$out" "$err" -- domain --fire-and-forget= "reconcile your own books" ||
-    fail "fire-and-forget= with no id should succeed: $(cat "$err")"
+  run_send_capture_out "$dir" "$out" "$err" -- domain --fire-and-forget-auto "reconcile your own books" ||
+    fail "--fire-and-forget-auto should succeed: $(cat "$err")"
   id=$(grep -oE '[a-f0-9]{16}' "$out" | head -1)
   [ -n "$id" ] || fail "no generated fire-and-forget delivery id was printed: $(cat "$out")"
   assert_contains "$(cat "$out")" "fire-and-forget delivery id: $id" \
@@ -348,7 +348,29 @@ test_fire_and_forget_no_id_generates_and_prints_one() {
   esac
   [ -z "$(find "$dir/home/state/pending-replies" -type f -not -name '.*' 2>/dev/null)" ] ||
     fail "a generated fire-and-forget delivery should never create a pending-reply expectation"
-  pass "fm-send fire-and-forget: --fire-and-forget= generates and prints an id, and it is what gets recorded"
+  pass "fm-send fire-and-forget: --fire-and-forget-auto generates and prints an id, and it is what gets recorded"
+}
+
+test_fire_and_forget_empty_equals_value_refused() {
+  local dir err rc
+  # "--fire-and-forget=" with nothing after the "=" used to silently fall
+  # through to an ordinary reply-bearing send (a pre-existing bug flagged by
+  # independent review while this PR was in progress). It must now refuse
+  # loudly and point at the named auto-generate flag instead.
+  dir=$(setup_case fire-empty-equals)
+  err="$dir/send.err"
+  fm_write_secondmate_meta "$dir/home/state/domain.meta" "$dir/home" "sess:fm-domain"
+  run_send "$dir" "$err" -- domain --fire-and-forget= "reconcile your own books"
+  rc=$?
+  [ "$rc" -ne 0 ] || fail "an empty --fire-and-forget= value should refuse, not silently become a reply-bearing send"
+  assert_contains "$(cat "$err")" "nonempty delivery id" \
+    "the empty-value refusal should be explicit"
+  assert_contains "$(cat "$err")" "--fire-and-forget-auto" \
+    "the empty-value refusal should point at the auto-generate flag"
+  [ ! -d "$dir/home/state/domain.inbox" ] || fail "a refused empty --fire-and-forget= send still wrote an inbox record"
+  [ -z "$(find "$dir/home/state/pending-replies" -type f -not -name '.*' 2>/dev/null)" ] ||
+    fail "a refused empty --fire-and-forget= send still created a pending-reply expectation"
+  pass "fm-send fire-and-forget: an empty --fire-and-forget= value is refused, not silently downgraded to a reply-bearing send"
 }
 
 test_fire_and_forget_duplicate_flag_still_refused() {
@@ -356,7 +378,7 @@ test_fire_and_forget_duplicate_flag_still_refused() {
   dir=$(setup_case fire-duplicate)
   err="$dir/send.err"
   fm_write_secondmate_meta "$dir/home/state/domain.meta" "$dir/home" "sess:fm-domain"
-  run_send "$dir" "$err" -- domain --fire-and-forget= --fire-and-forget= "reconcile your own books"
+  run_send "$dir" "$err" -- domain --fire-and-forget-auto --fire-and-forget-auto "reconcile your own books"
   rc=$?
   [ "$rc" -ne 0 ] || fail "a duplicate --fire-and-forget flag should still be refused"
   assert_contains "$(cat "$err")" "duplicate --fire-and-forget" \
@@ -407,7 +429,7 @@ test_fire_and_forget_refused_send_prints_no_generated_id() {
   err="$dir/send.err"
   out="$dir/send.out"
   fm_write_meta "$dir/home/state/t1.meta" "window=sess:fm-t1" "kind=ship" "harness=claude"
-  run_send_capture_out "$dir" "$out" "$err" -- t1 --fire-and-forget= "hello crew"
+  run_send_capture_out "$dir" "$out" "$err" -- t1 --fire-and-forget-auto "hello crew"
   rc=$?
   [ "$rc" -ne 0 ] || fail "fire-and-forget to a non-secondmate target should refuse"
   [ ! -s "$out" ] || fail "a refused fire-and-forget send must not print a generated delivery id: $(cat "$out")"
@@ -567,6 +589,7 @@ test_secondmate_marker_and_enqueue_delivery
 test_fire_and_forget_explicit_id_is_preserved
 test_fire_and_forget_malformed_explicit_id_still_refused
 test_fire_and_forget_no_id_generates_and_prints_one
+test_fire_and_forget_empty_equals_value_refused
 test_fire_and_forget_duplicate_flag_still_refused
 test_fire_and_forget_bare_form_never_guesses_at_message_text
 test_fire_and_forget_refused_send_prints_no_generated_id
