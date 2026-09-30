@@ -331,8 +331,8 @@ test_fire_and_forget_no_id_generates_and_prints_one() {
   err="$dir/send.err"
   out="$dir/send.out"
   fm_write_secondmate_meta "$dir/home/state/domain.meta" "$dir/home" "sess:fm-domain"
-  run_send_capture_out "$dir" "$out" "$err" -- domain --fire-and-forget "reconcile your own books" ||
-    fail "fire-and-forget with no id should succeed: $(cat "$err")"
+  run_send_capture_out "$dir" "$out" "$err" -- domain --fire-and-forget= "reconcile your own books" ||
+    fail "fire-and-forget= with no id should succeed: $(cat "$err")"
   id=$(grep -oE '[a-f0-9]{16}' "$out" | head -1)
   [ -n "$id" ] || fail "no generated fire-and-forget delivery id was printed: $(cat "$out")"
   assert_contains "$(cat "$out")" "fire-and-forget delivery id: $id" \
@@ -348,7 +348,7 @@ test_fire_and_forget_no_id_generates_and_prints_one() {
   esac
   [ -z "$(find "$dir/home/state/pending-replies" -type f -not -name '.*' 2>/dev/null)" ] ||
     fail "a generated fire-and-forget delivery should never create a pending-reply expectation"
-  pass "fm-send fire-and-forget: omitting the id generates and prints one, and it is what gets recorded"
+  pass "fm-send fire-and-forget: --fire-and-forget= generates and prints an id, and it is what gets recorded"
 }
 
 test_fire_and_forget_duplicate_flag_still_refused() {
@@ -356,12 +356,62 @@ test_fire_and_forget_duplicate_flag_still_refused() {
   dir=$(setup_case fire-duplicate)
   err="$dir/send.err"
   fm_write_secondmate_meta "$dir/home/state/domain.meta" "$dir/home" "sess:fm-domain"
-  run_send "$dir" "$err" -- domain --fire-and-forget --fire-and-forget "reconcile your own books"
+  run_send "$dir" "$err" -- domain --fire-and-forget= --fire-and-forget= "reconcile your own books"
   rc=$?
   [ "$rc" -ne 0 ] || fail "a duplicate --fire-and-forget flag should still be refused"
   assert_contains "$(cat "$err")" "duplicate --fire-and-forget" \
     "the duplicate-flag refusal should be explicit"
-  pass "fm-send fire-and-forget: a duplicate flag is refused even when the first occurrence auto-generates"
+  pass "fm-send fire-and-forget: a duplicate flag is refused even when the first occurrence would auto-generate"
+}
+
+test_fire_and_forget_bare_form_never_guesses_at_message_text() {
+  local dir err rc out body
+  # The bare positional form is deterministic, never a shape-based guess: the
+  # very next token is ALWAYS the id, whether or not it happens to look like
+  # a plausible hex id, and the rest is always the message. A hex-shaped first
+  # word is consumed as the id exactly like any other explicit id (this is
+  # legacy behavior kept intentionally strict, not silently reinterpreted -
+  # see independent review of PR 26, probe row 2).
+  dir=$(setup_case fire-bare-hexlike)
+  err="$dir/send.err"
+  fm_write_secondmate_meta "$dir/home/state/domain.meta" "$dir/home" "sess:fm-domain"
+  run_send "$dir" "$err" -- domain --fire-and-forget deadbeefcafe1234 is the sha to check ||
+    fail "a valid-hex first token should still be accepted as the explicit id: $(cat "$err")"
+  body=$(record_body _ "$dir/home/state/domain.inbox/001.msg")
+  case "$body" in
+  *"delivery=deadbeefcafe1234 is the sha to check"*) : ;;
+  *) fail "the hex-shaped first token should be consumed as the id, the rest as the message: $body" ;;
+  esac
+
+  # With no separate id token at all, the single message argument is taken
+  # as the (invalid) id and refused loudly - never silently auto-generated
+  # and never silently sent with the id text missing from the message.
+  dir=$(setup_case fire-bare-message-only)
+  err="$dir/send.err"
+  out="$dir/send.out"
+  fm_write_secondmate_meta "$dir/home/state/domain.meta" "$dir/home" "sess:fm-domain"
+  run_send_capture_out "$dir" "$out" "$err" -- domain --fire-and-forget "reconcile your own books"
+  rc=$?
+  [ "$rc" -ne 0 ] || fail "the bare form with only message text (no id) must refuse, not auto-generate: $(cat "$err")"
+  [ ! -s "$out" ] || fail "a refused bare fire-and-forget send must not print a generated id: $(cat "$out")"
+  assert_contains "$(cat "$err")" "16 lowercase hex" \
+    "the bare form should reject non-id-shaped text with the same hex-shape error"
+  pass "fm-send fire-and-forget: the bare positional form always treats the next token as the id, never as message text"
+}
+
+test_fire_and_forget_refused_send_prints_no_generated_id() {
+  local dir err out rc
+  # A structural refusal (wrong target kind) must never print a generated id
+  # for a send that never happened.
+  dir=$(setup_case fire-refused-no-print)
+  err="$dir/send.err"
+  out="$dir/send.out"
+  fm_write_meta "$dir/home/state/t1.meta" "window=sess:fm-t1" "kind=ship" "harness=claude"
+  run_send_capture_out "$dir" "$out" "$err" -- t1 --fire-and-forget= "hello crew"
+  rc=$?
+  [ "$rc" -ne 0 ] || fail "fire-and-forget to a non-secondmate target should refuse"
+  [ ! -s "$out" ] || fail "a refused fire-and-forget send must not print a generated delivery id: $(cat "$out")"
+  pass "fm-send fire-and-forget: a structurally refused send never prints a generated id"
 }
 
 test_post_enqueue_bookkeeping_failure_is_not_retryable() {
@@ -518,6 +568,8 @@ test_fire_and_forget_explicit_id_is_preserved
 test_fire_and_forget_malformed_explicit_id_still_refused
 test_fire_and_forget_no_id_generates_and_prints_one
 test_fire_and_forget_duplicate_flag_still_refused
+test_fire_and_forget_bare_form_never_guesses_at_message_text
+test_fire_and_forget_refused_send_prints_no_generated_id
 test_post_enqueue_bookkeeping_failure_is_not_retryable
 test_meta_lock_contention_fails_bounded
 test_unwritable_inbox_fails_loudly

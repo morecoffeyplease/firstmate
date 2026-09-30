@@ -403,6 +403,37 @@ test_remote_fire_and_forget_never_arms_reply_recovery() {
   pass "fm-send remote: fire-and-forget delivery is idempotent without reply recovery"
 }
 
+test_remote_fire_and_forget_generated_id_reuses_printed_id_on_retry() {
+  local dir fb ssh_log home rhome rc count out delivery
+  dir="$TMP_ROOT/remote-fire-and-forget-generated"; mkdir -p "$dir"
+  fb=$(make_stubs "$dir"); ssh_log="$dir/ssh.log"; : > "$ssh_log"
+  rhome=$(setup_remote_secondmate_home remote-fire-and-forget-generated)
+  home=$(setup_remote_parent_home remote-fire-and-forget-generated "$rhome")
+
+  rc=0
+  send_env "$fb" "$home" "$ssh_log" FM_FAKE_SSH_AFTER_AMBIGUOUS_RC=1 \
+    "$SEND" rsm --fire-and-forget= "reconcile your own books" \
+    >"$dir/out" 2>"$dir/err" || rc=$?
+  expect_code 3 "$rc" "an ambiguous generated-id fire-and-forget delivery must report unconfirmed"
+  out=$(cat "$dir/out")
+  delivery=$(printf '%s' "$out" | grep -oE '[a-f0-9]{16}' | head -1)
+  [ -n "$delivery" ] || fail "no generated delivery id was printed for the remote leg: $out"
+  assert_contains "$(cat "$dir/err")" "delivery-id=$delivery" \
+    "the unconfirmed-delivery error should name the generated id to retry with"
+  count=$(find "$rhome/state/parent-route/rsm.inbox" -name '*.msg' | wc -l | tr -d ' ')
+  [ "$count" = 1 ] || fail "the ambiguous generated-id delivery did not land exactly once"
+  grep -F "delivery=$delivery" "$(remote_inbox_records "$rhome" | head -1)" >/dev/null \
+    || fail "the remote record did not carry the printed generated delivery id"
+
+  send_env "$fb" "$home" "$ssh_log" \
+    "$SEND" rsm --fire-and-forget "$delivery" "reconcile your own books" \
+    >"$dir/retry.out" 2>"$dir/retry.err" \
+    || fail "reusing the printed generated id on retry failed: $(cat "$dir/retry.err")"
+  count=$(find "$rhome/state/parent-route/rsm.inbox" -name '*.msg' | wc -l | tr -d ' ')
+  [ "$count" = 1 ] || fail "reusing the printed generated id as an explicit retry id created a duplicate remote record"
+  pass "fm-send remote: a generated fire-and-forget id is printed once and its reuse on retry is idempotent"
+}
+
 test_remote_send_revalidates_after_retirement_lock() {
   local dir rhome meta lock ready release rc sender_pid holder_pid
   dir="$TMP_ROOT/remote-retire-race"; mkdir -p "$dir"
@@ -789,6 +820,7 @@ test_remote_steer_lands_in_remote_inbox
 test_remote_rerun_is_idempotent
 test_remote_retry_failure_preserves_ambiguous_expectation
 test_remote_fire_and_forget_never_arms_reply_recovery
+test_remote_fire_and_forget_generated_id_reuses_printed_id_on_retry
 test_remote_send_revalidates_after_retirement_lock
 test_remote_send_revalidates_parent_route_after_retirement_lock
 test_remote_expected_host_revalidates_final_route
