@@ -1667,6 +1667,25 @@ run_check_capture() {
   fm_check_output_cleanup
 }
 
+# 0 when <status-file> is a kind=secondmate task and its entire unseen span
+# (the same .seen-* offset the caller classifies with) is delivery
+# confirmations (status_span_all_confirmations, fm-classify-lib.sh). This is
+# the ONE place that checks task kind before trusting
+# status_is_delivery_confirmation's per-line verdict: that predicate has no
+# notion of kind on its own (fm-classify-lib.sh's status_is_captain_relevant
+# deliberately does not either), so scoping it here is what keeps a plain
+# ship/scout's tagged done: line fully captain-relevant as usual (PR #27
+# review finding P2). Both callers below share this one read so the kind
+# check and the content-safety check are never restated.
+_signal_secondmate_confirmation_only() {  # <status-file>
+  local f=$1 meta kind
+  case "$f" in *.status) ;; *) return 1 ;; esac
+  meta="${f%.status}.meta"
+  kind=$(grep '^kind=' "$meta" 2>/dev/null | tail -1 | cut -d= -f2-)
+  [ "$kind" = secondmate ] || return 1
+  status_span_all_confirmations "$f" "$(fm_wake_signal_seen_size "$STATE" "$f")"
+}
+
 # 0 when any signaled status file carries a captain-relevant event in the bytes
 # appended since this watcher last classified it. The start offset is the
 # classified-position field in that file's .seen-* marker, and fm-classify-lib.sh's
@@ -1685,6 +1704,12 @@ run_check_capture() {
 # route those - and only those - signal rows as main-only
 # (docs/pi-supervision-branch.md). Stale and heartbeat rows retain their existing
 # eligibility rules.
+# A verified kind=secondmate delivery-confirmation span (issue #18) downgrades
+# an otherwise-actionable rc=0/needs_decision=0 result to non-actionable here,
+# AFTER the ordinary kind-agnostic classification already ran: this is the only
+# place that override happens, so it can never reach an ordinary ship/scout's
+# done: line (PR #27 review finding P2), and it never fires when the span
+# carries a real decision (needs_decision=1 skips the check entirely).
 signal_files_actionable() {  # <status-file> ...
   local f task record rest endpoint ident needs_decision rc found=1
   FM_SIGNAL_SURFACE_ENDPOINTS=''
@@ -1706,6 +1731,9 @@ signal_files_actionable() {  # <status-file> ...
       found=0
       continue
     fi
+    if [ "$rc" -eq 0 ] && [ "$needs_decision" -eq 0 ] && _signal_secondmate_confirmation_only "$f"; then
+      rc=1
+    fi
     endpoint=${record%%$'\t'*}; rest=${record#*$'\t'}; ident=${rest%%$'\t'*}
     FM_SIGNAL_SURFACE_ENDPOINTS="${FM_SIGNAL_SURFACE_ENDPOINTS}${f}"$'\t'"${endpoint}"$'\t'"${ident}"$'\n'
     if [ "$needs_decision" -eq 1 ]; then
@@ -1720,27 +1748,20 @@ signal_files_actionable() {  # <status-file> ...
 
 # Space-separated subset of the given status-file batch that
 # signal_crew_provably_working's secondmate always-surface rule may safely skip:
-# a kind=secondmate .status file whose entire unseen span (the same .seen-*
-# offset signal_files_actionable just classified) is delivery confirmations
-# (status_span_all_confirmations, fm-classify-lib.sh). Every other secondmate
-# .status file - any span carrying a working:, paused:, note:, resolved:,
-# captain-held:, or untagged done: line - is deliberately excluded, so that
-# task keeps forcing a surface exactly as before (docs/secondmate-parent-
-# channel.md: nobody reads a mate's chat, so an unrecognized append must still
-# reach the parent). Call only after signal_files_actionable has already ruled
-# the whole batch non-actionable; a captain-relevant span always surfaces
-# regardless of this list (issue #18).
+# a kind=secondmate .status file whose entire unseen span is delivery
+# confirmations (_signal_secondmate_confirmation_only, shared with
+# signal_files_actionable above). Every other secondmate .status file - any
+# span carrying a working:, paused:, note:, resolved:, captain-held:, an
+# untagged done:, or a tagged done: whose text still carries outcome content -
+# is deliberately excluded, so that task keeps forcing a surface exactly as
+# before (docs/secondmate-parent-channel.md: nobody reads a mate's chat, so an
+# unrecognized append must still reach the parent). Call only after
+# signal_files_actionable has already ruled the whole batch non-actionable; a
+# captain-relevant span always surfaces regardless of this list (issue #18).
 signal_secondmate_confirmation_files() {  # <status-file> ...
-  local f task meta kind
+  local f
   for f in "$@"; do
-    case "$f" in *.status) ;; *) continue ;; esac
-    [ -e "$f" ] || [ -L "$f" ] || continue
-    task=$(basename "$f"); task="${task%.status}"
-    meta="${f%.status}.meta"
-    kind=$(grep '^kind=' "$meta" 2>/dev/null | tail -1 | cut -d= -f2-)
-    [ "$kind" = secondmate ] || continue
-    status_span_all_confirmations "$f" "$(fm_wake_signal_seen_size "$STATE" "$f")" \
-      && printf '%s ' "$f"
+    _signal_secondmate_confirmation_only "$f" && printf '%s ' "$f"
   done
 }
 

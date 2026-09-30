@@ -200,40 +200,98 @@ status_is_terminal_verb() {
   esac
 }
 
-# 0 when the "[confirmation]" delivery-confirmation tag sits in the documented
-# position before the line's first colon (or anywhere on a line with no colon
-# at all) - the same position rule "[key=...]" uses (_fm_key_before_colon).
-_fm_status_confirmation_tag() {  # <status-line>
-  case "${1%%:*}" in
-    *\[confirmation\]*) return 0 ;;
-    *) return 1 ;;
-  esac
+# The strict grammar for the text before the line's first colon: exactly the
+# word "done", then zero or more whitespace-separated recognized tokens
+# ("[key=<slug>]", "[corr=<16 hex>]", or the bare "corr=<16 hex>" form) in any
+# order around exactly one "[confirmation]" token, and nothing else. Case
+# sensitive on purpose (matches "[confirmation]" only, never "[Confirmation]"),
+# and this is a fixed regex string, never built from a caller-influenced
+# variable.
+_FM_STATUS_CONFIRMATION_PREFIX_RE='^done([[:space:]]+(\[key=[A-Za-z0-9_-]+\]|\[corr=[0-9A-Fa-f]{16}\]|corr=[0-9A-Fa-f]{16}))*[[:space:]]+\[confirmation\]([[:space:]]+(\[key=[A-Za-z0-9_-]+\]|\[corr=[0-9A-Fa-f]{16}\]|corr=[0-9A-Fa-f]{16}))*[[:space:]]*$'
+
+# 0 when the text before <status-line>'s first colon matches the strict prefix
+# grammar above exactly: "done" plus only recognized bracket/corr tokens around
+# exactly one "[confirmation]" token, with nothing else. This is a full-prefix
+# grammar rather than "does '[confirmation]' occur anywhere before the colon"
+# (the loose form this replaced): a stray word or punctuation glued in ahead of
+# the first colon - "done [confirmation] needs-decision: ...",
+# "done [confirmation]; blocked: ...", "done [key=a]x[confirmation]: ..." - now
+# fails the grammar outright rather than depending on a content blocklist to
+# catch it (PR #27 review finding P1-1, Opus's real-watcher probe matrix).
+# Case-sensitive matching is forced regardless of the caller's ambient
+# nocasematch state, matching how "[confirmation]" itself is case-sensitive.
+_fm_status_confirmation_prefix_ok() {  # <status-line>
+  local prefix=${1%%:*} restore_case=0 matched=1
+  shopt -q nocasematch && { shopt -u nocasematch; restore_case=1; }
+  [[ "$prefix" =~ $_FM_STATUS_CONFIRMATION_PREFIX_RE ]] && matched=0
+  [ "$restore_case" -eq 0 ] || shopt -s nocasematch
+  return "$matched"
 }
 
-# 0 if <status-line> is a `done:` completion explicitly tagged [confirmation]:
-# a secondmate's delivery confirmation that a previously routed instruction was
-# carried out, with no outcome for the parent to act on (issue #18). Verb-gated
-# to `done` only - the tag has NO EFFECT on needs-decision, blocked, or failed,
-# so a misapplied tag on a real outcome still wakes the parent rather than
-# silently dropping it. status_is_captain_relevant is the only place this
-# predicate changes the wake verdict for an ordinary crewmate or scout;
-# bin/fm-watch.sh's signal_secondmate_confirmation_files (via
-# status_span_all_confirmations below) is the only place it lets a secondmate's
-# otherwise-always-surfaced .status append be absorbed.
+# 0 when <status-line> contains NONE of the signals that must always wake the
+# parent even inside a tagged done: line's own text: the same legacy
+# captain-relevance tokens status_is_captain_relevant's free-text fallback
+# already uses (FM_CAPTAIN_RE/FM_CLASSIFY_CAPTAIN_RE_DEFAULT - "done:",
+# "needs-decision:", "blocked:", "failed:", "PR ready", "checks green", "ready
+# in branch", "merged"); a bare URL scheme, since a PR or merge link is itself
+# an outcome the captain must see in full (AGENTS.md: every PR mention carries
+# its complete https:// URL); and a small case-sensitive substring list for
+# outcomes the legacy vocabulary above does not otherwise name - a bare "PR"
+# mention, a "pull/" path segment, a doc-pointer "report.md", or an
+# unstructured "finding:"/"decision:" note (PR #27 review finding P1-2, Opus's
+# "finding: auth bypass" probe). That list is deliberately case-sensitive
+# exact-substring, not the case-insensitive FM_CAPTAIN_RE match above: a
+# case-insensitive bare "pr" would also match ordinary prose ("approve",
+# "surprise", "improve"), which would make the tag useless for its one
+# intended purpose. "data/" alone is NOT blocked: the issue's own motivating
+# example ("recorded in data/captain.md and cascaded") must stay absorbable,
+# and "report.md" already catches the doc-pointer shape
+# (bin/fm-secondmate-report.sh --doc) this guards against. Checked against the
+# WHOLE line, not just the note after the colon, so content ahead of the first
+# colon cannot dodge it either. A false positive here only means an extra
+# wake, which is the intended fail-toward-waking bias.
+_fm_status_confirmation_outcome_free() {  # <status-line>
+  local line=$1
+  _fm_classify_matches "$line" "${FM_CAPTAIN_RE:-$FM_CLASSIFY_CAPTAIN_RE_DEFAULT}" && return 1
+  _fm_classify_matches "$line" '[a-zA-Z][a-zA-Z0-9+.-]*://' && return 1
+  case "$line" in
+    *PR*|*pull/*|*report.md*|*finding:*|*decision:*) return 1 ;;
+  esac
+  return 0
+}
+
+# 0 if <status-line> is a `done:` completion explicitly tagged [confirmation]
+# whose text carries no outcome or decision content of its own
+# (_fm_status_confirmation_outcome_free): a secondmate's delivery confirmation
+# that a previously routed instruction was carried out, with no outcome for
+# the parent to act on (issue #18). Verb-gated to `done` only - the tag has NO
+# EFFECT on needs-decision, blocked, or failed, so a misapplied tag on a real
+# outcome still wakes the parent rather than silently dropping it.
+# Deliberately NOT wired into status_is_captain_relevant: that predicate is
+# shared by every task kind, and this one exists only for a verified
+# kind=secondmate status span (PR #27 review finding P2). bin/fm-watch.sh's
+# signal_files_actionable and signal_secondmate_confirmation_files (via
+# status_span_all_confirmations below) are the only places that check kind
+# before trusting this predicate to let a secondmate's otherwise-always-
+# surfaced .status append go unwoken.
 status_is_delivery_confirmation() {  # <status-line>
   local line=$1 verb
   [ -n "$line" ] || return 1
   verb=$(status_line_verb "$line")
   [ "$verb" = "done" ] || return 1
-  _fm_status_confirmation_tag "$line"
+  _fm_status_confirmation_prefix_ok "$line" || return 1
+  _fm_status_confirmation_outcome_free "$line"
 }
 
 # 0 if the given (last) status line matches a captain-relevant verb.
 # Verb-aware by default: terminal verbs always match; nonterminal progress verbs
 # (working, resolved, captain-held) and paused never match from free-text prose;
 # only lines without those leading verbs may still match free-text tokens for
-# legacy bare lines such as "merged" or "PR ready". A done: line explicitly
-# tagged [confirmation] is excluded the same way, regardless of FM_CAPTAIN_RE.
+# legacy bare lines such as "merged" or "PR ready". A tagged [confirmation]
+# done: line is STILL captain-relevant here, on purpose: this predicate has no
+# notion of task kind, and status_is_delivery_confirmation's absorb is scoped
+# to a verified kind=secondmate span by its only two callers, never by this
+# shared, kind-agnostic classifier (PR #27 review finding P2).
 status_is_captain_relevant() {
   local line=$1 verb
   [ -n "$line" ] || return 1
@@ -241,9 +299,6 @@ status_is_captain_relevant() {
   case "$verb" in
     working|resolved|captain-held|"${FM_CLASSIFY_PAUSED_VERB:-$FM_CLASSIFY_PAUSED_VERB_DEFAULT}")
       return 1
-      ;;
-    done)
-      status_is_delivery_confirmation "$line" && return 1
       ;;
   esac
   if [ -z "${FM_CAPTAIN_RE+x}" ]; then

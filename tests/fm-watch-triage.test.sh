@@ -245,6 +245,15 @@ test_status_span_all_confirmations_classifier() {
     && fail "a needs-decision: line appended after the offset was hidden from the span scan"
   status_span_all_confirmations "$state/later.status" 0 \
     && fail "an all-confirmations verdict ignored an earlier line outside the requested span start"
+  # PR #27 review finding P1: a tagged done: line hiding real outcome or
+  # decision content in its own text must not read as all-confirmations.
+  printf 'done [confirmation]: merged https://github.com/morecoffeyplease/firstmate/pull/27\n' \
+    > "$state/merge-url.status"
+  status_span_all_confirmations "$state/merge-url.status" 0 \
+    && fail "a tagged done: line carrying a merge URL was wrongly all-confirmations"
+  printf 'done [confirmation]: relayed; needs-decision: choose a vendor\n' > "$state/embedded-decision.status"
+  status_span_all_confirmations "$state/embedded-decision.status" 0 \
+    && fail "a tagged done: line hiding an embedded needs-decision: was wrongly all-confirmations"
   pass "status_span_all_confirmations: absorbable only when the whole new span is tagged confirmations"
 }
 
@@ -381,13 +390,17 @@ test_classifier_primitives() {
   status_is_captain_relevant "merged" || fail "legacy bare merged free-text not captain-relevant"
   status_is_captain_relevant "PR ready https://x/pull/2" \
     || fail "legacy bare PR ready free-text not captain-relevant"
-  # issue #18: a done: line tagged [confirmation] is a secondmate delivery
-  # confirmation and must stop being captain-relevant, but the tag has NO
-  # EFFECT on any other verb - a misapplied tag must still wake the parent.
+  # issue #18: status_is_delivery_confirmation recognizes a clean [confirmation]
+  # tagged done: line, but PR #27 review finding P2 established that
+  # status_is_captain_relevant must stay completely kind-agnostic - it has no
+  # notion of secondmate vs. ordinary crew, so a tagged done: line MUST remain
+  # captain-relevant there exactly like an untagged one. The absorb only
+  # happens one layer up, in bin/fm-watch.sh, gated on a verified
+  # kind=secondmate task (signal_files_actionable/signal_secondmate_confirmation_files).
   status_is_delivery_confirmation "done [confirmation]: relayed to Surfaces" \
-    || fail "a tagged done: line was not recognized as a delivery confirmation"
+    || fail "a clean tagged done: line was not recognized as a delivery confirmation"
   status_is_captain_relevant "done [confirmation]: relayed to Surfaces" \
-    && fail "a tagged done: line was still captain-relevant"
+    || fail "a tagged done: line stopped being captain-relevant (status_is_captain_relevant must stay kind-agnostic)"
   status_is_terminal_verb "done [confirmation]: relayed to Surfaces" \
     || fail "a tagged done: line stopped being a terminal verb"
   status_is_captain_relevant "done: relayed to Surfaces" \
@@ -404,12 +417,29 @@ test_classifier_primitives() {
     || fail "a mistagged failed: line stopped waking the parent"
   status_is_captain_relevant "working [confirmation]: still going" \
     && fail "the confirmation tag made a working: line captain-relevant"
-  status_is_captain_relevant "done corr=aaaa1111bbbb2222 [confirmation]: relayed" \
-    && fail "the confirmation tag did not read through a correlation token"
-  status_is_captain_relevant "done [confirmation] corr=aaaa1111bbbb2222: relayed" \
-    && fail "the confirmation tag was not recognized ahead of a correlation token"
-  status_is_captain_relevant "done: [confirmation] relayed" \
-    || fail "a [confirmation] token mentioned only in the note (after the colon) was wrongly recognized as the tag"
+  status_is_delivery_confirmation "done corr=aaaa1111bbbb2222 [confirmation]: relayed" \
+    || fail "the confirmation tag did not read through a correlation token"
+  status_is_delivery_confirmation "done [confirmation] corr=aaaa1111bbbb2222: relayed" \
+    || fail "the confirmation tag was not recognized ahead of a correlation token"
+  status_is_delivery_confirmation "done: [confirmation] relayed" \
+    && fail "a [confirmation] token mentioned only in the note (after the colon) was wrongly recognized as the tag"
+  # PR #27 review finding P1: outcome or decision content inside the tagged
+  # line's own text - a merge/PR URL, an embedded needs-decision/blocked/failed
+  # token, any legacy free-text outcome token, or a malformed line that crams a
+  # second verb ahead of the first colon - must disqualify the confirmation
+  # rather than being silently absorbed.
+  status_is_delivery_confirmation \
+    "done [confirmation]: merged https://github.com/morecoffeyplease/firstmate/pull/27" \
+    && fail "a tagged done: line carrying a merge URL was wrongly treated as a clean confirmation"
+  status_is_delivery_confirmation \
+    "done [confirmation]: relayed to Surfaces; needs-decision: choose a vendor" \
+    && fail "a tagged done: line hiding an embedded needs-decision: was wrongly treated as a clean confirmation"
+  status_is_delivery_confirmation "done [confirmation] needs-decision: choose a vendor" \
+    && fail "a malformed pre-colon needs-decision: token was wrongly treated as a clean confirmation"
+  status_is_delivery_confirmation "done [confirmation]: PR ready checks green" \
+    && fail "legacy outcome free-text inside a tagged done: line was wrongly treated as a clean confirmation"
+  status_is_delivery_confirmation "done [confirmation]: see http://example.com/x" \
+    && fail "a bare URL inside a tagged done: line was wrongly treated as a clean confirmation"
   [ "$(window_to_task "sess:fm-fix-login-k3")" = "fix-login-k3" ] || fail "window_to_task did not strip session+fm- prefix"
   fm_write_meta "$state/herdr-task.meta" "window=default:w1:p2" "backend=herdr"
   [ "$(window_to_task "default:w1:p2" "$state")" = "herdr-task" ] || fail "window_to_task did not resolve opaque backend target through metadata"
@@ -452,6 +482,72 @@ EOF
   [ -z "$(status_open_activities "$state/legacy-activity.status")" ] \
     || fail "a legacy terminal event did not supersede the default working phase"
   pass "classifier primitives: keyed decisions and activity phases, captain relevance, window-to-task, and overrides"
+}
+
+# PR #27 independent review findings (Sol + Opus): status_is_delivery_confirmation
+# must reject every adversarial shape that tries to smuggle a decision, blocker,
+# failure, or outcome past the [confirmation] tag, not merely the cases where a
+# recognized verb happens to lead the line. Opus drove the real watcher against
+# every "must reject" row here and confirmed each one surfaced on unpatched
+# fm-classify-lib.sh and was wrongly absorbed before this grammar tightening.
+test_delivery_confirmation_adversarial_classifier() {
+  # Clean, well-formed lines: must still absorb.
+  status_is_delivery_confirmation "done [confirmation]: relayed to Surfaces" \
+    || fail "a clean tagged done: line was rejected"
+  status_is_delivery_confirmation "done [confirmation]: recorded in data/captain.md and cascaded" \
+    || fail "the issue's own worked example was rejected (data/ must not be blocklisted)"
+  status_is_delivery_confirmation "done [key=vendor] [confirmation]: vendor chosen" \
+    || fail "a clean line with a key token ahead of the tag was rejected"
+  status_is_delivery_confirmation "done [confirmation] [corr=abcd1234abcd1234]: relayed" \
+    || fail "a clean line with a bracketed corr token after the tag was rejected"
+  status_is_delivery_confirmation "done [confirmation] corr=abcd1234abcd1234: relayed" \
+    || fail "a clean line with a bare corr token after the tag was rejected"
+  status_is_delivery_confirmation "done corr=aaaa1111bbbb2222 [confirmation]: relayed" \
+    || fail "a clean line with a bare corr token before the tag was rejected"
+  # Structural smuggling: a second verb or stray text crammed ahead of the
+  # first colon, so the grammar itself - not a content blocklist - must reject it.
+  status_is_delivery_confirmation "done [confirmation] needs-decision: which vendor?" \
+    && fail "a needs-decision word glued after the tag, ahead of the colon, was accepted"
+  status_is_delivery_confirmation "done [confirmation]; blocked: CI red on main" \
+    && fail "a semicolon-joined blocked: clause ahead of the colon was accepted"
+  status_is_delivery_confirmation "done [confirmation]; failed: deploy rolled back" \
+    && fail "a semicolon-joined failed: clause ahead of the colon was accepted"
+  status_is_delivery_confirmation "done [key=a]x[confirmation]: y" \
+    && fail "a stray character glued between two recognized tokens was accepted"
+  status_is_delivery_confirmation "done [confirmation] relayed with no colon, merged https://x/pull/9" \
+    && fail "a colonless line with trailing outcome prose was accepted"
+  # Content smuggling: the prefix is grammatically clean, but the note itself
+  # (after the first colon) still carries a decision, outcome, or pointer.
+  status_is_delivery_confirmation "done [confirmation]: relayed to Surfaces; needs-decision: choose a vendor" \
+    && fail "an embedded needs-decision: in the note was accepted"
+  status_is_delivery_confirmation "done [key=vendor] [confirmation]: finding: auth bypass in login" \
+    && fail "an unstructured finding: smuggled in the note was accepted"
+  status_is_delivery_confirmation "done [confirmation]: merged https://github.com/morecoffeyplease/firstmate/pull/27" \
+    && fail "a merge URL in the note was accepted"
+  status_is_delivery_confirmation "done [confirmation]: PR https://github.com/o/r/pull/7" \
+    && fail "a bare PR mention in the note was accepted"
+  status_is_delivery_confirmation "done [confirmation] [corr=abcd1234abcd1234]: data/x/report.md (via-helper)" \
+    && fail "a report.md doc pointer in the note was accepted"
+  status_is_delivery_confirmation "done [confirmation]: see http://example.com/x" \
+    && fail "a bare URL in the note was accepted"
+  # Tag misplacement or case must never accidentally recognize the tag.
+  status_is_delivery_confirmation "done [Confirmation]: relayed" \
+    && fail "a capitalized [Confirmation] tag was recognized (must be case-sensitive)"
+  status_is_delivery_confirmation "[confirmation] done: relayed" \
+    && fail "a tag placed before the verb was recognized"
+  status_is_delivery_confirmation "done: [confirmation] relayed" \
+    && fail "a tag placed in the note after the colon was recognized"
+  status_is_delivery_confirmation "failed: done [confirmation]: relayed" \
+    && fail "a tag was recognized on a line whose actual leading verb is failed:"
+  # Every one of the above must ALSO still be captain-relevant (fail toward
+  # waking has no other backstop for these): the whole point is that rejection
+  # by status_is_delivery_confirmation means status_is_captain_relevant sees an
+  # ordinary done:/needs-decision:/blocked:/failed: line.
+  status_is_captain_relevant "done [confirmation] needs-decision: which vendor?" \
+    || fail "a rejected confirmation line stopped being captain-relevant"
+  status_is_captain_relevant "done [confirmation]: merged https://github.com/morecoffeyplease/firstmate/pull/27" \
+    || fail "a rejected outcome-carrying confirmation line stopped being captain-relevant"
+  pass "status_is_delivery_confirmation: every adversarial smuggling shape from the PR #27 review is rejected"
 }
 
 # crew_is_provably_working: the absorb-only-when-provably-working predicate. It is
@@ -804,6 +900,102 @@ test_secondmate_mixed_confirmation_and_decision_surfaces() {
   grep -F "$state/sm.status" "$drain_out" >/dev/null || fail "surfaced mixed span was not queued"
   unset FM_FAKE_CREW_STATE_sm
   pass "a secondmate span mixing a confirmation with a real decision still surfaces in full"
+}
+
+# PR #27 review finding P1, at full watcher level: a tagged done: line hiding a
+# merge URL in its own text must still surface, even though it parses as a
+# well-formed [confirmation]-tagged done: line.
+test_secondmate_confirmation_with_outcome_content_surfaces() {
+  local dir state fakebin out drain_out pid
+  dir=$(make_case secondmate-confirmation-outcome); state="$dir/state"; fakebin="$dir/fakebin"
+  out="$dir/watch.out"; drain_out="$dir/drain.out"
+  printf 'kind=secondmate\n' > "$state/sm.meta"
+  printf 'done [confirmation]: merged https://github.com/morecoffeyplease/firstmate/pull/27\n' > "$state/sm.status"
+  export FM_FAKE_CREW_STATE_sm='state: unknown · source: none · no current-state source available'
+  watch_bg "$state" "$fakebin" "$out"
+  pid=$!
+  wait_for_exit "$pid" 100 \
+    || fail "watcher did not surface a tagged done: line whose own text carries a merge outcome"
+  grep -F "signal: $state/sm.status" "$out" >/dev/null || fail "watcher did not print the surfaced outcome-carrying signal"
+  FM_STATE_OVERRIDE="$state" "$DRAIN" > "$drain_out" 2>/dev/null || fail "drain after the surfaced outcome-carrying line failed"
+  grep -F "$state/sm.status" "$drain_out" >/dev/null || fail "surfaced outcome-carrying line was not queued"
+  unset FM_FAKE_CREW_STATE_sm
+  pass "a tagged done: line carrying a merge outcome in its own text still surfaces"
+}
+
+# PR #27 review finding P2, at full watcher level: the confirmation tag must
+# NEVER let an ordinary (kind=ship) crewmate's done: line go unreported, even
+# when that crewmate is provably working at the moment of the poll - the exact
+# combination that would leak the secondmate-only carve-out onto ordinary crew.
+test_ordinary_crew_confirmation_tag_still_surfaces() {
+  local dir state fakebin out drain_out pid
+  dir=$(make_case ship-confirmation-tag-leak); state="$dir/state"; fakebin="$dir/fakebin"
+  out="$dir/watch.out"; drain_out="$dir/drain.out"
+  printf 'kind=ship\n' > "$state/crew.meta"
+  printf 'done [confirmation]: relayed to Surfaces\n' > "$state/crew.status"
+  # Provably working: exactly the busy evidence that would let
+  # signal_crew_provably_working absorb a genuine no-verb wake, which a tagged
+  # done: line for an ORDINARY crewmate must never qualify for.
+  export FM_FAKE_CREW_STATE_crew='state: working · source: pane · running'
+  watch_bg "$state" "$fakebin" "$out"
+  pid=$!
+  wait_for_exit "$pid" 100 \
+    || fail "watcher did not surface an ordinary crewmate's tagged done: line even while provably working"
+  grep -F "signal: $state/crew.status" "$out" >/dev/null || fail "watcher did not print the surfaced ordinary-crew signal"
+  FM_STATE_OVERRIDE="$state" "$DRAIN" > "$drain_out" 2>/dev/null || fail "drain after the surfaced ordinary-crew line failed"
+  grep -F "$state/crew.status" "$drain_out" >/dev/null || fail "surfaced ordinary-crew tagged done: line was not queued"
+  unset FM_FAKE_CREW_STATE_crew
+  pass "an ordinary crewmate's tagged done: line still surfaces, busy or not - the confirmation carve-out never leaks off secondmate"
+}
+
+# PR #27 review finding P1-1, at full watcher level: Opus's "combo" and "semi"
+# probe rows - a second verb or clause glued ahead of the first colon on an
+# otherwise well-formed [confirmation] tag - were absorbed by the real watcher
+# before the strict prefix grammar; they must surface now.
+test_secondmate_confirmation_structural_smuggling_surfaces() {
+  local dir state fakebin out drain_out pid
+  dir=$(make_case secondmate-confirmation-structural); state="$dir/state"; fakebin="$dir/fakebin"
+  out="$dir/watch.out"; drain_out="$dir/drain.out"
+  printf 'kind=secondmate\n' > "$state/sm.meta"
+  printf 'done [confirmation] needs-decision: which vendor?\n' > "$state/sm.status"
+  export FM_FAKE_CREW_STATE_sm='state: unknown · source: none · no current-state source available'
+  watch_bg "$state" "$fakebin" "$out"
+  pid=$!
+  wait_for_exit "$pid" 100 \
+    || fail "watcher did not surface a needs-decision word glued ahead of the colon on a tagged done: line"
+  grep -F "signal: $state/sm.status" "$out" >/dev/null || fail "watcher did not print the surfaced structural-smuggling signal"
+  FM_STATE_OVERRIDE="$state" "$DRAIN" > "$drain_out" 2>/dev/null || fail "drain after the surfaced structural-smuggling line failed"
+  grep -F "$state/sm.status" "$drain_out" >/dev/null || fail "surfaced structural-smuggling line was not queued"
+  unset FM_FAKE_CREW_STATE_sm
+  pass "a decision/blocker/failure word glued ahead of the first colon on a tagged done: line still surfaces"
+}
+
+# Opus's observation: an absorbed confirmation is delayed to the next wake's
+# annotation, never dropped. A confirmation-only status append is absorbed
+# with no queue entry, then a later routine working: append on the SAME task
+# surfaces normally and the confirmation line is still visible as the prior
+# unread wake-event in the drain's queued-signal annotation, not lost.
+test_absorbed_confirmation_visible_at_next_drain() {
+  local dir state fakebin out drain_out pid
+  dir=$(make_case secondmate-confirmation-next-drain); state="$dir/state"; fakebin="$dir/fakebin"
+  out="$dir/watch.out"; drain_out="$dir/drain.out"
+  printf 'kind=secondmate\n' > "$state/sm.meta"
+  printf 'done [confirmation]: relayed to Surfaces\n' > "$state/sm.status"
+  export FM_FAKE_CREW_STATE_sm='state: unknown · source: none · no current-state source available'
+  watch_bg "$state" "$fakebin" "$out"
+  pid=$!
+  if ! wait_poll_cycle "$state" "$pid"; then
+    reap "$pid"; fail "watcher exited for the confirmation-only signal it should absorb before the follow-up append"
+  fi
+  [ ! -s "$out" ] || fail "the confirmation-only signal printed a wake reason before the follow-up append"
+  printf 'working: phase two started\n' >> "$state/sm.status"
+  wait_for_exit "$pid" 100 || fail "watcher did not surface the follow-up working: append"
+  FM_STATE_OVERRIDE="$state" "$DRAIN" > "$drain_out" 2>/dev/null || fail "drain after the follow-up surface failed"
+  grep -F "relayed to Surfaces" "$drain_out" >/dev/null \
+    || fail "the earlier absorbed confirmation line never became visible at the next drain"
+  reap "$pid"
+  unset FM_FAKE_CREW_STATE_sm
+  pass "an absorbed confirmation is delayed to the next wake's annotation, never dropped"
 }
 
 # --- benign wakes are absorbed ONLY when the crew is provably working ---------
@@ -5202,6 +5394,7 @@ test_status_span_respects_decision_closure
 test_malformed_seen_signature_reads_the_whole_log
 test_stale_is_terminal_classifier
 test_classifier_primitives
+test_delivery_confirmation_adversarial_classifier
 test_crew_is_provably_working_classifier
 test_status_is_paused_classifier
 test_crew_absorb_class_classifier
@@ -5213,6 +5406,10 @@ test_signal_crew_provably_working_classifier
 test_secondmate_status_signal_never_absorbed_classifier
 test_secondmate_confirmation_signal_absorbed
 test_secondmate_mixed_confirmation_and_decision_surfaces
+test_secondmate_confirmation_with_outcome_content_surfaces
+test_ordinary_crew_confirmation_tag_still_surfaces
+test_secondmate_confirmation_structural_smuggling_surfaces
+test_absorbed_confirmation_visible_at_next_drain
 test_provably_working_signal_absorbed
 test_turn_ended_provably_working_absorbed
 test_turn_ended_not_working_surfaced

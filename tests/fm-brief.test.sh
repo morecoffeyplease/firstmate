@@ -548,6 +548,11 @@ test_secondmate_marked_request_reporting_contract() {
     "secondmate charter lost the delivery-confirmation tag"
   assert_grep 'The tag has NO EFFECT on `needs-decision:`, `blocked:`, or `failed:`' "$brief" \
     "secondmate charter did not scope the confirmation tag away from real outcomes"
+  # PR #27 review findings P1/P3-2 (Opus): the charter must also tell a mate
+  # exactly what may never be tagged, one sentence per line like the rest of
+  # this section.
+  assert_grep 'Never tag a merge, a PR or other URL, a finding, a report pointer, or the answer to anything the parent asked' "$brief" \
+    "secondmate charter did not prohibit outcome content inside a tagged confirmation line"
   pass "fm-brief.sh: marked requests avoid generic acknowledgements and preserve material reporting"
 }
 
