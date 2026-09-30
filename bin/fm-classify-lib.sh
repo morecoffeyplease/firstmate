@@ -604,6 +604,46 @@ status_open_decisions() {  # <status-file> [<kind>]
   printf '%s' "$open"
 }
 
+# Byte-exact locator for the line that opened <key>'s CURRENT needs-decision or
+# blocked state in <status-file>, for a caller (bin/fm-wake-drain.sh) that needs
+# to point a captain at one exact source line rather than an ambiguous "read
+# this file" when the key appears more than once in the log (issue #19 P1).
+# Reuses the fold's own status_line_verb/_fm_decision_key parsing read-only,
+# rather than a separate text search, so this can never disagree with what
+# status_open_decisions itself considers <key>'s current opener.
+# Only meaningful for a <key> the fold currently reports OPEN: the LAST
+# needs-decision/blocked line naming that key IS the source of that open
+# record's note, because any transition after it would have had to be its
+# resolution instead (the same last-write-wins rule _fm_decision_fold_line
+# applies). Prints "<1-based line number>\t<line start byte>\t<line end byte>"
+# for that line, or nothing (and fails) when no such line is found - a caller
+# must treat that as "cannot locate", never as evidence the key is not open.
+status_decision_locator() {  # <status-file> <key>
+  local f=$1 want=$2 line lineno=0 offset=0 len key verb
+  local found_line=0 found_start=0 found_end=0
+  local LC_ALL=C
+  [ -f "$f" ] && [ -r "$f" ] && [ ! -L "$f" ] || return 1
+  [ -n "$want" ] || return 1
+  while IFS= read -r line || [ -n "$line" ]; do
+    lineno=$((lineno + 1))
+    len=$(( ${#line} + 1 ))
+    status_line_verb "$line" verb
+    case "$verb" in
+      needs-decision|blocked)
+        key=$(_fm_decision_key "$line") || key=
+        if [ -n "$key" ] && [ "$key" = "$want" ]; then
+          found_line=$lineno
+          found_start=$offset
+          found_end=$((offset + len - 1))
+        fi
+        ;;
+    esac
+    offset=$((offset + len))
+  done < "$f"
+  [ "$found_line" -gt 0 ] || return 1
+  printf '%s\t%s\t%s\n' "$found_line" "$found_start" "$found_end"
+}
+
 # Resolve the log's current declaration at one boundary for crew-state consumers.
 # Any decision the fold still holds open wins over unrelated events, and the
 # fold's most recently opened record supplies it; the latest recognized event

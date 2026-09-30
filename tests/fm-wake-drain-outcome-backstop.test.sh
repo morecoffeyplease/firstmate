@@ -304,29 +304,56 @@ test_rejected_decision_line_surfaces_once_through_backstop() {
 }
 
 test_rejected_decision_line_prints_in_full() {
-  local dir state out line
+  local dir state out line expected note
   dir=$(make_case rejected-decision-long)
   state="$dir/state"
   out="$dir/drain.out"
 
-  {
-    printf 'blocked [key=bad/value]: credential missing'
-    awk 'BEGIN { while (i++ < 200) printf " and-then-some" }'
-    printf '\n'
-  } > "$state/rejected-long.status"
+  # 220 repeats of " and-then-some" (14 chars each) is 3,080 characters plus
+  # the lede, clearing the issue's stated 3,000+ character acceptance bar, not
+  # just the old 220-character cap.
+  note=$(awk 'BEGIN { printf "credential missing padding-to-clear-3000-chars"; while (i++ < 220) printf " and-then-some" }')
+  [ "${#note}" -ge 3000 ] || fail "test fixture note is only ${#note} chars, below the 3,000+ acceptance bar"
+  printf 'blocked [key=bad/value]: %s\n' "$note" > "$state/rejected-long.status"
 
   FM_STATE_OVERRIDE="$state" "$DRAIN" > "$out" || fail "rejected-decision drain failed"
   line=$(backstop_body "$out" | grep -F 'rejected-long')
   [ -n "$line" ] || fail "a long rejected decision was lost: $(cat "$out")"
   # A malformed-key blocked/needs-decision line has no OPEN DECISIONS
   # representation, so this backstop is its only presentation path; it must
-  # not be cut to the routine per-item budget (issue #19).
+  # print byte-for-byte, not cut to the routine per-item budget (issue #19).
+  expected="rejected-long blocked [key=bad/value]: $note"
+  [ "$line" = "$expected" ] \
+    || fail "a long rejected decision did not print byte-for-byte: got [$line]"
+  pass "a rejected decision line prints in full, byte-for-byte, through the backstop instead of being cut"
+}
+
+test_rejected_decision_line_too_large_for_the_section_points_at_its_byte_offset() {
+  local dir state out line expected_prefix
+  dir=$(make_case rejected-decision-huge)
+  state="$dir/state"
+  out="$dir/drain.out"
+
+  # 5,000 'x' characters clears the section's whole 4,000-byte budget on its
+  # own; the fallback must be an exact byte-offset pointer (from this event's
+  # own snapshot read), not a bare "read this file" (issue #19 review finding
+  # P1: an ambiguous pointer cannot tell which of several same-key lines is
+  # current).
+  awk 'BEGIN { printf "blocked [key=bad/value]: "; while (i++ < 5000) printf "x"; printf "\n" }' \
+    > "$state/rejected-huge.status"
+
+  FM_STATE_OVERRIDE="$state" "$DRAIN" > "$out" || fail "rejected-decision drain failed"
+  line=$(backstop_body "$out" | grep -F 'rejected-huge')
+  [ -n "$line" ] || fail "a section-busting rejected decision was lost: $(cat "$out")"
   case "$line" in
-    *' [truncated]') fail "a long rejected decision was truncated: $line" ;;
+    *xxxxxxxxxx*) fail "a section-busting rejected decision printed inline instead of falling back to a pointer: $line" ;;
   esac
-  grep -F 'and-then-some and-then-some and-then-some' <<<"$line" >/dev/null \
-    || fail "a long rejected decision lost its tail instead of printing in full: $line"
-  pass "a rejected decision line prints in full through the backstop instead of being cut"
+  expected_prefix="rejected-huge blocked: too long to print in full here - read it in full at $state/rejected-huge.status (event ends at byte offset "
+  case "$line" in
+    "$expected_prefix"*')') : ;;
+    *) fail "a section-busting rejected decision's pointer did not match the expected exact-locator shape: $line" ;;
+  esac
+  pass "a rejected decision too large for the section points at its exact byte offset instead of being dropped"
 }
 
 test_missing_index_self_heals_on_first_drain() {
@@ -542,6 +569,7 @@ test_output_failure_does_not_commit_the_backstop_receipt
 test_receipt_commit_failure_repeats_the_already_presented_backstop
 test_rejected_decision_line_surfaces_once_through_backstop
 test_rejected_decision_line_prints_in_full
+test_rejected_decision_line_too_large_for_the_section_points_at_its_byte_offset
 test_missing_index_self_heals_on_first_drain
 test_uncovered_event_surfaces_on_first_drain_without_index
 test_malformed_outcome_store_fails_closed_without_pi_advice

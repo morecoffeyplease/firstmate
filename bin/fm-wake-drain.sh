@@ -304,6 +304,7 @@ EOF
 print_status_outcome_backstop_section() {  # <task-and-endpoint-snapshot>
   local snapshot=$1 task endpoint ident event event_endpoint line verb key receipt store lock ready
   local output='' used=0 shown=0 omitted=0 bytes item_bytes=220 global_bytes=4000 rc=0
+  local omitted_decisions=''
   [ "$ACTOR" = main ] || return 0
 
   store="$STATE/branch-outcomes.jsonl"
@@ -368,20 +369,31 @@ print_status_outcome_backstop_section() {  # <task-and-endpoint-snapshot>
     # never applies to it, same rule as OPEN DECISIONS (issue #19).
     fm_cap_status_line_var "$line" "$verb" $((item_bytes - 1))
     line=$FM_LINE_CAP_LINE
-    bytes=$(( ${#line} + 1 ))
-    if [ $((used + bytes)) -gt "$global_bytes" ]; then
+    if [ "${#line}" -ge "$global_bytes" ]; then
+      # This single event alone could not fit the section's own byte budget
+      # even uncapped: point at its exact source instead of printing 4KB+ of
+      # inline text. event_endpoint is the byte-exact end offset this event's
+      # own snapshot read already computed, so the pointer needs no separate
+      # locator scan the way OPEN DECISIONS' fold-derived note does.
       case "$verb" in
         needs-decision|blocked)
-          # Never drop a decision or blocker silently: point at its durable
-          # source instead of the plain omission count routine events get.
-          line="$task $verb: too long to print in full here - read it in full at $STATE/$task.status"
-          bytes=$(( ${#line} + 1 ))
-          ;;
-        *)
-          omitted=$((omitted + 1))
-          continue
+          line="$task $verb: too long to print in full here - read it in full at $STATE/$task.status (event ends at byte offset $event_endpoint)"
           ;;
       esac
+    fi
+    bytes=$(( ${#line} + 1 ))
+    if [ $((used + bytes)) -gt "$global_bytes" ]; then
+      # The section's byte budget is a real bound: an item that does not fit
+      # the REMAINING budget is omitted here exactly as a routine event is,
+      # even a decision-verb one - only an item too large for the WHOLE budget
+      # (above) gets a pointer instead of inline text. A decision omitted this
+      # way still gets an exact retrieval route: its task id joins the printed
+      # summary list rather than vanishing into a bare count.
+      omitted=$((omitted + 1))
+      case "$verb" in
+        needs-decision|blocked) omitted_decisions="$omitted_decisions$task, " ;;
+      esac
+      continue
     fi
     output="$output$line
 "
@@ -404,7 +416,15 @@ EOF
   printf 'STATUS OUTCOME BACKSTOP (newest captain-facing task event has no covering branch outcome):\n' || return 1
   printf '%s' "$output" || return 1
   if [ "$omitted" -gt 0 ]; then
-    printf 'STATUS OUTCOME BACKSTOP: %d more omitted (byte cap)\n' "$omitted" || return 1
+    if [ -n "$omitted_decisions" ]; then
+      # Task ids, not fold-derived note prose, so no routine per-line cut here
+      # either: cutting it would silently drop the retrieval route it exists
+      # to guarantee (issue #19).
+      printf 'STATUS OUTCOME BACKSTOP: %d more omitted (byte cap); read these in full at their own state/<id>.status: %s\n' \
+        "$omitted" "${omitted_decisions%, }" || return 1
+    else
+      printf 'STATUS OUTCOME BACKSTOP: %d more omitted (byte cap)\n' "$omitted" || return 1
+    fi
   fi
 }
 
@@ -457,7 +477,8 @@ EOF
 # common case.
 print_open_decisions_section() {
   local snapshot=${1:-} open task key verb note line item_bytes=220 global_bytes=4000
-  local output='' used=0 shown=0 bytes pointer
+  local output='' used=0 shown=0 omitted=0 bytes locator lineno locstart
+  local omitted_decisions=''
 
   if [ -n "$snapshot" ]; then
     open=$(scan_open_decisions_snapshot "$STATE" "$snapshot") || return 1
@@ -474,20 +495,39 @@ print_open_decisions_section() {
     # Every row here is needs-decision or blocked by construction (this fold's
     # whole contract): the captain needs the full context, options, and
     # recommendation to relay onward, so the routine per-line cut never
-    # applies here (issue #19). The section's own byte budget is unchanged -
-    # an item that cannot fit it is never silently dropped, though: it falls
-    # back to a short pointer at its durable source instead of the previous
-    # bare "N more omitted" count, so every decision stays findable from the
-    # drain output alone.
+    # applies here (issue #19).
     fm_cap_status_line_var "$line" "$verb" $((item_bytes - 1))
     line=$FM_LINE_CAP_LINE
+    if [ "${#line}" -ge "$global_bytes" ]; then
+      # Even uncapped, this single decision alone could not fit the section's
+      # byte budget: point at its exact source line (never just "read this
+      # file", which is ambiguous once a key reopens more than once in the same
+      # log - status_decision_locator reuses the fold's own key/verb parsing to
+      # find the line that opened this key's CURRENT state).
+      line="$task"
+      [ "$key" = default ] || line="$line [key=$key]"
+      if locator=$(status_decision_locator "$STATE/$task.status" "$key"); then
+        lineno=${locator%%$'\t'*}
+        locstart=${locator#*$'\t'}
+        locstart=${locstart%%$'\t'*}
+        line="$line $verb: too long to print in full here (${#note} bytes) - read it in full at $STATE/$task.status:$lineno (byte offset $locstart)"
+      else
+        line="$line $verb: too long to print in full here (${#note} bytes) - read it in full at $STATE/$task.status"
+      fi
+    fi
     bytes=$(( ${#line} + 1 ))
     if [ $((used + bytes)) -gt "$global_bytes" ]; then
-      pointer="$task"
-      [ "$key" = default ] || pointer="$pointer [key=$key]"
-      pointer="$pointer $verb: too long to print in full here (${#note} bytes) - read it in full at $STATE/$task.status"
-      line=$pointer
-      bytes=$(( ${#line} + 1 ))
+      # The section's byte budget is a real bound, unchanged from before this
+      # fix: an item that does not fit the REMAINING budget is omitted here,
+      # even a decision - only an item too large for the WHOLE budget (above)
+      # gets a pointer instead of inline text. A decision omitted this way
+      # still gets an exact retrieval route: its task id joins the printed
+      # summary list below rather than vanishing into a bare count.
+      omitted=$((omitted + 1))
+      omitted_decisions="$omitted_decisions$task"
+      [ "$key" = default ] || omitted_decisions="$omitted_decisions [key=$key]"
+      omitted_decisions="$omitted_decisions, "
+      continue
     fi
     output="$output$line
 "
@@ -497,9 +537,17 @@ print_open_decisions_section() {
 $open
 EOF
 
-  [ "$shown" -gt 0 ] || return 0
+  [ "$shown" -gt 0 ] || [ "$omitted" -gt 0 ] || return 0
   printf 'OPEN DECISIONS (still open, folded from the durable status logs - not just the latest line):\n' || return 1
   printf '%s' "$output" || return 1
+  if [ "$omitted" -gt 0 ]; then
+    # This list is task/key identifiers, not fold-derived note prose, so it
+    # never takes the routine per-line cut either: cutting it would silently
+    # drop the very retrieval route it exists to guarantee (issue #19). It
+    # stays cheap even at fleet scale - dozens of short ids, not note text.
+    printf 'OPEN DECISIONS: %d more omitted (byte cap); read each in full at its own state/<id>.status: %s\n' \
+      "$omitted" "${omitted_decisions%, }" || return 1
+  fi
   # Answerer-closes hint, printed at exactly the moment an answer gets written:
   # the send that answers a listed decision also closes it, so closure never
   # depends on the busy worker writing a matching resolved line (contract:

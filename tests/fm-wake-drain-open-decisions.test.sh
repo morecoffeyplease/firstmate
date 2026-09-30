@@ -186,29 +186,28 @@ test_status_symlink_is_not_followed() {
 # still prints whole, and one too large for the section's own byte budget
 # falls back to a pointer instead of being silently dropped.
 test_over_long_decision_note_prints_in_full() {
-  local dir state out line
+  local dir state out line expected note
   dir=$(make_case long-note)
   state="$dir/state"
   out="$dir/drain.out"
-  {
-    printf 'needs-decision [key=api-shape]: pick REST or RPC'
-    awk 'BEGIN { while (i++ < 200) printf " and-then-some" }'
-    printf '\n'
-  } > "$state/task-long.status"
+  # 220 repeats of " and-then-some" (14 chars each) is 3,080 characters plus
+  # the lede, clearing the issue's stated 3,000+ character acceptance bar, not
+  # just the old 220-character cap.
+  note=$(awk 'BEGIN { printf "pick REST or RPC padding-to-clear-3000-chars"; while (i++ < 220) printf " and-then-some" }')
+  [ "${#note}" -ge 3000 ] || fail "test fixture note is only ${#note} chars, below the 3,000+ acceptance bar"
+  printf 'needs-decision [key=api-shape]: %s\n' "$note" > "$state/task-long.status"
 
   FM_STATE_OVERRIDE="$state" "$DRAIN" > "$out" || fail "drain failed on an over-long decision note"
 
   # A needs-decision line carries the context, options, and recommendation the
   # captain must relay onward verbatim, so it is exempt from the routine
   # per-line cut - past the old 220-character bound but nowhere near the
-  # section's own byte budget, it prints whole with no truncation marker
-  # (issue #19).
+  # section's own byte budget, it prints whole, byte-for-byte, with no
+  # truncation marker (issue #19).
+  expected="task-long [key=api-shape] needs-decision: $note"
   line=$(grep -F 'task-long' "$out")
-  case "$line" in
-    *' [truncated]') fail "a needs-decision note was truncated: $line" ;;
-  esac
-  grep -F 'and-then-some and-then-some and-then-some' <<<"$line" >/dev/null \
-    || fail "an over-long decision note lost its tail instead of printing in full: $line"
+  [ "$line" = "$expected" ] \
+    || fail "an over-long decision note did not print byte-for-byte: got [$line]"
 
   printf 'needs-decision [key=short]: brief enough to keep whole\n' > "$state/task-short.status"
   FM_STATE_OVERRIDE="$state" "$DRAIN" > "$out" || fail "drain failed on a short decision note"
@@ -218,18 +217,21 @@ test_over_long_decision_note_prints_in_full() {
     fail "a decision note already under the cap was marked truncated"
   fi
 
-  pass "an over-long open decision prints in full instead of being cut to the routine per-item budget"
+  pass "an over-long open decision prints in full, byte-for-byte, instead of being cut to the routine per-item budget"
 }
 
 test_decision_note_too_large_for_the_section_budget_points_at_its_source() {
-  local dir state out line
+  local dir state out line expected_prefix lineno byteoff content
   dir=$(make_case huge-note)
   state="$dir/state"
   out="$dir/drain.out"
   # 5000 'x' characters clears the section's whole 4000-byte budget on its
   # own, so it cannot be printed in full without starving every other
   # section item; the acceptance bar is "readable in full, or via one
-  # printed pointer" (issue #19), so this is the pointer path.
+  # printed pointer" (issue #19), so this is the pointer path - and that
+  # pointer must be exact (a file plus line number and byte offset), not just
+  # "read this file", which issue #19's own review flagged as ambiguous once a
+  # key can open more than once in the same log.
   awk 'BEGIN { printf "needs-decision [key=huge]: "; while (i++ < 5000) printf "x"; printf "\n" }' \
     > "$state/task-huge.status"
 
@@ -240,15 +242,105 @@ test_decision_note_too_large_for_the_section_budget_points_at_its_source() {
   case "$line" in
     *xxxxxxxxxx*) fail "a section-busting decision note printed inline instead of falling back to a pointer: $line" ;;
   esac
-  grep -F "$state/task-huge.status" <<<"$line" >/dev/null \
-    || fail "a section-busting decision note's pointer did not name its durable source: $line"
+  expected_prefix="task-huge [key=huge] needs-decision: too long to print in full here (5000 bytes) - read it in full at $state/task-huge.status:"
+  case "$line" in
+    "$expected_prefix"*) : ;;
+    *) fail "a section-busting decision note's pointer did not match the expected exact-locator shape: $line" ;;
+  esac
+  lineno=${line#"$expected_prefix"}
+  lineno=${lineno%% *}
+  [ "$lineno" = 1 ] || fail "the pointer named the wrong line number: $line"
+  byteoff=$(printf '%s' "$line" | grep -oE 'byte offset [0-9]+' | grep -oE '[0-9]+')
+  [ "$byteoff" = 0 ] || fail "the pointer named the wrong byte offset for the file's only line: $line"
+  content=$(dd if="$state/task-huge.status" bs=1 skip="$byteoff" count=27 2>/dev/null)
+  [ "$content" = 'needs-decision [key=huge]: ' ] \
+    || fail "the pointer's byte offset did not land on the decision line: got [$content]"
 
-  pass "a decision note too large for the section budget points at its status file instead of being dropped"
+  pass "a decision note too large for the section budget points at its exact source line instead of being dropped"
+}
+
+test_reopened_key_pointer_locates_the_current_decision() {
+  local dir state out line lineno note2
+  dir=$(make_case reopened-key)
+  state="$dir/state"
+  out="$dir/drain.out"
+  # Two DISTINCT 5,000-character needs-decision events share one key with no
+  # resolution between them (a legal reopen - see
+  # _fm_decision_key_transition_allowed). A bare "read this file" pointer
+  # cannot tell the captain which of the two is current; the exact-locator
+  # pointer must name the SECOND (currently open) line, not the first
+  # (issue #19 review finding P1).
+  note2=$(awk 'BEGIN { while (i++ < 5000) printf "m" }')
+  {
+    awk 'BEGIN { printf "needs-decision [key=ambiguous]: "; while (i++ < 5000) printf "n"; printf "\n" }'
+    printf 'working: continuing\n'
+    printf 'needs-decision [key=ambiguous]: %s\n' "$note2"
+  } > "$state/multi.status"
+
+  FM_STATE_OVERRIDE="$state" "$DRAIN" > "$out" || fail "drain failed on a reopened decision key"
+
+  line=$(grep -F 'multi' "$out")
+  [ -n "$line" ] || fail "a reopened decision key produced no OPEN DECISIONS line: $(cat "$out")"
+  case "$line" in
+    *"(5000 bytes)"*) : ;;
+    *) fail "reopened-key pointer did not report the current (second) note's length: $line" ;;
+  esac
+  case "$line" in
+    *"$state/multi.status:3 "*) : ;;
+    *) fail "reopened-key pointer did not name line 3 (the current, second needs-decision): $line" ;;
+  esac
+  lineno=$(sed -n '3p' "$state/multi.status")
+  [ "$lineno" = "needs-decision [key=ambiguous]: $note2" ] \
+    || fail "test fixture's line 3 is not the second needs-decision event"
+
+  pass "a decision key reopened without an intervening resolution points at its current line, not an earlier one"
+}
+
+test_many_oversized_decisions_stay_within_the_section_budget() {
+  local dir state out i section_bytes count
+  dir=$(make_case many-huge)
+  state="$dir/state"
+  out="$dir/drain.out"
+  # 32 distinct 5,000-character decisions: individually each falls back to a
+  # pointer (above the section's own 4,000-byte budget), but printing every
+  # pointer unconditionally would still let the section grow without bound -
+  # exactly the regression issue #19's review flagged (P2). The section must
+  # stay near its advertised budget regardless of how many oversized decisions
+  # are open, and every decision omitted past that must still be named.
+  i=1
+  while [ "$i" -le 32 ]; do
+    awk -v n="$i" 'BEGIN { printf "needs-decision [key=k]: "; while (j++ < 5000) printf "x"; printf "\n" }' \
+      > "$state/task-$i.status"
+    i=$((i + 1))
+  done
+
+  FM_STATE_OVERRIDE="$state" "$DRAIN" > "$out" || fail "drain failed on many oversized decisions"
+
+  section_bytes=$(awk '/^OPEN DECISIONS \(/{f=1} f{print} /answering it:/{exit}' "$out" | wc -c | tr -d ' ')
+  [ "$section_bytes" -lt 6000 ] \
+    || fail "OPEN DECISIONS grew unbounded with many oversized decisions: $section_bytes bytes"
+  grep -F 'OPEN DECISIONS:' "$out" | grep -F 'more omitted (byte cap)' >/dev/null \
+    || fail "an over-budget section of oversized decisions did not report bounded omission: $(cat "$out")"
+  count=$(grep -c '^task-[0-9]* \[key=k\] needs-decision:' "$out")
+  [ "$count" -gt 0 ] && [ "$count" -lt 32 ] \
+    || fail "unexpected number of individually-printed decisions: $count"
+  # Every task must appear either as a printed pointer or in the omitted list -
+  # never neither.
+  i=1
+  while [ "$i" -le 32 ]; do
+    grep -qF "task-$i " "$out" || grep -qF "task-$i]" "$out" || grep -qF "task-$i," "$out" \
+      || fail "task-$i is missing from both the printed decisions and the omitted list"
+    i=$((i + 1))
+  done
+
+  pass "many oversized open decisions stay within the section's byte budget, with every one still findable"
 }
 
 test_buried_decision_still_surfaces
 test_over_long_decision_note_prints_in_full
 test_decision_note_too_large_for_the_section_budget_points_at_its_source
+test_reopened_key_pointer_locates_the_current_decision
+test_many_oversized_decisions_stay_within_the_section_budget
 test_explicit_resolution_closes_it
 test_later_unrelated_terminal_line_does_not_close_it
 test_reserved_key_namespace_is_owned_by_its_library
