@@ -333,7 +333,7 @@ test_rejected_decision_line_is_capped_with_an_attachment_pointer() {
     *) fail "a long rejected decision was not capped with an attachment-line reference: $line" ;;
   esac
 
-  attach_path=$(grep -F 'full payloads:' "$out" | awk '{print $NF}')
+  attach_path=$(grep -F 'full payloads:' "$out" | awk '{print $NF}' | sed 's/:1$//')
   [ -n "$attach_path" ] && [ -f "$attach_path" ] \
     || fail "no readable attachment path was printed for the rejected decision: $(cat "$out")"
   attach_line=${line##*'(full: L'}
@@ -369,7 +369,7 @@ test_many_oversized_rejected_decisions_stay_within_the_section_budget() {
   [ "$count" -gt 0 ] && [ "$count" -lt 20 ] \
     || fail "unexpected number of individually-printed rejected decisions: $count"
 
-  attach_path=$(grep -F 'full payloads:' "$out" | awk '{print $NF}')
+  attach_path=$(grep -F 'full payloads:' "$out" | awk '{print $NF}' | sed 's/:1$//')
   [ -n "$attach_path" ] && [ -f "$attach_path" ] \
     || fail "no readable attachment path was printed: $(cat "$out")"
   attach_lines=$(wc -l < "$attach_path" | tr -d ' ')

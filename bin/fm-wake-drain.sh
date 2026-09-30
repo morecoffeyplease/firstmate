@@ -350,18 +350,31 @@ _fm_drain_attach_dir_ready() {  # <dir>
   [ -d "$1" ] && [ ! -L "$1" ]
 }
 
+# 0 if <file>'s current bytes hash to <expected-hash>, the one check that lets
+# this store ever trust a hash-named file it did not just write this call
+# (issue #19 review, rev25-sol3 P1: a content-addressed name is a promise,
+# never a fact, until the bytes underneath are confirmed - a corrupted or
+# out-of-band-replaced attachment must never be silently reused).
+_fm_drain_attach_verify() {  # <file> <expected-hash>
+  local actual
+  [ -f "$1" ] && [ ! -L "$1" ] || return 1
+  actual=$(_fm_drain_sha256 "$1") || return 1
+  [ "$actual" = "$2" ]
+}
+
 # Publish the already-populated, already-mode-0600 <staged-file> as
 # <dir>/<sha256-of-its-content>.txt, the durable full-payload attachment for
-# one drain section. Content-addressing makes this idempotent across drains:
-# an unchanged set of open decisions reuses the same path instead of writing a
-# new file every wake, and a concurrent publish of identical content races
-# harmlessly (whichever mv completes second still lands the same bytes at the
-# same path). Rejects a symlink or non-regular object already occupying the
-# destination rather than following or overwriting it - the immutability
-# guarantee upstream code relies on requires that this function never adopts
-# an object it did not just write. Always consumes <staged-file> (renames or
-# removes it); the caller never touches it again after this call. Prints the
-# published path on success.
+# a drain's selected decisions. Content-addressing makes this idempotent
+# across drains: an unchanged set of open decisions reuses the same path
+# instead of writing a new file every wake. Publication is atomic and
+# no-clobber (`ln`, which fails rather than touching an existing destination)
+# rather than a check-then-replace `mv -f`, so a concurrent publisher's
+# identical-content attachment can never be blindly overwritten (issue #19
+# review, rev25-sol3 P1). Either way, an existing destination is verified
+# against the just-computed hash before this function ever reuses it - a
+# mismatched destination is rejected outright rather than trusted. Always
+# consumes <staged-file> (links or removes it); the caller never touches it
+# again after this call. Prints the published path on success.
 fm_drain_publish_attachment() {  # <dir> <staged-file>
   local dir=$1 staged=$2 hash dest
   _fm_drain_attach_dir_ready "$dir" || { rm -f -- "$staged"; return 1; }
@@ -371,35 +384,104 @@ fm_drain_publish_attachment() {  # <dir> <staged-file>
     *) rm -f -- "$staged"; return 1 ;;
   esac
   dest="$dir/$hash.txt"
-  if [ -e "$dest" ] || [ -L "$dest" ]; then
+  if ln -- "$staged" "$dest" 2>/dev/null; then
     rm -f -- "$staged"
-    [ -f "$dest" ] && [ ! -L "$dest" ] || return 1
     printf '%s' "$dest"
     return 0
   fi
-  if ! mv -f -- "$staged" "$dest"; then
-    rm -f -- "$staged"
-    return 1
-  fi
+  # Either a destination already exists (the common, idempotent-reuse case) or
+  # this filesystem cannot hard-link into $dir; either way, never take the
+  # existing object on faith - reject anything that is not a plain file, and
+  # reject a plain file whose bytes do not actually hash to this name.
+  rm -f -- "$staged"
+  _fm_drain_attach_verify "$dest" "$hash" || return 1
   printf '%s' "$dest"
 }
 
-print_status_outcome_backstop_section() {  # <task-and-endpoint-snapshot>
+# Shared per-drain attachment state (issue #19 review, rev25-sol3 P3): OPEN
+# DECISIONS and STATUS OUTCOME BACKSTOP both select decisions the captain may
+# need in full, so one drain publishes exactly ONE attachment covering both,
+# never one file per section. print_status_sections resets these once per
+# drain, then runs a collect phase for each section (which only appends to the
+# shared staging file and buffers its own candidate rows - no printing yet),
+# publishes once, and only then runs each section's render phase, which
+# already knows the real, final attachment path (or its absence) and never
+# has to guess or patch printed text after the fact.
+_FM_DRAIN_ATTACH_DIR=
+_FM_DRAIN_ATTACH_TMP=
+_FM_DRAIN_ATTACH_LINENO=0
+_FM_DRAIN_ATTACH_PATH=
+
+_fm_drain_attach_reset() {
+  _FM_DRAIN_ATTACH_DIR="$STATE/drain-decisions"
+  _FM_DRAIN_ATTACH_TMP=
+  _FM_DRAIN_ATTACH_LINENO=0
+  _FM_DRAIN_ATTACH_PATH=
+}
+
+# Append <line> to the shared per-drain attachment, opening its staging file on
+# first use this drain. Sets _FM_DRAIN_ATTACH_LAST_LINE to the 1-based line
+# number <line> landed on (empty on failure) - a caller uses a failure to skip
+# the "(full: Lx)" reference it would otherwise add to a truncated preview
+# row. A caller MUST invoke this as a plain statement, never inside a
+# `$(...)` command substitution: this function's whole job is updating the
+# shared _FM_DRAIN_ATTACH_TMP/_FM_DRAIN_ATTACH_LINENO globals so the SAME
+# staging file spans both collect phases, and a command substitution would run
+# it in a subshell whose variable updates vanish the instant it exits.
+_FM_DRAIN_ATTACH_LAST_LINE=
+_fm_drain_attach_append() {  # <line>
+  _FM_DRAIN_ATTACH_LAST_LINE=
+  if [ -z "$_FM_DRAIN_ATTACH_TMP" ]; then
+    _fm_drain_attach_dir_ready "$_FM_DRAIN_ATTACH_DIR" || return 1
+    _FM_DRAIN_ATTACH_TMP=$(mktemp "$_FM_DRAIN_ATTACH_DIR/.attach.XXXXXX") || return 1
+    chmod 0600 "$_FM_DRAIN_ATTACH_TMP" || { _FM_DRAIN_ATTACH_TMP=; return 1; }
+  fi
+  printf '%s\n' "$1" >> "$_FM_DRAIN_ATTACH_TMP" || { rm -f -- "$_FM_DRAIN_ATTACH_TMP"; _FM_DRAIN_ATTACH_TMP=; return 1; }
+  _FM_DRAIN_ATTACH_LINENO=$((_FM_DRAIN_ATTACH_LINENO + 1))
+  _FM_DRAIN_ATTACH_LAST_LINE=$_FM_DRAIN_ATTACH_LINENO
+}
+
+# Publish the shared per-drain attachment once, after every section has
+# finished collecting. Always succeeds (0) when nothing was ever appended this
+# drain - there is nothing to publish, and every render phase reads an empty
+# _FM_DRAIN_ATTACH_PATH as "no decisions this drain", not as a failure.
+_fm_drain_attach_publish() {
+  [ -n "$_FM_DRAIN_ATTACH_TMP" ] || return 0
+  _FM_DRAIN_ATTACH_PATH=$(fm_drain_publish_attachment "$_FM_DRAIN_ATTACH_DIR" "$_FM_DRAIN_ATTACH_TMP") || {
+    _FM_DRAIN_ATTACH_PATH=
+    return 1
+  }
+}
+
+# Collect phase for STATUS OUTCOME BACKSTOP (issue #19 shape review, rev25-sol3
+# P3): read the snapshot, apply every existing selection rule unchanged
+# (branch-outcome coverage, malformed-key admission), append each selected
+# decision's complete payload to the shared per-drain attachment, and stash
+# the candidate preview rows in BACKSTOP_* globals. Prints nothing; the render
+# phase below does all presentation once the shared attachment is published.
+BACKSTOP_RC=0
+BACKSTOP_CANDIDATES=
+BACKSTOP_TOTAL=0
+BACKSTOP_TOTAL_DECISIONS=0
+collect_status_outcome_backstop_section() {  # <task-and-endpoint-snapshot>
   local snapshot=$1 task endpoint ident event event_endpoint line verb key receipt store lock ready
-  local output='' used=0 shown=0 omitted=0 bytes item_bytes=220 global_bytes=4000 rc=0
-  local attach_dir="$STATE/drain-decisions" attach_tmp='' attach_path='' attach_lineno=0
-  local candidates='' cand_line total=0 total_decisions=0 footer_reserve row_budget heading
+  local item_bytes=220 cand_line lineno
+  BACKSTOP_RC=0
+  BACKSTOP_CANDIDATES=
+  BACKSTOP_TOTAL=0
+  BACKSTOP_TOTAL_DECISIONS=0
+  STATUS_OUTCOME_BACKSTOP_ACKNOWLEDGED=
   [ "$ACTOR" = main ] || return 0
 
   store="$STATE/branch-outcomes.jsonl"
   lock="$STATE/.branch-outcomes.lock"
   if [ -e "$store" ] || [ -L "$store" ]; then
     if [ ! -f "$store" ] || [ ! -r "$store" ] || [ -L "$store" ]; then
-      printf 'STATUS OUTCOME BACKSTOP SKIPPED: branch outcome history could not be read safely; repair it before relying on drain recovery.\n'
+      BACKSTOP_RC=3
       return 0
     fi
     if ! fm_lock_acquire_wait_bounded "$lock" "$PRESENTATION_LOCK_TIMEOUT"; then
-      printf 'STATUS OUTCOME BACKSTOP SKIPPED: branch outcome history is busy; retry on the next drain.\n'
+      BACKSTOP_RC=4
       return 0
     fi
     ready="$STATE/.branch-outcome-index-ready"
@@ -407,19 +489,15 @@ print_status_outcome_backstop_section() {  # <task-and-endpoint-snapshot>
       if ! "$SCRIPT_DIR/fm-branch-outcome.sh" processed-init --held-lock >/dev/null 2>&1 \
         || ! outcome_index_ready_ok "$ready"; then
         fm_lock_release "$lock"
-        printf 'STATUS OUTCOME BACKSTOP SKIPPED: bounded outcome indexes could not be rebuilt because the outcome store is unsafe; repair it before relying on drain recovery.\n'
+        BACKSTOP_RC=5
         return 0
       fi
     fi
   fi
 
-  if _fm_drain_attach_dir_ready "$attach_dir"; then
-    attach_tmp=$(mktemp "$attach_dir/.attach.XXXXXX") && chmod 0600 "$attach_tmp" || attach_tmp=
-  fi
-
   while IFS=$(printf '\t') read -r task endpoint ident; do
     [ -n "$task" ] || continue
-    receipt=$(status_outcome_backstop_cursor_offset "$STATE/$task.status") || { rc=1; break; }
+    receipt=$(status_outcome_backstop_cursor_offset "$STATE/$task.status") || { BACKSTOP_RC=1; break; }
     [ "$receipt" -lt "$endpoint" ] || continue
     status_snapshot_latest_event "$STATE/$task.status" "$endpoint" "$ident" || continue
     event=$FM_STATUS_SNAPSHOT_EVENT_LINE
@@ -440,7 +518,7 @@ print_status_outcome_backstop_section() {  # <task-and-endpoint-snapshot>
     esac
     load_branch_outcome_index "$task"
     if [ "$BRANCH_OUTCOME_INDEX_STATE" != ok ]; then
-      rc=2
+      BACKSTOP_RC=2
       break
     fi
     if [ -n "$BRANCH_OUTCOME_INDEX_ENDPOINT" ] \
@@ -449,85 +527,101 @@ print_status_outcome_backstop_section() {  # <task-and-endpoint-snapshot>
       continue
     fi
 
-    total=$((total + 1))
+    BACKSTOP_TOTAL=$((BACKSTOP_TOTAL + 1))
     # Only a decision (needs-decision/blocked with a malformed key - the only
     # kind that ever reaches this backstop, per the `case` above) goes into
     # the attachment: issue #19 is about decisions, and a routine done/failed
     # event omitted here has always simply been a routine loss, unrelated to
     # this fix (issue #19 shape review point 1).
+    lineno=
     case "$verb" in
       needs-decision|blocked)
-        total_decisions=$((total_decisions + 1))
-        if [ -n "$attach_tmp" ]; then
-          attach_lineno=$((attach_lineno + 1))
-          printf '[backstop-event] task %s %s: %s\n' "$task" "$verb" "$event" >> "$attach_tmp" \
-            || { rm -f -- "$attach_tmp"; attach_tmp=; }
-        fi
+        BACKSTOP_TOTAL_DECISIONS=$((BACKSTOP_TOTAL_DECISIONS + 1))
+        _fm_drain_attach_append "[backstop-event] task $task $verb: $event"
+        lineno=$_FM_DRAIN_ATTACH_LAST_LINE
         ;;
     esac
 
     line="$task $event"
     fm_cap_line_var "$line" $((item_bytes - 1))
     cand_line=$FM_LINE_CAP_LINE
-    case "$verb" in
-      needs-decision|blocked)
-        if [ -n "$attach_tmp" ] && [ "${#line}" -gt $((item_bytes - 1)) ]; then
-          cand_line="$cand_line (full: L$attach_lineno)"
-        fi
-        ;;
-    esac
-    candidates="$candidates$cand_line$(printf '\t')$task$(printf '\t')$event_endpoint
+    if [ -n "$lineno" ] && [ "${#line}" -gt $((item_bytes - 1)) ]; then
+      cand_line="$cand_line (full: L$lineno)"
+    fi
+    BACKSTOP_CANDIDATES="$BACKSTOP_CANDIDATES$cand_line$(printf '\t')$task$(printf '\t')$event_endpoint
 "
   done <<EOF
 $snapshot
 EOF
 
   if [ -e "$store" ] || [ -L "$store" ]; then fm_lock_release "$lock"; fi
-  if [ "$rc" -eq 1 ]; then rm -f -- "$attach_tmp"; return 1; fi
-  if [ "$rc" -eq 2 ]; then
-    rm -f -- "$attach_tmp"
-    printf 'STATUS OUTCOME BACKSTOP SKIPPED: a bounded task outcome index could not be read safely; repair it before relying on drain recovery.\n'
-    STATUS_OUTCOME_BACKSTOP_ACKNOWLEDGED=
-    return 0
-  fi
-  if [ "$total" -eq 0 ]; then
-    rm -f -- "$attach_tmp"
-    return 0
-  fi
+  [ "$BACKSTOP_RC" -ne 1 ] || return 1
+}
 
-  if [ "$total_decisions" -gt 0 ]; then
-    attach_path=$(fm_drain_publish_attachment "$attach_dir" "$attach_tmp") || attach_path=
+# Render phase for STATUS OUTCOME BACKSTOP: turn the collected candidates into
+# bounded preview text, now that $_FM_DRAIN_ATTACH_PATH (the one shared
+# attachment for this whole drain, published after both collect phases ran)
+# is known for certain - no placeholder text, no after-the-fact patching.
+render_status_outcome_backstop_section() {
+  local output='' used=0 shown=0 omitted=0 bytes item_bytes=220 global_bytes=4000
+  local cand_line task event_endpoint footer_reserve row_budget heading
+  local attach_path=$_FM_DRAIN_ATTACH_PATH
+
+  case "$BACKSTOP_RC" in
+    3)
+      printf 'STATUS OUTCOME BACKSTOP SKIPPED: branch outcome history could not be read safely; repair it before relying on drain recovery.\n'
+      return 0
+      ;;
+    4)
+      printf 'STATUS OUTCOME BACKSTOP SKIPPED: branch outcome history is busy; retry on the next drain.\n'
+      return 0
+      ;;
+    5)
+      printf 'STATUS OUTCOME BACKSTOP SKIPPED: bounded outcome indexes could not be rebuilt because the outcome store is unsafe; repair it before relying on drain recovery.\n'
+      return 0
+      ;;
+    1) return 1 ;;
+    2)
+      printf 'STATUS OUTCOME BACKSTOP SKIPPED: a bounded task outcome index could not be read safely; repair it before relying on drain recovery.\n'
+      STATUS_OUTCOME_BACKSTOP_ACKNOWLEDGED=
+      return 0
+      ;;
+  esac
+
+  [ "$BACKSTOP_TOTAL" -gt 0 ] || return 0
+
+  if [ "$BACKSTOP_TOTAL_DECISIONS" -gt 0 ]; then
     if [ -z "$attach_path" ]; then
       # A decision or blocker's full payload has no durable pointer this
       # drain, so none of this section's events are acknowledged - they
       # remain eligible to try again, in full, on the next drain (issue #19
       # shape review point 5).
       STATUS_OUTCOME_BACKSTOP_ACKNOWLEDGED=
-      printf 'STATUS OUTCOME BACKSTOP SKIPPED: %d decision(s) could not be recorded to a durable attachment; retry on the next drain.\n' "$total_decisions" || return 1
+      printf 'STATUS OUTCOME BACKSTOP SKIPPED: %d decision(s) could not be recorded to a durable attachment; retry on the next drain.\n' "$BACKSTOP_TOTAL_DECISIONS" || return 1
       return 0
     fi
   else
-    rm -f -- "$attach_tmp"
+    attach_path=
   fi
 
   heading='STATUS OUTCOME BACKSTOP (newest captain-facing task event has no covering branch outcome):
 '
   # Reserve the footer's worst-case width - its wording, the attachment path
-  # when there is one, and up to $total's own digit count for the omitted
-  # number - before deciding how many preview rows fit, so the footer itself
-  # can never be the thing that blows the section's budget (issue #19 shape
-  # review point 4).
+  # when there is one, and up to $BACKSTOP_TOTAL's own digit count for the
+  # omitted number - before deciding how many preview rows fit, so the footer
+  # itself can never be the thing that blows the section's budget (issue #19
+  # shape review point 4).
   if [ -n "$attach_path" ]; then
-    footer_reserve=$(( $(_fm_byte_len "$attach_path") + ${#total} + 80 ))
+    footer_reserve=$(( $(_fm_byte_len "$attach_path") + ${#BACKSTOP_TOTAL} + 80 ))
   else
-    footer_reserve=$(( ${#total} + 40 ))
+    footer_reserve=$(( ${#BACKSTOP_TOTAL} + 40 ))
   fi
   row_budget=$(( global_bytes - $(_fm_byte_len "$heading") - footer_reserve ))
   if [ "$row_budget" -lt 0 ]; then
     STATUS_OUTCOME_BACKSTOP_ACKNOWLEDGED=
     if [ -n "$attach_path" ]; then
       printf 'STATUS OUTCOME BACKSTOP SKIPPED: the durable attachment path is too long to present within budget; %d decision(s) recorded in full at %s\n' \
-        "$total_decisions" "$attach_path" || return 1
+        "$BACKSTOP_TOTAL_DECISIONS" "$attach_path" || return 1
     else
       printf 'STATUS OUTCOME BACKSTOP SKIPPED: budget exhausted before any event could be presented.\n' || return 1
     fi
@@ -553,19 +647,22 @@ EOF
     used=$((used + bytes))
     shown=$((shown + 1))
   done <<EOF
-$candidates
+$BACKSTOP_CANDIDATES
 EOF
 
   printf '%s' "$heading" || return 1
   printf '%s' "$output" || return 1
   if [ "$omitted" -gt 0 ]; then
     if [ -n "$attach_path" ]; then
-      printf 'STATUS OUTCOME BACKSTOP: %d more not previewed (byte cap); full payloads: %s\n' "$omitted" "$attach_path" || return 1
+      # A bounded aggregate index pointer, never a per-omitted-item list: the
+      # attachment is fully labeled and searchable from its first line (issue
+      # #19 shape review, rev25-sol3 P2).
+      printf 'STATUS OUTCOME BACKSTOP: %d more not previewed (byte cap); full payloads: %s:1\n' "$omitted" "$attach_path" || return 1
     else
       printf 'STATUS OUTCOME BACKSTOP: %d more omitted (byte cap)\n' "$omitted" || return 1
     fi
   elif [ -n "$attach_path" ]; then
-    printf 'STATUS OUTCOME BACKSTOP: full payloads: %s\n' "$attach_path" || return 1
+    printf 'STATUS OUTCOME BACKSTOP: full payloads: %s:1\n' "$attach_path" || return 1
   fi
 }
 
@@ -616,11 +713,17 @@ EOF
 # fm-classify-lib.sh's "incremental (cursor-backed) open-decisions fold").
 # Bounded and silent: prints nothing when no decision is open, which is the
 # common case.
-print_open_decisions_section() {
-  local snapshot=${1:-} open task key verb note line item_bytes=220 global_bytes=4000
-  local output='' used=0 shown=0 omitted=0 bytes
-  local attach_dir="$STATE/drain-decisions" attach_tmp='' attach_path='' attach_lineno=0
-  local candidates='' cand_line total=0 footer_reserve row_budget heading hint
+# Collect phase for OPEN DECISIONS (issue #19 shape review, rev25-sol3 P3):
+# fold every still-open decision fleet-wide, append each one's complete
+# payload to the shared per-drain attachment, and stash the candidate preview
+# rows in OPEN_DECISIONS_* globals. Prints nothing; the render phase below
+# does all presentation once the shared attachment is published.
+OPEN_DECISIONS_CANDIDATES=
+OPEN_DECISIONS_TOTAL=0
+collect_open_decisions_section() {  # <task-and-endpoint-snapshot>
+  local snapshot=${1:-} open task key verb note line item_bytes=220 cand_line lineno
+  OPEN_DECISIONS_CANDIDATES=
+  OPEN_DECISIONS_TOTAL=0
 
   if [ -n "$snapshot" ]; then
     open=$(scan_open_decisions_snapshot "$STATE" "$snapshot") || return 1
@@ -629,19 +732,11 @@ print_open_decisions_section() {
   fi
   [ -n "$open" ] || return 0
 
-  if _fm_drain_attach_dir_ready "$attach_dir"; then
-    attach_tmp=$(mktemp "$attach_dir/.attach.XXXXXX") && chmod 0600 "$attach_tmp" || attach_tmp=
-  fi
-
   while IFS=$(printf '\t') read -r task key verb note; do
     [ -n "$task" ] || continue
-    total=$((total + 1))
-    if [ -n "$attach_tmp" ]; then
-      attach_lineno=$((attach_lineno + 1))
-      printf '[open-decision] task %s%s %s: %s\n' \
-        "$task" "$([ "$key" = default ] && printf '' || printf ' [key=%s]' "$key")" "$verb" "$note" \
-        >> "$attach_tmp" || { rm -f -- "$attach_tmp"; attach_tmp=; }
-    fi
+    OPEN_DECISIONS_TOTAL=$((OPEN_DECISIONS_TOTAL + 1))
+    _fm_drain_attach_append "[open-decision] task $task$([ "$key" = default ] && printf '' || printf ' [key=%s]' "$key") $verb: $note"
+    lineno=$_FM_DRAIN_ATTACH_LAST_LINE
 
     line="$task"
     [ "$key" = default ] || line="$line [key=$key]"
@@ -651,25 +746,29 @@ print_open_decisions_section() {
     # allowance passed down is one short of the cap.
     fm_cap_line_var "$line" $((item_bytes - 1))
     cand_line=$FM_LINE_CAP_LINE
-    if [ -n "$attach_tmp" ] && [ "${#line}" -gt $((item_bytes - 1)) ]; then
-      cand_line="$cand_line (full: L$attach_lineno)"
+    if [ -n "$lineno" ] && [ "${#line}" -gt $((item_bytes - 1)) ]; then
+      cand_line="$cand_line (full: L$lineno)"
     fi
-    candidates="$candidates$cand_line
+    OPEN_DECISIONS_CANDIDATES="$OPEN_DECISIONS_CANDIDATES$cand_line
 "
   done <<EOF
 $open
 EOF
+}
 
-  if [ "$total" -eq 0 ]; then
-    rm -f -- "$attach_tmp"
-    return 0
-  fi
+# Render phase for OPEN DECISIONS: turn the collected candidates into bounded
+# preview text, now that $_FM_DRAIN_ATTACH_PATH (the one shared attachment for
+# this whole drain, published after both collect phases ran) is known for
+# certain - no placeholder text, no after-the-fact patching.
+render_open_decisions_section() {
+  local output='' used=0 shown=0 omitted=0 bytes item_bytes=220 global_bytes=4000
+  local cand_line footer_reserve row_budget heading hint
+  local attach_path=$_FM_DRAIN_ATTACH_PATH
 
-  if [ -n "$attach_tmp" ]; then
-    attach_path=$(fm_drain_publish_attachment "$attach_dir" "$attach_tmp") || attach_path=
-  fi
+  [ "$OPEN_DECISIONS_TOTAL" -gt 0 ] || return 0
+
   if [ -z "$attach_path" ]; then
-    printf 'OPEN DECISIONS SKIPPED: %d decision(s) could not be recorded to a durable attachment; retry on the next drain.\n' "$total" || return 1
+    printf 'OPEN DECISIONS SKIPPED: %d decision(s) could not be recorded to a durable attachment; retry on the next drain.\n' "$OPEN_DECISIONS_TOTAL" || return 1
     return 0
   fi
 
@@ -678,14 +777,15 @@ EOF
   hint="OPEN DECISIONS: close one by answering it: bin/fm-send.sh <task> --resolve-key <key> '<answer>'
 "
   # Reserve the footer's worst-case width - its wording, the attachment path,
-  # and up to $total's own digit count for the omitted number - before
-  # deciding how many preview rows fit, so the footer itself can never be the
-  # thing that blows the section's budget (issue #19 shape review point 4).
-  footer_reserve=$(( $(_fm_byte_len "$attach_path") + ${#total} + 80 ))
+  # and up to $OPEN_DECISIONS_TOTAL's own digit count for the omitted number -
+  # before deciding how many preview rows fit, so the footer itself can never
+  # be the thing that blows the section's budget (issue #19 shape review
+  # point 4).
+  footer_reserve=$(( $(_fm_byte_len "$attach_path") + ${#OPEN_DECISIONS_TOTAL} + 80 ))
   row_budget=$(( global_bytes - $(_fm_byte_len "$heading") - $(_fm_byte_len "$hint") - footer_reserve ))
   if [ "$row_budget" -lt 0 ]; then
     printf 'OPEN DECISIONS SKIPPED: the durable attachment path is too long to present within budget; %d decision(s) recorded in full at %s\n' \
-      "$total" "$attach_path" || return 1
+      "$OPEN_DECISIONS_TOTAL" "$attach_path" || return 1
     return 0
   fi
 
@@ -701,15 +801,18 @@ EOF
     used=$((used + bytes))
     shown=$((shown + 1))
   done <<EOF
-$candidates
+$OPEN_DECISIONS_CANDIDATES
 EOF
 
   printf '%s' "$heading" || return 1
   printf '%s' "$output" || return 1
   if [ "$omitted" -gt 0 ]; then
-    printf 'OPEN DECISIONS: %d more not previewed (byte cap); full payloads: %s\n' "$omitted" "$attach_path" || return 1
+    # A bounded aggregate index pointer, never a per-omitted-item list: the
+    # attachment is fully labeled and searchable from its first line (issue
+    # #19 shape review, rev25-sol3 P2).
+    printf 'OPEN DECISIONS: %d more not previewed (byte cap); full payloads: %s:1\n' "$omitted" "$attach_path" || return 1
   else
-    printf 'OPEN DECISIONS: full payloads: %s\n' "$attach_path" || return 1
+    printf 'OPEN DECISIONS: full payloads: %s:1\n' "$attach_path" || return 1
   fi
   # Answerer-closes hint, printed at exactly the moment an answer gets written:
   # the send that answers a listed decision also closes it, so closure never
@@ -779,15 +882,40 @@ EOF
 }
 
 print_status_sections() {
-  local snapshot=${1:-} fully_presented=${2:-} acknowledged prepared
+  local snapshot=${1:-} fully_presented=${2:-} acknowledged prepared unread_text
   if [ -z "$snapshot" ]; then snapshot=$(status_presentation_snapshot "$STATE") || return 1; fi
   [ -n "$snapshot" ] || return 0
   acknowledged=$(status_acknowledge_presented_snapshot "$STATE" "$snapshot" "$fully_presented") || return 1
   prepared=$(mktemp "$STATE/.status-presentation.prepared.XXXXXX") || return 1
+
+  # UNREAD STATUS must still run, and be fully read, before either decision
+  # section's collect phase: scan_open_decisions_incremental (inside
+  # collect_open_decisions_section) advances its own cursor as a side effect
+  # of folding, which can make a not-yet-presented `note:` line stop looking
+  # unread to scan_unread_surface_lines if the fold runs first. Buffering this
+  # section's own text (it has no other cross-section state to preserve)
+  # keeps that original read-before-mutate ordering while still collecting
+  # both decision sections before either one prints (below).
+  unread_text=$(print_unread_status_section "$snapshot") || { rm -f -- "$prepared"; return 1; }
+
+  # Collect both decision-bearing sections before printing either: issue #19
+  # shape review (rev25-sol3 P3) calls for ONE attachment per drain covering
+  # every selected decision from both sections, not one file each, so
+  # publication must wait until both have finished appending to it. Each
+  # render phase below then already knows the real, final attachment path (or
+  # its confirmed absence) before it prints a single byte.
+  _fm_drain_attach_reset
+  if ! collect_status_outcome_backstop_section "$snapshot" \
+    || ! collect_open_decisions_section "$snapshot"; then
+    rm -f -- "$prepared"
+    return 1
+  fi
+  _fm_drain_attach_publish || true
+
   if ! {
-    print_unread_status_section "$snapshot" \
-      && print_status_outcome_backstop_section "$snapshot" \
-      && print_open_decisions_section "$snapshot" \
+    { [ -z "$unread_text" ] || printf '%s\n' "$unread_text"; } \
+      && render_status_outcome_backstop_section \
+      && render_open_decisions_section \
       && print_record_divergence_section
   } > "$prepared"; then
     rm -f -- "$prepared"

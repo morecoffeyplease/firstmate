@@ -210,7 +210,7 @@ test_over_long_decision_note_is_capped_with_an_attachment_pointer() {
   esac
   [ "${#line}" -le 260 ] || fail "a capped decision item ran unexpectedly long: ${#line} chars: $line"
 
-  attach_path=$(grep -F 'full payloads:' "$out" | awk '{print $NF}')
+  attach_path=$(grep -F 'full payloads:' "$out" | awk '{print $NF}' | sed 's/:1$//')
   [ -n "$attach_path" ] && [ -f "$attach_path" ] \
     || fail "no readable attachment path was printed for the over-long decision: $(cat "$out")"
   attach_line=${line##*'(full: L'}
@@ -255,7 +255,7 @@ test_reopened_key_attachment_holds_the_current_note() {
 
   line=$(grep -F 'multi' "$out")
   [ -n "$line" ] || fail "a reopened decision key produced no OPEN DECISIONS line: $(cat "$out")"
-  attach_path=$(grep -F 'full payloads:' "$out" | awk '{print $NF}')
+  attach_path=$(grep -F 'full payloads:' "$out" | awk '{print $NF}' | sed 's/:1$//')
   [ -n "$attach_path" ] && [ -f "$attach_path" ] \
     || fail "no readable attachment path was printed for the reopened key: $(cat "$out")"
   grep -qF "[open-decision] task multi [key=ambiguous] needs-decision: $note2" "$attach_path" \
@@ -296,7 +296,7 @@ test_many_oversized_decisions_stay_within_the_section_budget() {
   [ "$count" -gt 0 ] && [ "$count" -lt 32 ] \
     || fail "unexpected number of individually-printed decisions: $count"
 
-  attach_path=$(grep -F 'full payloads:' "$out" | awk '{print $NF}')
+  attach_path=$(grep -F 'full payloads:' "$out" | awk '{print $NF}' | sed 's/:1$//')
   [ -n "$attach_path" ] && [ -f "$attach_path" ] \
     || fail "no readable attachment path was printed: $(cat "$out")"
   attach_lines=$(wc -l < "$attach_path" | tr -d ' ')
@@ -333,7 +333,7 @@ test_multibyte_decision_note_stays_within_the_byte_budget() {
   python3 -c "open('$out','rb').read().decode('utf-8')" \
     || fail "the section output was not valid UTF-8 - the per-item cut split a multibyte character"
 
-  attach_path=$(grep -F 'full payloads:' "$out" | awk '{print $NF}')
+  attach_path=$(grep -F 'full payloads:' "$out" | awk '{print $NF}' | sed 's/:1$//')
   [ -n "$attach_path" ] && [ -f "$attach_path" ] \
     || fail "no readable attachment path was printed for the multibyte decision: $(cat "$out")"
   python3 -c "
@@ -367,12 +367,95 @@ test_unchanged_decision_set_reuses_the_same_attachment() {
   pass "an unchanged decision set reuses its already-published attachment instead of writing a new one"
 }
 
+# Issue #19 shape review re-review (data/rev25-sol3/report.md P1): a
+# content-addressed name is a promise, not a fact, until the bytes underneath
+# are actually verified - a corrupted or out-of-band-replaced attachment must
+# never be silently reused just because a file already sits at its hash path.
+test_tampered_attachment_is_rejected_not_silently_reused() {
+  local dir state out1 out2 attach_path
+  dir=$(make_case tampered-attachment)
+  state="$dir/state"
+  out1="$dir/drain1.out"
+  out2="$dir/drain2.out"
+  printf 'needs-decision [key=k]: original payload\n' > "$state/task1.status"
+
+  FM_STATE_OVERRIDE="$state" "$DRAIN" > "$out1" || fail "first drain failed"
+  attach_path=$(grep -F 'full payloads:' "$out1" | awk '{print $NF}' | sed 's/:1$//')
+  [ -n "$attach_path" ] && [ -f "$attach_path" ] || fail "no attachment was published: $(cat "$out1")"
+
+  printf 'WRONG CONTENT\n' > "$attach_path"
+
+  FM_STATE_OVERRIDE="$state" "$DRAIN" > "$out2" || fail "second drain failed"
+  grep -qF 'OPEN DECISIONS SKIPPED:' "$out2" \
+    || fail "a tampered attachment was silently trusted instead of being rejected: $(cat "$out2")"
+  [ "$(cat "$attach_path")" = 'WRONG CONTENT' ] \
+    || fail "the tampered file was overwritten instead of being left alone for investigation"
+
+  pass "a hash-named attachment whose bytes no longer match its name is rejected, not silently reused"
+}
+
+# Issue #19 shape review re-review (rev25-sol3 P2): the printed route for an
+# attachment must have the file-and-line shape the verdict itself calls for,
+# not a bare file path.
+test_attachment_pointer_has_file_and_line_shape() {
+  local dir state out line
+  dir=$(make_case pointer-shape)
+  state="$dir/state"
+  out="$dir/drain.out"
+  printf 'needs-decision [key=k]: brief\n' > "$state/task1.status"
+
+  FM_STATE_OVERRIDE="$state" "$DRAIN" > "$out" || fail "drain failed"
+
+  line=$(grep -F 'full payloads:' "$out")
+  case "$line" in
+    *"/drain-decisions/"*.txt:1) : ;;
+    *) fail "the attachment pointer was not a file-and-line reference: $line" ;;
+  esac
+
+  pass "the attachment pointer names a file and a line, not a bare path"
+}
+
+# Issue #19 shape review re-review (rev25-sol3 P3): one drain must publish
+# exactly one attachment covering every selected decision from BOTH sections,
+# not one file per section.
+test_one_drain_publishes_one_shared_attachment() {
+  local dir state out path_open path_backstop file_count
+  dir=$(make_case shared-attachment)
+  state="$dir/state"
+  out="$dir/drain.out"
+  printf 'needs-decision [key=k1]: an open decision\n' > "$state/task1.status"
+  printf 'blocked [key=bad/value]: a malformed-key backstop event\n' > "$state/task2.status"
+
+  FM_STATE_OVERRIDE="$state" "$DRAIN" > "$out" || fail "drain failed"
+
+  path_open=$(grep -F 'OPEN DECISIONS: full payloads:' "$out" | awk '{print $NF}' | sed 's/:1$//')
+  path_backstop=$(grep -F 'STATUS OUTCOME BACKSTOP: full payloads:' "$out" | awk '{print $NF}' | sed 's/:1$//')
+  [ -n "$path_open" ] && [ -n "$path_backstop" ] \
+    || fail "one or both sections printed no attachment pointer: $(cat "$out")"
+  [ "$path_open" = "$path_backstop" ] \
+    || fail "OPEN DECISIONS and STATUS OUTCOME BACKSTOP published two different attachments instead of one shared one: $path_open vs $path_backstop"
+
+  file_count=$(find "$state/drain-decisions" -type f -name '*.txt' | wc -l | tr -d ' ')
+  [ "$file_count" = 1 ] \
+    || fail "the drain left more than one attachment file behind: $file_count"
+
+  grep -qF '[open-decision] task task1 [key=k1] needs-decision: an open decision' "$path_open" \
+    || fail "the shared attachment is missing the open decision's complete payload"
+  grep -qF '[backstop-event] task task2 blocked: blocked [key=bad/value]: a malformed-key backstop event' "$path_open" \
+    || fail "the shared attachment is missing the backstop event's complete payload"
+
+  pass "one drain publishes exactly one shared attachment covering both sections' selected decisions"
+}
+
 test_buried_decision_still_surfaces
 test_over_long_decision_note_is_capped_with_an_attachment_pointer
 test_reopened_key_attachment_holds_the_current_note
 test_many_oversized_decisions_stay_within_the_section_budget
 test_multibyte_decision_note_stays_within_the_byte_budget
 test_unchanged_decision_set_reuses_the_same_attachment
+test_tampered_attachment_is_rejected_not_silently_reused
+test_attachment_pointer_has_file_and_line_shape
+test_one_drain_publishes_one_shared_attachment
 test_explicit_resolution_closes_it
 test_later_unrelated_terminal_line_does_not_close_it
 test_reserved_key_namespace_is_owned_by_its_library
