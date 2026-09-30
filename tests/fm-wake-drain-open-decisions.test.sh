@@ -428,8 +428,8 @@ test_one_drain_publishes_one_shared_attachment() {
 
   FM_STATE_OVERRIDE="$state" "$DRAIN" > "$out" || fail "drain failed"
 
-  path_open=$(grep -F 'OPEN DECISIONS: full payloads:' "$out" | awk '{print $NF}' | sed 's/:1$//')
-  path_backstop=$(grep -F 'STATUS OUTCOME BACKSTOP: full payloads:' "$out" | awk '{print $NF}' | sed 's/:1$//')
+  path_open=$(grep -F 'OPEN DECISIONS: full payloads:' "$out" | awk '{print $NF}' | sed 's/:[0-9]*$//')
+  path_backstop=$(grep -F 'STATUS OUTCOME BACKSTOP: full payloads:' "$out" | awk '{print $NF}' | sed 's/:[0-9]*$//')
   [ -n "$path_open" ] && [ -n "$path_backstop" ] \
     || fail "one or both sections printed no attachment pointer: $(cat "$out")"
   [ "$path_open" = "$path_backstop" ] \
@@ -447,6 +447,90 @@ test_one_drain_publishes_one_shared_attachment() {
   pass "one drain publishes exactly one shared attachment covering both sections' selected decisions"
 }
 
+# Issue #19 shape review re-review (data/rev25-sol4/report.md P2): when both
+# sections select decisions, the shared attachment carries the backstop's
+# rows first (collect order), so a hard-coded ":1" in OPEN DECISIONS' own
+# footer would point at the backstop's row, not its own. Each section must
+# use its own recorded first attachment line.
+test_mixed_drain_each_section_points_at_its_own_first_line() {
+  local dir state out backstop_line open_line backstop_lineno open_lineno attach_path
+  dir=$(make_case mixed-pointer-lines)
+  state="$dir/state"
+  out="$dir/drain.out"
+  printf 'blocked [key=bad/value]: a malformed-key backstop event\n' > "$state/task-backstop.status"
+  printf 'needs-decision [key=k1]: an open decision\n' > "$state/task-open.status"
+
+  FM_STATE_OVERRIDE="$state" "$DRAIN" > "$out" || fail "drain failed"
+
+  backstop_line=$(grep -F 'STATUS OUTCOME BACKSTOP: full payloads:' "$out")
+  open_line=$(grep -F 'OPEN DECISIONS: full payloads:' "$out")
+  [ -n "$backstop_line" ] && [ -n "$open_line" ] \
+    || fail "one or both sections printed no attachment pointer: $(cat "$out")"
+
+  attach_path=$(printf '%s' "$backstop_line" | awk '{print $NF}' | sed 's/:[0-9]*$//')
+  backstop_lineno=$(printf '%s' "$backstop_line" | awk '{print $NF}' | sed 's/^.*://')
+  open_lineno=$(printf '%s' "$open_line" | awk '{print $NF}' | sed 's/^.*://')
+  [ "$backstop_lineno" != "$open_lineno" ] \
+    || fail "both sections pointed at the same attachment line: $backstop_line / $open_line"
+
+  [ "$(sed -n "${backstop_lineno}p" "$attach_path")" = '[backstop-event] task task-backstop blocked: blocked [key=bad/value]: a malformed-key backstop event' ] \
+    || fail "the backstop pointer's line did not hold the backstop event: $backstop_line"
+  [ "$(sed -n "${open_lineno}p" "$attach_path")" = '[open-decision] task task-open [key=k1] needs-decision: an open decision' ] \
+    || fail "the OPEN DECISIONS pointer's line did not hold the open decision, not the backstop row: $open_line"
+
+  pass "each section points at its own first line in the shared attachment, never the other section's row"
+}
+
+# Issue #19 shape review re-review (rev25-sol4 P3): a collect phase can fail
+# after an EARLIER collect phase already appended a complete decision payload
+# to the shared staging file. That staging file must never survive the
+# failure - a repeated failing drain must not silently accumulate full
+# decision text on disk with no attachment ever accounting for it.
+test_failed_collection_leaves_no_staged_attachment_behind() {
+  local dir state out realmv
+  dir=$(make_case failed-collection-cleanup)
+  state="$dir/state"
+  out="$dir/drain.out"
+  realmv=$(command -v mv)
+
+  printf 'blocked [key=bad/value]: first event\n' > "$state/task-a.status"
+  printf 'needs-decision [key=k]: open decision bootstrap\n' > "$state/task-b.status"
+  # Bootstrap drain: publishes an attachment (discarded below) and, more
+  # importantly, seeds task-b's own open-decisions fold cache so the SECOND
+  # drain takes the incremental path with a cursor cache file to corrupt.
+  FM_STATE_OVERRIDE="$state" "$DRAIN" > "$dir/bootstrap.out" || fail "bootstrap drain failed"
+  rm -rf "$state/drain-decisions"
+
+  # New content for BOTH tasks: backstop has something fresh to append (this
+  # is the payload that must not leak onto disk unpublished), and open
+  # decisions has new bytes to fold (triggering a cursor cache write-back).
+  printf 'blocked [key=bad/value]: decision appended before failure\n' >> "$state/task-a.status"
+  printf 'working: more content to fold\n' >> "$state/task-b.status"
+
+  # A portable failure injection (this codebase's own established pattern for
+  # "make exactly this write fail"): a fake mv that fails only for task-b's
+  # open-decisions cursor cache write-back, passing every other invocation
+  # through to the real mv untouched.
+  mkdir -p "$dir/fakebin"
+  cat > "$dir/fakebin/mv" <<SH
+#!/usr/bin/env bash
+for arg in "\$@"; do last=\$arg; done
+if [ "\${last:-}" = "$state/.task-b.open-decisions-cursor" ]; then exit 1; fi
+exec "$realmv" "\$@"
+SH
+  chmod +x "$dir/fakebin/mv"
+
+  PATH="$dir/fakebin:$PATH" FM_STATE_OVERRIDE="$state" "$DRAIN" > "$out" 2>&1
+  # The drain's compatibility exit code stays 0 even when presentation fails
+  # (an existing, unrelated contract); what matters here is what it left on
+  # disk, not its exit status.
+  if find "$state/drain-decisions" -type f 2>/dev/null | grep -q .; then
+    fail "a failed collection left a staged or published attachment behind: $(find "$state/drain-decisions" -type f 2>/dev/null)"
+  fi
+
+  pass "a collection failure after an earlier section already appended a decision leaves no staged attachment behind"
+}
+
 test_buried_decision_still_surfaces
 test_over_long_decision_note_is_capped_with_an_attachment_pointer
 test_reopened_key_attachment_holds_the_current_note
@@ -456,6 +540,8 @@ test_unchanged_decision_set_reuses_the_same_attachment
 test_tampered_attachment_is_rejected_not_silently_reused
 test_attachment_pointer_has_file_and_line_shape
 test_one_drain_publishes_one_shared_attachment
+test_mixed_drain_each_section_points_at_its_own_first_line
+test_failed_collection_leaves_no_staged_attachment_behind
 test_explicit_resolution_closes_it
 test_later_unrelated_terminal_line_does_not_close_it
 test_reserved_key_namespace_is_owned_by_its_library

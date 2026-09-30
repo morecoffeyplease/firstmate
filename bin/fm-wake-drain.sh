@@ -463,6 +463,7 @@ BACKSTOP_RC=0
 BACKSTOP_CANDIDATES=
 BACKSTOP_TOTAL=0
 BACKSTOP_TOTAL_DECISIONS=0
+BACKSTOP_FIRST_LINE=
 collect_status_outcome_backstop_section() {  # <task-and-endpoint-snapshot>
   local snapshot=$1 task endpoint ident event event_endpoint line verb key receipt store lock ready
   local item_bytes=220 cand_line lineno
@@ -470,6 +471,7 @@ collect_status_outcome_backstop_section() {  # <task-and-endpoint-snapshot>
   BACKSTOP_CANDIDATES=
   BACKSTOP_TOTAL=0
   BACKSTOP_TOTAL_DECISIONS=0
+  BACKSTOP_FIRST_LINE=
   STATUS_OUTCOME_BACKSTOP_ACKNOWLEDGED=
   [ "$ACTOR" = main ] || return 0
 
@@ -539,6 +541,7 @@ collect_status_outcome_backstop_section() {  # <task-and-endpoint-snapshot>
         BACKSTOP_TOTAL_DECISIONS=$((BACKSTOP_TOTAL_DECISIONS + 1))
         _fm_drain_attach_append "[backstop-event] task $task $verb: $event"
         lineno=$_FM_DRAIN_ATTACH_LAST_LINE
+        [ -n "$BACKSTOP_FIRST_LINE" ] || BACKSTOP_FIRST_LINE=$lineno
         ;;
     esac
 
@@ -565,7 +568,7 @@ EOF
 render_status_outcome_backstop_section() {
   local output='' used=0 shown=0 omitted=0 bytes item_bytes=220 global_bytes=4000
   local cand_line task event_endpoint footer_reserve row_budget heading
-  local attach_path=$_FM_DRAIN_ATTACH_PATH
+  local attach_path=$_FM_DRAIN_ATTACH_PATH attach_line=${BACKSTOP_FIRST_LINE:-1}
 
   case "$BACKSTOP_RC" in
     3)
@@ -655,14 +658,16 @@ EOF
   if [ "$omitted" -gt 0 ]; then
     if [ -n "$attach_path" ]; then
       # A bounded aggregate index pointer, never a per-omitted-item list: the
-      # attachment is fully labeled and searchable from its first line (issue
-      # #19 shape review, rev25-sol3 P2).
-      printf 'STATUS OUTCOME BACKSTOP: %d more not previewed (byte cap); full payloads: %s:1\n' "$omitted" "$attach_path" || return 1
+      # attachment is fully labeled and searchable from this section's own
+      # first line onward (issue #19 shape review, rev25-sol3 P2). The shared
+      # attachment can carry the other section's rows first (rev25-sol4 P2),
+      # so this must be BACKSTOP's own first line, never a bare ":1".
+      printf 'STATUS OUTCOME BACKSTOP: %d more not previewed (byte cap); full payloads: %s:%s\n' "$omitted" "$attach_path" "$attach_line" || return 1
     else
       printf 'STATUS OUTCOME BACKSTOP: %d more omitted (byte cap)\n' "$omitted" || return 1
     fi
   elif [ -n "$attach_path" ]; then
-    printf 'STATUS OUTCOME BACKSTOP: full payloads: %s:1\n' "$attach_path" || return 1
+    printf 'STATUS OUTCOME BACKSTOP: full payloads: %s:%s\n' "$attach_path" "$attach_line" || return 1
   fi
 }
 
@@ -720,10 +725,12 @@ EOF
 # does all presentation once the shared attachment is published.
 OPEN_DECISIONS_CANDIDATES=
 OPEN_DECISIONS_TOTAL=0
+OPEN_DECISIONS_FIRST_LINE=
 collect_open_decisions_section() {  # <task-and-endpoint-snapshot>
   local snapshot=${1:-} open task key verb note line item_bytes=220 cand_line lineno
   OPEN_DECISIONS_CANDIDATES=
   OPEN_DECISIONS_TOTAL=0
+  OPEN_DECISIONS_FIRST_LINE=
 
   if [ -n "$snapshot" ]; then
     open=$(scan_open_decisions_snapshot "$STATE" "$snapshot") || return 1
@@ -737,6 +744,7 @@ collect_open_decisions_section() {  # <task-and-endpoint-snapshot>
     OPEN_DECISIONS_TOTAL=$((OPEN_DECISIONS_TOTAL + 1))
     _fm_drain_attach_append "[open-decision] task $task$([ "$key" = default ] && printf '' || printf ' [key=%s]' "$key") $verb: $note"
     lineno=$_FM_DRAIN_ATTACH_LAST_LINE
+    [ -n "$OPEN_DECISIONS_FIRST_LINE" ] || OPEN_DECISIONS_FIRST_LINE=$lineno
 
     line="$task"
     [ "$key" = default ] || line="$line [key=$key]"
@@ -763,7 +771,7 @@ EOF
 render_open_decisions_section() {
   local output='' used=0 shown=0 omitted=0 bytes item_bytes=220 global_bytes=4000
   local cand_line footer_reserve row_budget heading hint
-  local attach_path=$_FM_DRAIN_ATTACH_PATH
+  local attach_path=$_FM_DRAIN_ATTACH_PATH attach_line=${OPEN_DECISIONS_FIRST_LINE:-1}
 
   [ "$OPEN_DECISIONS_TOTAL" -gt 0 ] || return 0
 
@@ -808,11 +816,13 @@ EOF
   printf '%s' "$output" || return 1
   if [ "$omitted" -gt 0 ]; then
     # A bounded aggregate index pointer, never a per-omitted-item list: the
-    # attachment is fully labeled and searchable from its first line (issue
-    # #19 shape review, rev25-sol3 P2).
-    printf 'OPEN DECISIONS: %d more not previewed (byte cap); full payloads: %s:1\n' "$omitted" "$attach_path" || return 1
+    # attachment is fully labeled and searchable from this section's own
+    # first line onward (issue #19 shape review, rev25-sol3 P2). The shared
+    # attachment can carry the other section's rows first (rev25-sol4 P2), so
+    # this must be OPEN DECISIONS' own first line, never a bare ":1".
+    printf 'OPEN DECISIONS: %d more not previewed (byte cap); full payloads: %s:%s\n' "$omitted" "$attach_path" "$attach_line" || return 1
   else
-    printf 'OPEN DECISIONS: full payloads: %s:1\n' "$attach_path" || return 1
+    printf 'OPEN DECISIONS: full payloads: %s:%s\n' "$attach_path" "$attach_line" || return 1
   fi
   # Answerer-closes hint, printed at exactly the moment an answer gets written:
   # the send that answers a listed decision also closes it, so closure never
@@ -907,6 +917,12 @@ print_status_sections() {
   _fm_drain_attach_reset
   if ! collect_status_outcome_backstop_section "$snapshot" \
     || ! collect_open_decisions_section "$snapshot"; then
+    # A collect phase can fail after it already appended one or more complete
+    # decision payloads to the shared staging file (issue #19 review,
+    # rev25-sol4 P3): never leave that unpublished file behind on a failing
+    # drain, or a repeated failure quietly retains full decision text on disk
+    # with nothing to account for it.
+    rm -f -- "$_FM_DRAIN_ATTACH_TMP"
     rm -f -- "$prepared"
     return 1
   fi
