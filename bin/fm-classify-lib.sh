@@ -166,7 +166,7 @@ _fm_status_event_scan() {
     case "$line" in *[![:space:]]*) fallback=$line ;; *) continue ;; esac
     case "$line" in *:*) status_line_verb "$line" verb ;; *) verb='' ;; esac
     case "$verb" in
-      working|needs-decision|blocked|done|failed|note|\
+      working|needs-decision|blocked|done|failed|note|receipt|\
       "${FM_CLASSIFY_PAUSED_VERB:-$FM_CLASSIFY_PAUSED_VERB_DEFAULT}"|\
       "${FM_CLASSIFY_RESOLVE_VERB:-$FM_CLASSIFY_RESOLVE_VERB_DEFAULT}"|\
       "${FM_CLASSIFY_CAPTAIN_HELD_VERB:-$FM_CLASSIFY_CAPTAIN_HELD_VERB_DEFAULT}") prev=$last; last=$line ;;
@@ -200,98 +200,16 @@ status_is_terminal_verb() {
   esac
 }
 
-# The strict grammar for the text before the line's first colon: exactly the
-# word "done", then zero or more whitespace-separated recognized tokens
-# ("[key=<slug>]", "[corr=<16 hex>]", or the bare "corr=<16 hex>" form) in any
-# order around exactly one "[confirmation]" token, and nothing else. Case
-# sensitive on purpose (matches "[confirmation]" only, never "[Confirmation]"),
-# and this is a fixed regex string, never built from a caller-influenced
-# variable.
-_FM_STATUS_CONFIRMATION_PREFIX_RE='^done([[:space:]]+(\[key=[A-Za-z0-9_-]+\]|\[corr=[0-9A-Fa-f]{16}\]|corr=[0-9A-Fa-f]{16}))*[[:space:]]+\[confirmation\]([[:space:]]+(\[key=[A-Za-z0-9_-]+\]|\[corr=[0-9A-Fa-f]{16}\]|corr=[0-9A-Fa-f]{16}))*[[:space:]]*$'
-
-# 0 when the text before <status-line>'s first colon matches the strict prefix
-# grammar above exactly: "done" plus only recognized bracket/corr tokens around
-# exactly one "[confirmation]" token, with nothing else. This is a full-prefix
-# grammar rather than "does '[confirmation]' occur anywhere before the colon"
-# (the loose form this replaced): a stray word or punctuation glued in ahead of
-# the first colon - "done [confirmation] needs-decision: ...",
-# "done [confirmation]; blocked: ...", "done [key=a]x[confirmation]: ..." - now
-# fails the grammar outright rather than depending on a content blocklist to
-# catch it (PR #27 review finding P1-1, Opus's real-watcher probe matrix).
-# Case-sensitive matching is forced regardless of the caller's ambient
-# nocasematch state, matching how "[confirmation]" itself is case-sensitive.
-_fm_status_confirmation_prefix_ok() {  # <status-line>
-  local prefix=${1%%:*} restore_case=0 matched=1
-  shopt -q nocasematch && { shopt -u nocasematch; restore_case=1; }
-  [[ "$prefix" =~ $_FM_STATUS_CONFIRMATION_PREFIX_RE ]] && matched=0
-  [ "$restore_case" -eq 0 ] || shopt -s nocasematch
-  return "$matched"
-}
-
-# 0 when <status-line> contains NONE of the signals that must always wake the
-# parent even inside a tagged done: line's own text: the same legacy
-# captain-relevance tokens status_is_captain_relevant's free-text fallback
-# already uses (FM_CAPTAIN_RE/FM_CLASSIFY_CAPTAIN_RE_DEFAULT - "done:",
-# "needs-decision:", "blocked:", "failed:", "PR ready", "checks green", "ready
-# in branch", "merged"); a bare URL scheme, since a PR or merge link is itself
-# an outcome the captain must see in full (AGENTS.md: every PR mention carries
-# its complete https:// URL); and a small case-sensitive substring list for
-# outcomes the legacy vocabulary above does not otherwise name - a bare "PR"
-# mention, a "pull/" path segment, a doc-pointer "report.md", or an
-# unstructured "finding:"/"decision:" note (PR #27 review finding P1-2, Opus's
-# "finding: auth bypass" probe). That list is deliberately case-sensitive
-# exact-substring, not the case-insensitive FM_CAPTAIN_RE match above: a
-# case-insensitive bare "pr" would also match ordinary prose ("approve",
-# "surprise", "improve"), which would make the tag useless for its one
-# intended purpose. "data/" alone is NOT blocked: the issue's own motivating
-# example ("recorded in data/captain.md and cascaded") must stay absorbable,
-# and "report.md" already catches the doc-pointer shape
-# (bin/fm-secondmate-report.sh --doc) this guards against. Checked against the
-# WHOLE line, not just the note after the colon, so content ahead of the first
-# colon cannot dodge it either. A false positive here only means an extra
-# wake, which is the intended fail-toward-waking bias.
-_fm_status_confirmation_outcome_free() {  # <status-line>
-  local line=$1
-  _fm_classify_matches "$line" "${FM_CAPTAIN_RE:-$FM_CLASSIFY_CAPTAIN_RE_DEFAULT}" && return 1
-  _fm_classify_matches "$line" '[a-zA-Z][a-zA-Z0-9+.-]*://' && return 1
-  case "$line" in
-    *PR*|*pull/*|*report.md*|*finding:*|*decision:*) return 1 ;;
-  esac
-  return 0
-}
-
-# 0 if <status-line> is a `done:` completion explicitly tagged [confirmation]
-# whose text carries no outcome or decision content of its own
-# (_fm_status_confirmation_outcome_free): a secondmate's delivery confirmation
-# that a previously routed instruction was carried out, with no outcome for
-# the parent to act on (issue #18). Verb-gated to `done` only - the tag has NO
-# EFFECT on needs-decision, blocked, or failed, so a misapplied tag on a real
-# outcome still wakes the parent rather than silently dropping it.
-# Deliberately NOT wired into status_is_captain_relevant: that predicate is
-# shared by every task kind, and this one exists only for a verified
-# kind=secondmate status span (PR #27 review finding P2). bin/fm-watch.sh's
-# signal_files_actionable and signal_secondmate_confirmation_files (via
-# status_span_all_confirmations below) are the only places that check kind
-# before trusting this predicate to let a secondmate's otherwise-always-
-# surfaced .status append go unwoken.
-status_is_delivery_confirmation() {  # <status-line>
-  local line=$1 verb
-  [ -n "$line" ] || return 1
-  verb=$(status_line_verb "$line")
-  [ "$verb" = "done" ] || return 1
-  _fm_status_confirmation_prefix_ok "$line" || return 1
-  _fm_status_confirmation_outcome_free "$line"
-}
-
 # 0 if the given (last) status line matches a captain-relevant verb.
 # Verb-aware by default: terminal verbs always match; nonterminal progress verbs
 # (working, resolved, captain-held) and paused never match from free-text prose;
 # only lines without those leading verbs may still match free-text tokens for
-# legacy bare lines such as "merged" or "PR ready". A tagged [confirmation]
-# done: line is STILL captain-relevant here, on purpose: this predicate has no
-# notion of task kind, and status_is_delivery_confirmation's absorb is scoped
-# to a verified kind=secondmate span by its only two callers, never by this
-# shared, kind-agnostic classifier (PR #27 review finding P2).
+# legacy bare lines such as "merged" or "PR ready". A `receipt:` line (see
+# status_span_is_all_receipts below) is not a recognized verb here either, so
+# it falls through to that same free-text check and is captain-relevant only
+# if a home's own FM_CAPTAIN_RE happens to say so - deliberately unmodified for
+# that case (PR #27 Astra shape review: a receipt has no `done` verb to
+# special-case, so there is nothing here to downgrade).
 status_is_captain_relevant() {
   local line=$1 verb
   [ -n "$line" ] || return 1
@@ -2005,35 +1923,42 @@ status_span_has_actionable() {  # <status-file> <start-offset>
   status_span_first_actionable_record "$1" "${2:-0}" > /dev/null
 }
 
-# 0 when <status-file>'s span from <start-offset> to EOF is NONEMPTY and every
-# non-blank line in it is a delivery confirmation (status_is_delivery_confirmation);
-# 1 when the span is empty (nothing new since <start-offset>) or contains ANY
-# line that is not a tagged delivery confirmation - including every other
-# recognized verb (working, paused, note, resolved, captain-held), an untagged
-# done, and anything status_is_captain_relevant already treats as actionable. A
-# read or identity failure also returns 1, so an unclassifiable log surfaces
-# rather than silently absorbing (issue #18's fail-toward-waking requirement).
-# Offset-only, like status_span_first_actionable_record, so a caller with its
-# own seen-position bookkeeping (bin/fm-watch.sh's .seen-* markers) can reuse it
-# without this library knowing that format exists.
-status_span_all_confirmations() {  # <status-file> <start-offset>
-  local f=$1 start=${2:-0} size lines line seen=0
+# 0 when the exact byte span [<start-offset>, <end-offset>) of <status-file> is
+# nonempty and consists of nothing but the fixed record
+# "receipt: delivery=<16 lowercase hex>\n" repeated one or more times, with
+# NOTHING else - no note, recipient, path, bracket token, corr=, key, blank
+# line, extra or missing trailing LF, CR, tab, NUL, or non-ASCII byte, and no
+# byte anywhere outside that grammar (PR #27 Astra shape review: replaces the
+# free-text "[confirmation]"-tagged done: blocklist, which independent review
+# showed could not distinguish open-ended outcome prose - "landed change",
+# "shipped the fix", "closed #18", "review found two high severity defects" -
+# from a genuine receipt). 1 for an empty, unreadable, symlinked, or missing
+# file, a malformed offset pair, or any content outside the exact grammar.
+# Matched against the RAW bytes via a single anchored regex read directly from
+# the file, never through a shell variable capture: command substitution
+# strips a trailing newline and cannot hold an embedded NUL, either of which
+# would silently defeat exactly the boundary check this exists to enforce.
+# <end-offset> is a REQUIRED, CALLER-SUPPLIED boundary, not "current EOF": the
+# caller must pass the same endpoint it captured earlier (from
+# status_span_first_actionable_record, in bin/fm-watch.sh's
+# signal_files_actionable) and will commit as the new classified position, so
+# this never validates a later, larger span than the one being marked seen.
+status_span_is_all_receipts() {  # <status-file> <start-offset> <end-offset>
+  local f=$1 start=${2:-} end=${3:-} length
   [ -f "$f" ] && [ -r "$f" ] && [ ! -L "$f" ] || return 1
-  size=$(_fm_status_file_size "$f") || return 1
-  size=${size//[[:space:]]/}
-  case "$size" in ''|*[!0-9]*) return 1 ;; esac
-  case "$start" in ''|*[!0-9]*) start=0 ;; esac
-  [ "$start" -le "$size" ] || start=0
-  [ "$start" -lt "$size" ] || return 1
-  lines=$(_fm_status_read_span "$f" "$start" "$((size - start))" 2>/dev/null) || return 1
-  while IFS= read -r line || [ -n "$line" ]; do
-    case "$line" in *[![:space:]]*) ;; *) continue ;; esac
-    status_is_delivery_confirmation "$line" || return 1
-    seen=1
-  done <<EOF
-$lines
-EOF
-  [ "$seen" -eq 1 ]
+  case "$start" in ''|*[!0-9]*) return 1 ;; esac
+  case "$end" in ''|*[!0-9]*) return 1 ;; esac
+  [ "$start" -lt "$end" ] || return 1
+  length=$((end - start))
+  perl -e '
+    my ($path, $start, $length) = @ARGV;
+    open(my $fh, "<:raw", $path) or exit 1;
+    seek($fh, $start, 0) or exit 1;
+    my $data = "";
+    my $got = read($fh, $data, $length);
+    (defined $got && $got == $length) or exit 1;
+    exit(($data =~ /\A(?:receipt: delivery=[0-9a-f]{16}\n)+\z/) ? 0 : 1);
+  ' "$f" "$start" "$length"
 }
 
 # Classify WHY an idle/stale crew MIGHT be safely absorbed instead of surfaced,
@@ -2188,10 +2113,10 @@ crew_worktree_written_since() {  # <id> <state> <anchor-file>
 # more current, not less deliverable. Scoped to .status files - a mate's bare
 # turn-ended ping still uses the ordinary provably-working absorb. The ONE
 # exception lives one layer up, in the caller: bin/fm-watch.sh's
-# signal_secondmate_confirmation_files filters a secondmate .status file out of
-# the batch THIS function sees when its whole unseen span is delivery
-# confirmations (status_span_all_confirmations), so it never reaches this
-# always-surface rule at all (issue #18).
+# signal_secondmate_receipt_files filters a secondmate .status file out of the
+# batch THIS function sees when its whole unseen span is exact payload-free
+# receipts (status_span_is_all_receipts), so it never reaches this
+# always-surface rule at all (issue #18, PR #27 Astra shape review).
 signal_crew_provably_working() {  # <file> ...
   local f base dir task seen=""
   for f in "$@"; do

@@ -506,8 +506,8 @@ test_secondmate_marked_request_reporting_contract() {
 
   assert_grep 'A marked request requires one correlated answer after the work' "$brief" \
     "secondmate charter did not require the correlated answer after the work"
-  assert_grep 'does not require a separate receipt or start acknowledgement' "$brief" \
-    "secondmate charter did not reject a separate receipt/start acknowledgement"
+  assert_grep 'it does not require a separate acknowledgement that you started' "$brief" \
+    "secondmate charter did not reject a separate start acknowledgement"
   assert_grep "Never append \`working:\` merely to acknowledge receipt or announce that a marked request has started." "$brief" \
     "secondmate charter did not forbid a generic working acknowledgement"
   assert_no_grep "Give every routed-work phase a stable key: open it with \`working" "$brief" \
@@ -541,18 +541,18 @@ test_secondmate_marked_request_reporting_contract() {
     "secondmate charter did not name a landed merge as a reporting trigger"
   assert_grep 'States: working, needs-decision, blocked, paused, done, failed.' "$brief" \
     "secondmate charter changed the preserved status vocabulary"
-  # issue #18: the charter must tell a mate how to mark a pure delivery
-  # confirmation so the watcher can absorb it, and that the tag never applies
-  # to a real outcome verb.
-  assert_grep 'done [confirmation]: {what you delivered}' "$brief" \
-    "secondmate charter lost the delivery-confirmation tag"
-  assert_grep 'The tag has NO EFFECT on `needs-decision:`, `blocked:`, or `failed:`' "$brief" \
-    "secondmate charter did not scope the confirmation tag away from real outcomes"
-  # PR #27 review findings P1/P3-2 (Opus): the charter must also tell a mate
-  # exactly what may never be tagged, one sentence per line like the rest of
-  # this section.
-  assert_grep 'Never tag a merge, a PR or other URL, a finding, a report pointer, or the answer to anything the parent asked' "$brief" \
-    "secondmate charter did not prohibit outcome content inside a tagged confirmation line"
+  # issue #18, shaped per the PR #27 Astra review: the charter must tell a mate
+  # how to send a payload-free delivery receipt for a fire-and-forget
+  # instruction, and that a receipt never carries or substitutes for an
+  # outcome.
+  assert_grep 'bin/fm-secondmate-report.sh --receipt <id>' "$brief" \
+    "secondmate charter lost the payload-free receipt helper invocation"
+  assert_grep 'A receipt is EXACTLY that one line and nothing else' "$brief" \
+    "secondmate charter did not state the receipt's fixed, payload-free shape"
+  assert_grep 'never let a receipt stand in for reporting a merge, a PR, a finding, a decision, a blocker, or a failure' "$brief" \
+    "secondmate charter did not prohibit outcome content standing in as a receipt"
+  assert_grep 'is never answered with a payload-free receipt' "$brief" \
+    "secondmate charter did not forbid answering a corr-marked request with a receipt"
   pass "fm-brief.sh: marked requests avoid generic acknowledgements and preserve material reporting"
 }
 
