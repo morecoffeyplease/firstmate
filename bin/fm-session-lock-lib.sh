@@ -109,27 +109,40 @@ fm_harness_process_matches() {  # <comm> <args>
 # session cannot be read off the ancestry at all, so the whole contiguous run is
 # reported and the callers below decide what they need from it.
 fm_harness_ancestry_pids() {
-  local pid=$$ comm args extending=0 printed=0
-  for _ in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16; do
+  local pid=$$ comm args parent_pid extending=0 printed=0 args_read=0 hop complete=0
+  for hop in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16; do
     comm=$(ps -o comm= -p "$pid" 2>/dev/null) || break
-    args=$(ps -o args= -p "$pid" 2>/dev/null)
+    [ -n "$comm" ] || break
+    args=$(ps -o args= -p "$pid" 2>/dev/null) || args_read=1
+    [ -n "$args" ] || args_read=1
     if fm_harness_process_matches "$comm" "$args"; then
       printf '%s\n' "$pid"
       printed=1
-      [ "$FM_HARNESS_IS_CLAUDE" -eq 1 ] || break
+      if [ "$FM_HARNESS_IS_CLAUDE" -ne 1 ]; then
+        [ "$args_read" -eq 0 ] && complete=1
+        break
+      fi
       extending=1
     elif [ "$extending" -eq 1 ]; then
+      [ "$args_read" -eq 0 ] && complete=1
       break
     fi
-    pid=$(ps -o ppid= -p "$pid" 2>/dev/null | tr -d ' ')
+    [ "$args_read" -eq 0 ] || break
+    parent_pid=$(ps -o ppid= -p "$pid" 2>/dev/null) || break
+    parent_pid=$(printf '%s' "$parent_pid" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
+    case "$parent_pid" in
+      ''|*[!0-9]*) break ;;
+      0) complete=1; break ;;
+    esac
     # Examine the top of the chain before stopping. Inside a PID namespace the
     # harness itself is pid 1, so stopping as soon as the next pid is 1 hides the
     # very process this walk exists to find. A host's real pid 1 (init, systemd,
     # launchd) is not harness-shaped, so fm_harness_process_matches rejects it.
-    case "$pid" in '' | *[!0-9]*) break ;; esac
-    [ "$pid" -ge 1 ] || break
+    pid=$parent_pid
   done
-  [ "$printed" -eq 1 ]
+  [ "$printed" -eq 1 ] || return 1
+  [ "$complete" -eq 1 ] && return 0
+  return 2
 }
 
 # Print the one pid that identifies this session when the session lock is being
@@ -139,8 +152,9 @@ fm_harness_ancestry_pids() {
 # is still running. Every non-Claude harness reports a single pid, so this is its
 # innermost match unchanged.
 fm_harness_ancestry_pid() {
-  local pids pid outermost=''
-  pids=$(fm_harness_ancestry_pids) || return 1
+  local pids pid outermost='' ancestry_status
+  pids=$(fm_harness_ancestry_pids); ancestry_status=$?
+  [ "$ancestry_status" -eq 0 ] || return 1
   while IFS= read -r pid; do
     [ -n "$pid" ] && outermost=$pid
   done <<EOF
@@ -168,12 +182,13 @@ fm_harness_pid_alive() {
 # lock, a malformed lock, a lock held by a harness outside this ancestry, or an
 # ancestry that cannot be resolved all fail closed.
 fm_session_lock_owned_by_self() {
-  local state=$1 lock_pid pids pid
+  local state=$1 lock_pid pids pid ancestry_status
   lock_pid=$(cat "$state/.lock" 2>/dev/null || true)
   case "$lock_pid" in
     ''|*[!0-9]*) return 1 ;;
   esac
-  pids=$(fm_harness_ancestry_pids) || return 1
+  pids=$(fm_harness_ancestry_pids); ancestry_status=$?
+  [ "$ancestry_status" -eq 0 ] || [ "$ancestry_status" -eq 2 ] || return 1
   while IFS= read -r pid; do
     [ "$pid" = "$lock_pid" ] && return 0
   done <<EOF
@@ -189,7 +204,7 @@ EOF
 # shellcheck disable=SC2034 # Output global, read by the sourcing guard caller.
 FM_SESSION_LOCK_FOREIGN_OWNER_PID=
 fm_session_lock_foreign_owner_live() {
-  local state=$1 lock_pid pids pid
+  local state=$1 lock_pid pids pid ancestry_status
   FM_SESSION_LOCK_FOREIGN_OWNER_PID=
   [ -f "$state/.lock" ] && [ ! -L "$state/.lock" ] || return 1
   lock_pid=$(cat "$state/.lock" 2>/dev/null || true)
@@ -197,12 +212,13 @@ fm_session_lock_foreign_owner_live() {
     ''|*[!0-9]*) return 1 ;;
   esac
   fm_harness_pid_alive "$lock_pid" || return 1
-  pids=$(fm_harness_ancestry_pids) || return 1
+  pids=$(fm_harness_ancestry_pids); ancestry_status=$?
   while IFS= read -r pid; do
     [ "$pid" = "$lock_pid" ] && return 1
   done <<EOF
 $pids
 EOF
+  [ "$ancestry_status" -eq 0 ] || return 1
   # shellcheck disable=SC2034 # Output global, read by the sourcing guard caller.
   FM_SESSION_LOCK_FOREIGN_OWNER_PID=$lock_pid
   return 0

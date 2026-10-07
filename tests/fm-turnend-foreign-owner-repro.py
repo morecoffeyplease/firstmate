@@ -124,6 +124,50 @@ def autoarm(env, label):
     return process
 
 
+def watcher_healthy(env):
+    process = run(
+        env,
+        '. "$FM_ROOT_OVERRIDE/bin/fm-wake-lib.sh"; '
+        'if fm_watcher_healthy "$FM_HOME/state" "$FM_ROOT_OVERRIDE/bin/fm-watch.sh" 300 "$FM_HOME"; then '
+        'printf "watcher_healthy=1\\n"; fi',
+    )
+    return process.returncode == 0 and "watcher_healthy=1" in process.stdout
+
+
+def uncertain_ancestry_guard(env, mode):
+    fake_bin = LAB / f"fake-ps-{mode}"
+    fake_bin.mkdir()
+    ps = fake_bin / "ps"
+    ps.write_text(
+        """#!/bin/bash
+field= pid=
+while [ "$#" -gt 0 ]; do case "$1" in -o) field=$2; shift 2;; -p) pid=$2; shift 2;; *) shift;; esac; done
+if [ "$pid" = "$OWNER_PID" ]; then
+ case "$field" in comm=) echo claude;; args=) echo claude;; ppid=) echo 1;; esac
+elif [ "$pid" = 600 ]; then
+ case "$field" in comm=) echo claude;; args=) echo claude;; ppid=) if [ "$MODE" = partial ]; then exit 1; else echo 601; fi;; esac
+elif [ "$MODE" = depth ] && [ "$pid" -ge 601 ] && [ "$pid" -le 615 ]; then
+ case "$field" in comm=) echo claude;; args=) echo claude;; ppid=) echo $((pid+1));; esac
+elif [ "$pid" = 1 ]; then echo init
+else
+ case "$field" in comm=) echo bash;; args=) echo bash;; ppid=) echo 600;; esac
+fi
+"""
+    )
+    ps.chmod(0o755)
+    fault_env = env | {
+        "PATH": str(fake_bin) + ":" + env["PATH"],
+        "OWNER_PID": lock_owner,
+        "MODE": mode,
+    }
+    result = guard(fault_env, f"uncertain ancestry ({mode})")
+    require(result.returncode == 2, f"{mode} ancestry uncertainty must retain the ordinary guard block")
+    require("TURN WOULD END BLIND" in result.stderr, f"{mode} ancestry uncertainty lost the guard banner")
+    require("SUPERVISION IS OWNED BY ANOTHER LIVE SESSION" not in result.stdout,
+            f"{mode} ancestry uncertainty was treated as foreign-owner proof")
+    return fault_env
+
+
 def stop(process):
     if process.poll() is None:
         os.killpg(process.pid, signal.SIGTERM)
@@ -188,10 +232,35 @@ try:
     fresh = guard(env, "fresh-beat-only counterfactual")
     require(fresh.returncode == 0, "a fresh leftover beat must not restore foreign-owner blocking")
 
+    lock_path.write_text("600\n")
+    partial_env = uncertain_ancestry_guard(env, "partial")
+    membership = run(
+        partial_env,
+        '. "$FM_ROOT_OVERRIDE/bin/fm-session-lock-lib.sh"; '
+        'if fm_session_lock_owned_by_self "$FM_HOME/state"; then printf "partial_positive_membership=1\\n"; fi',
+    )
+    require("partial_positive_membership=1" in membership.stdout,
+            "positive lock-owner membership must survive an incomplete ancestry walk")
+    lock_path.write_text(lock_owner + "\n")
+    uncertain_ancestry_guard(env, "depth")
+
     stop(owner)
+    replacement_command = (
+        '"$FM_ROOT_OVERRIDE/bin/fm-lock.sh" >/dev/null 2>&1; '
+        'printf \'%s\\n\' \'{"session_id":"replacement","stop_hook_active":true}\' | '
+        '"$FM_ROOT_OVERRIDE/bin/fm-claude-stop-autoarm.sh" > "$FM_HOME/state/autoarm.out" 2>&1 & '
+        'printf \'%s\\n\' "$!" > "$FM_HOME/state/autoarm-pid"; '
+        '. "$FM_ROOT_OVERRIDE/bin/fm-wake-lib.sh"; '
+        'for _ in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 22 23 24 25 26 27 28 29 30 31 32 33 34 35 36 37 38 39 40; do '
+        'fm_watcher_healthy "$FM_HOME/state" "$FM_ROOT_OVERRIDE/bin/fm-watch.sh" 300 "$FM_HOME" && break; sleep 0.05; done; '
+        'printf \'%s\\n\' \'{"session_id":"replacement-owner","stop_hook_active":true}\' | '
+        '"$FM_ROOT_OVERRIDE/bin/fm-turnend-guard.sh" --claude > "$FM_HOME/state/owning-guard.out" 2>&1; '
+        'printf \'%s\\n\' "$?" > "$FM_HOME/state/owning-guard-rc"; '
+        'while [ ! -e "$FM_HOME/state/replacement-finish" ]; do sleep 0.05; done'
+    )
     replacement = start(
         env,
-        'printf \'%s\\n\' \'{"session_id":"replacement","stop_hook_active":true}\' | "$FM_ROOT_OVERRIDE/bin/fm-claude-stop-autoarm.sh"; printf "replacement_rc=%s\\n" "$?"; sleep 1',
+        replacement_command,
         "replacement.txt",
     )
     until(
@@ -199,9 +268,25 @@ try:
         message="replacement owner did not publish state/.watch.lock/pid",
     )
     watcher_pid = (root / "state/.watch.lock/pid").read_text().strip()
-    print("COUNTERFACTUAL dead original owner: watcher=", watcher_pid, flush=True)
+    until(lambda: watcher_healthy(env), message="replacement watcher never passed fm_watcher_healthy")
+    until(lambda: (root / "state/owning-guard-rc").is_file(),
+          message="replacement owner did not run its own turn-end guard")
+    owner_guard_rc = (root / "state/owning-guard-rc").read_text().strip()
+    owner_guard_out = (root / "state/owning-guard.out").read_text()
+    require(owner_guard_rc == "0", "a replacement owner with a healthy watcher must allow its Stop")
+    require(not owner_guard_out, f"a healthy owning-session Stop must be silent: {owner_guard_out!r}")
+    print("COUNTERFACTUAL dead original owner: fm_watcher_healthy=1 watcher=", watcher_pid,
+          "owning_guard_rc=0 silent=1", flush=True)
     healthy = guard(env, "replacement-owned healthy watcher")
-    require(healthy.returncode == 0, "a replacement owning session must still recover supervision")
+    require(healthy.returncode == 0, "the watcher-health predicate must allow a non-owner Stop")
+    require(not healthy.stdout, "the healthy watcher must allow the stop before foreign-owner diagnostics")
+    os.kill(int(watcher_pid), signal.SIGTERM)
+    until(lambda: not watcher_healthy(env), message="dead replacement watcher still passed fm_watcher_healthy")
+    require(session_lock_text(lock_path) == str(replacement.pid),
+            "dead-watcher counterfactual must retain the live replacement session lock")
+    print("COUNTERFACTUAL dead replacement watcher: fm_watcher_healthy=0 while session lock remains live",
+          flush=True)
+    (root / "state/replacement-finish").touch()
     stop(replacement)
 
     single, single_env = make("single-idle")
@@ -216,6 +301,8 @@ try:
         '"$FM_ROOT_OVERRIDE/bin/fm-turnend-guard.sh" --claude; rc=$?; printf "single_owner_guard_rc=%s\\n" "$rc"; true',
     )
     print("single owner, no autoarm firing", "rc=" + str(sole_owner.returncode), "stdout=" + repr(sole_owner.stdout), "stderr=" + repr(sole_owner.stderr), flush=True)
+    require("single_owner_verified=1" in sole_owner.stdout,
+            "single-owner test did not prove that the guard owns the session lock")
     require("single_owner_guard_rc=2" in sole_owner.stdout, "a sole owner without supervision must retain the guard")
     print("COMPLETE", flush=True)
 finally:
