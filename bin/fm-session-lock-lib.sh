@@ -109,8 +109,8 @@ fm_harness_process_matches() {  # <comm> <args>
 # session cannot be read off the ancestry at all, so the whole contiguous run is
 # reported and the callers below decide what they need from it.
 fm_harness_ancestry_pids() {
-  local pid=$$ comm args parent_pid extending=0 printed=0 args_read=0 hop complete=0
-  for hop in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16; do
+  local pid=$$ comm args parent_pid extending=0 printed=0 args_read=0 complete=0
+  for _ in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16; do
     comm=$(ps -o comm= -p "$pid" 2>/dev/null) || break
     [ -n "$comm" ] || break
     args=$(ps -o args= -p "$pid" 2>/dev/null) || args_read=1
