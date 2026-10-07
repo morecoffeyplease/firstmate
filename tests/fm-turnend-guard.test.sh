@@ -1697,8 +1697,7 @@ test_hook_claude_mode_integrated_monotonic_fail_open() {
 }
 
 # The auto-arm's ledger epoch advances only when the hook reaches its
-# generation claim. A live harness-named process outside the hook's ancestry
-# holding state/.lock keeps the hook inert by its identity contract, so the
+# generation claim. An unowned hook with no session lock stays inert, so the
 # ledger stays at the exhausted-failure epoch the hook wrote before it went
 # quiet. This test keeps that foreign lock in place for each auto-arm attempt,
 # then clears it before invoking the guard so it can test that repeated
@@ -1713,9 +1712,8 @@ hold_session_lock_from_foreign_harness() {  # sets FOREIGN_LOCK_HOLDER
   FOREIGN_LOCK_HOLDER=$!
   printf '%s\n' "$FOREIGN_LOCK_HOLDER" > "$dir/state/.lock"
 }
-
 test_hook_claude_mode_frozen_epoch_reaches_bounded_fail_open() {
-  local dir out status guard_out guard_status holder i pid identity count epoch_line
+  local dir out status guard_out guard_status i pid identity count epoch_line
   dir=$(make_primary_dir "$TMP_ROOT/hook-claude-frozen-epoch")
   : > "$dir/state/task1.meta"
   install_integrated_autoarm "$dir"
@@ -1727,8 +1725,9 @@ test_hook_claude_mode_frozen_epoch_reaches_bounded_fail_open() {
   expect_code 0 "$guard_status" "the first failed epoch must own its Stop handoff"
   epoch_line=$(sed -n '1p' "$dir/state/.claude-autoarm-epoch")
 
-  hold_session_lock_from_foreign_harness "$dir"
-  holder=$FOREIGN_LOCK_HOLDER
+  # Remove the dead lock left by the fixture arm so this case isolates the
+  # frozen-ledger accounting path rather than the live foreign-owner escape.
+  rm -f "$dir/state/.lock"
   for i in 1 2 3 4; do
     printf '%s\n' "$holder" > "$dir/state/.lock"
     out=$(run_integrated_autoarm_unowned "$dir"); status=$?
@@ -1763,8 +1762,6 @@ test_hook_claude_mode_frozen_epoch_reaches_bounded_fail_open() {
   identity=$(watcher_identity "$dir" "$pid") || {
     kill "$pid" 2>/dev/null || true
     wait "$pid" 2>/dev/null || true
-    kill "$holder" 2>/dev/null || true
-    wait "$holder" 2>/dev/null || true
     fail "could not identify the frozen-epoch recovery watcher"
   }
   record_watcher_lock "$dir" "$pid" "$identity"
@@ -1772,8 +1769,6 @@ test_hook_claude_mode_frozen_epoch_reaches_bounded_fail_open() {
   guard_out=$(run_hook_claude "$dir" true); guard_status=$?
   kill "$pid" 2>/dev/null || true
   wait "$pid" 2>/dev/null || true
-  kill "$holder" 2>/dev/null || true
-  wait "$holder" 2>/dev/null || true
   rm -rf "$dir/state/.watch.lock"
   expect_code 0 "$guard_status" "a healthy watcher must still allow the stop after a frozen-epoch alarm"
   [ -z "$guard_out" ] || fail "healthy allow after the frozen-epoch alarm produced output: $guard_out"
