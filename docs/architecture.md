@@ -391,10 +391,9 @@ The [Relay configuration reference](configuration.md#promised-public-replies-sta
 ## Project memory belongs to projects
 
 Durable project-intrinsic agent guidance lives in each project's committed `AGENTS.md`, with `CLAUDE.md` as a real `@AGENTS.md` import pointer.
-Routine workers may correct existing project guidance only when evidence shows it is factually wrong; missing guidance is not an error, and routine work does not add instructions, headings, or lesson pointers.
-Explicit human or task authorization may direct additions, and guarded manual initialization remains available through [`bin/fm-ensure-agents-md.sh`](../bin/fm-ensure-agents-md.sh).
+Project instruction ownership and routine-edit policy follow [AGENTS.md section 6](../AGENTS.md#6-project-and-knowledge-management).
 `data/projects.md` stays a thin private registry.
-The helper owns canonical self-governance wording and idempotent insertion; its header and help document the explicit mark for equivalent project-owned guidance.
+[`bin/fm-ensure-agents-md.sh`](../bin/fm-ensure-agents-md.sh) owns canonical self-governance wording and idempotent insertion; its header and help document the explicit mark for equivalent project-owned guidance.
 It refuses a case-variant real memory file such as a lowercase `agents.md`, so the pointer's `@AGENTS.md` import resolves to a real `AGENTS.md` on a case-sensitive filesystem, and surfaces the mismatch for manual reconciliation.
 The full ownership rule - what is project-intrinsic versus fleet-private, and how firstmate keeps the two apart without writing into project clones - is owned by [`AGENTS.md`](../AGENTS.md) (project and knowledge management).
 
