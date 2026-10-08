@@ -45,7 +45,96 @@ jobs:
       # and GitHub workflow lint). Do not re-spell the checks here; keep CI
       # and the pre-push gate on this script so a self-broken ci.yml still
       # fails locally before merge.
-      - run: bin/fm-lint.sh
+      - name: Run canonical lint with resource sampler
+        shell: bash
+        run: |
+          # shellcheck shell=bash
+          set -eu
+          sample_dir="$RUNNER_TEMP/fm-lint-resource-diagnostics"
+          if ! mkdir -p "$sample_dir"; then
+            printf 'resource sampler: diagnostics directory unavailable; running canonical lint without optional telemetry\n' >&2
+            bin/fm-lint.sh
+            exit "$?"
+          fi
+          sample_log="$sample_dir/resource-samples.log"
+          telemetry_file="$sample_dir/fm-lint-telemetry.tsv"
+          if ! (: > "$sample_log.probe" && : > "$telemetry_file.probe"); then
+            printf 'resource sampler: diagnostics directory is not writable; running canonical lint without optional telemetry\n' >&2
+            bin/fm-lint.sh
+            exit "$?"
+          fi
+          rm -f "$sample_log.probe" "$telemetry_file.probe"
+          sampler_pid=
+
+          cleanup() {
+            status=$?
+            trap - EXIT HUP INT TERM
+            if [ -n "$sampler_pid" ]; then
+              kill "$sampler_pid" 2>/dev/null || true
+              wait "$sampler_pid" 2>/dev/null || true
+            fi
+            exit "$status"
+          }
+          trap cleanup EXIT
+          trap 'exit 129' HUP
+          trap 'exit 130' INT
+          trap 'exit 143' TERM
+
+          sample_resources() {
+            sample_sleep_pid=
+            # shellcheck disable=SC2329 # Registered with the EXIT trap below.
+            stop_sampler() {
+              if [ -n "$sample_sleep_pid" ]; then
+                kill "$sample_sleep_pid" 2>/dev/null || true
+                wait "$sample_sleep_pid" 2>/dev/null || true
+              fi
+            }
+            trap stop_sampler EXIT
+            trap 'exit 0' HUP INT TERM
+            sample_number=0
+            while [ "$sample_number" -lt 300 ]; do
+              sample_number=$((sample_number + 1))
+              {
+                printf 'sample=%s utc=%s\n' "$sample_number" "$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
+                for metric in memory.current memory.max; do
+                  if [ -r "/sys/fs/cgroup/$metric" ]; then
+                    awk -v name="$metric" 'NR == 1 {print name "=" $0}' "/sys/fs/cgroup/$metric"
+                  else
+                    printf '%s=unavailable\n' "$metric"
+                  fi
+                done
+                if [ -r /sys/fs/cgroup/memory.events ]; then
+                  awk '$1 == "high" || $1 == "max" || $1 == "oom" || $1 == "oom_kill" {print "memory.event=" $0}' /sys/fs/cgroup/memory.events || true
+                else
+                  printf 'memory.event=unavailable\n'
+                fi
+                if [ -r /sys/fs/cgroup/cpu.stat ]; then
+                  awk '$1 == "usage_usec" {print "cpu.usage_usec=" $2}' /sys/fs/cgroup/cpu.stat
+                else
+                  printf 'cpu.usage=unavailable\n'
+                fi
+                awk '/^(MemTotal|MemAvailable|SwapTotal|SwapFree):/ {print "meminfo." $0}' /proc/meminfo 2>/dev/null || true
+                ps -eo pid=,ppid=,comm=,rss= 2>/dev/null | awk '{if ($3 == "bash" && bash_count < 40) {bash_count++; print "process=" $0} else if ($3 == "shellcheck" && shellcheck_count < 40) {shellcheck_count++; print "process=" $0}}' || true
+                printf '\n'
+              } | tee -a "$sample_log"
+              sleep 5 &
+              sample_sleep_pid=$!
+              wait "$sample_sleep_pid" || exit 0
+              sample_sleep_pid=
+            done
+          }
+
+          sample_resources &
+          sampler_pid=$!
+          FM_LINT_TELEMETRY="$telemetry_file" bin/fm-lint.sh
+      - name: Upload lint resource diagnostics
+        if: always()
+        continue-on-error: true
+        uses: actions/upload-artifact@v4
+        with:
+          name: lint-resource-diagnostics-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/fm-lint-resource-diagnostics/
+          if-no-files-found: ignore
 
   # Deterministic proof that portable parallel shards + portable serial + Herdr
   # equal the complete tests/*.test.sh inventory with no missing or duplicates,
