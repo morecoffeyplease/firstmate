@@ -134,8 +134,8 @@ def watcher_healthy(env):
     return process.returncode == 0 and "watcher_healthy=1" in process.stdout
 
 
-def uncertain_ancestry_guard(env, mode):
-    fake_bin = LAB / f"fake-ps-{mode}"
+def uncertain_ancestry_guard(env, mode, case=None):
+    fake_bin = LAB / f"fake-ps-{case or mode}"
     fake_bin.mkdir()
     ps = fake_bin / "ps"
     ps.write_text(
@@ -160,7 +160,7 @@ fi
         "OWNER_PID": lock_owner,
         "MODE": mode,
     }
-    result = guard(fault_env, f"uncertain ancestry ({mode})")
+    result = guard(fault_env, f"uncertain ancestry ({case or mode})")
     require(result.returncode == 2, f"{mode} ancestry uncertainty must retain the ordinary guard block")
     require("TURN WOULD END BLIND" in result.stderr, f"{mode} ancestry uncertainty lost the guard banner")
     require("SUPERVISION IS OWNED BY ANOTHER LIVE SESSION" not in result.stdout,
@@ -241,7 +241,10 @@ try:
     )
     require("partial_positive_membership=1" in membership.stdout,
             "positive lock-owner membership must survive an incomplete ancestry walk")
+
     lock_path.write_text(lock_owner + "\n")
+    uncertain_ancestry_guard(env, "partial", "live-owner-beyond-unreadable-parent")
+
     uncertain_ancestry_guard(env, "depth")
 
     stop(owner)
