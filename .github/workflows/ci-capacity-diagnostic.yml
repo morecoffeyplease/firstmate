@@ -57,7 +57,29 @@ jobs:
         run: |
           set -eu
           run_root="$RUNNER_TEMP/fm-capacity/$GITHUB_RUN_ID/$GITHUB_RUN_ATTEMPT/$LAB_SCENARIO"
-          mkdir -p "$run_root"
+          job_phase=job-bootstrap
+          if ! mkdir -p "$run_root"; then
+            printf 'could not create diagnostic evidence directory: %s\n' "$run_root" >&2
+            exit 2
+          fi
+          printf 'phase=job-bootstrap\noutcome=in-progress\n' > "$run_root/job-status.txt"
+          date -u '+%Y-%m-%dT%H:%M:%SZ\tjob-bootstrap\tin-progress' \
+            >> "$run_root/phase-journal.tsv"
+          finish_job_bootstrap() {
+            status=$?
+            trap - EXIT
+            printf 'phase=%s\nexit=%s\n' "$job_phase" "$status" \
+              > "$run_root/job-status.txt.tmp" 2>/dev/null || true
+            mv "$run_root/job-status.txt.tmp" "$run_root/job-status.txt" 2>/dev/null || true
+            printf '%s\t%s\texit=%s\n' "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" \
+              "$job_phase" "$status" >> "$run_root/phase-journal.tsv" 2>/dev/null || true
+            exit "$status"
+          }
+          trap finish_job_bootstrap EXIT
+          trap 'exit 129' HUP
+          trap 'exit 130' INT
+          trap 'exit 143' TERM
+          job_phase=admission-before-checkout
           python3 - "$GITHUB_EVENT_PATH" "$run_root/admission-before-checkout.json" <<'PY'
           import json
           import os
@@ -87,6 +109,7 @@ jobs:
           if not result['admitted']:
               raise SystemExit('diagnostic admission refused')
           PY
+          job_phase=clock-start-recorded
           date -u '+%Y-%m-%dT%H:%M:%SZ' > "$run_root/job-start-utc.txt"
           date +%s > "$run_root/job-start-epoch.txt"
           printf 'workflow=%s\nrun_id=%s\nrun_attempt=%s\nevent=%s\nscenario=%s\n' \
@@ -110,8 +133,16 @@ jobs:
           SOURCE_GIT_ROOT: ${{ github.workspace }}/source-git
           LAB_RECIPE_ROOT: ${{ github.workspace }}/.github/labs/ci-capacity
         run: .github/labs/ci-capacity/prepare.sh
-      - name: Measure full lint owner
+      - name: Run bounded Linux tracer fixtures
+        id: fixtures
         if: steps.prepare.outcome == 'success'
+        timeout-minutes: 1
+        env:
+          LAB_RECIPE_ROOT: ${{ github.workspace }}/.github/labs/ci-capacity
+          LAB_RUN_ROOT: ${{ runner.temp }}/fm-capacity/${{ github.run_id }}/${{ github.run_attempt }}/${{ matrix.scenario }}
+        run: python3 .github/labs/ci-capacity/fixture-check.py
+      - name: Measure full lint owner
+        if: steps.prepare.outcome == 'success' && steps.fixtures.outcome == 'success'
         timeout-minutes: 45
         env:
           LAB_RECIPE_ROOT: ${{ github.workspace }}/.github/labs/ci-capacity

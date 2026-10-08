@@ -1,36 +1,57 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
-recipe_root=${LAB_RECIPE_ROOT:?}
-source_git_root=${SOURCE_GIT_ROOT:?}
-scenario=${LAB_SCENARIO:?}
-expected_tree=fedd0f74ae63ce5963940a105b744497e630259b
-run_id=${GITHUB_RUN_ID:?}
-run_attempt=${GITHUB_RUN_ATTEMPT:?}
-root=${RUNNER_TEMP:?}/fm-capacity/$run_id/$run_attempt/$scenario
-source_root=$root/source
-tool_bin=$RUNNER_TEMP/bin
-mkdir -p "$root" "$tool_bin"
-phase=prepare-start
-printf 'phase=%s\noutcome=in-progress\n' "$phase" > "$root/prepare-status.txt"
-printf '%s\t%s\t%s\n' "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" "$phase" in-progress \
-  >> "$root/phase-journal.tsv"
+phase=prepare-bootstrap
+runner_temp=${RUNNER_TEMP:-}
+run_id=${GITHUB_RUN_ID:-}
+run_attempt=${GITHUB_RUN_ATTEMPT:-}
+scenario=${LAB_SCENARIO:-}
+root=
+if [[ -n "$runner_temp" && -n "$run_id" && -n "$run_attempt" && -n "$scenario" ]]; then
+  root=$runner_temp/fm-capacity/$run_id/$run_attempt/$scenario
+fi
 prepare_finish() {
   local status=$?
   trap - EXIT
-  {
-    printf 'phase=%s\nexit=%s\n' "$phase" "$status"
-    printf 'finished_utc=%s\n' "$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
-  } > "$root/prepare-status.txt.tmp" 2>/dev/null || true
-  mv "$root/prepare-status.txt.tmp" "$root/prepare-status.txt" 2>/dev/null || true
-  printf '%s\t%s\texit=%s\n' "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" "$phase" "$status" \
-    >> "$root/phase-journal.tsv" 2>/dev/null || true
+  if [[ -n "$root" && -d "$root" ]]; then
+    {
+      printf 'phase=%s\nexit=%s\n' "$phase" "$status"
+      printf 'finished_utc=%s\n' "$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
+    } > "$root/prepare-status.txt.tmp" 2>/dev/null || true
+    mv "$root/prepare-status.txt.tmp" "$root/prepare-status.txt" 2>/dev/null || true
+    printf '%s\t%s\texit=%s\n' "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" "$phase" "$status" \
+      >> "$root/phase-journal.tsv" 2>/dev/null || true
+  else
+    printf 'prepare evidence unavailable before failure: phase=%s exit=%s\n' "$phase" "$status" >&2
+  fi
   exit "$status"
 }
 trap prepare_finish EXIT
 trap 'exit 129' HUP
 trap 'exit 130' INT
 trap 'exit 143' TERM
+
+if [[ -z "$runner_temp" || -z "$run_id" || -z "$run_attempt" || -z "$scenario" ]]; then
+  printf 'required run identity unavailable before evidence setup\n' >&2
+  exit 2
+fi
+recipe_root=${LAB_RECIPE_ROOT:-}
+source_git_root=${SOURCE_GIT_ROOT:-}
+if [[ -z "$recipe_root" || -z "$source_git_root" ]]; then
+  printf 'recipe or immutable source checkout path unavailable\n' >&2
+  exit 2
+fi
+expected_tree=fedd0f74ae63ce5963940a105b744497e630259b
+source_root=$root/source
+tool_bin=$RUNNER_TEMP/bin
+if ! mkdir -p "$root" "$tool_bin"; then
+  printf 'could not create diagnostic evidence or tool directories: %s %s\n' "$root" "$tool_bin" >&2
+  exit 2
+fi
+phase=prepare-start
+printf 'phase=%s\noutcome=in-progress\n' "$phase" > "$root/prepare-status.txt"
+printf '%s\t%s\t%s\n' "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" "$phase" in-progress \
+  >> "$root/phase-journal.tsv"
 set_phase() {
   phase=$1
   printf '%s\t%s\tin-progress\n' "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" "$phase" \
