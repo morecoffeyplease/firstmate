@@ -281,7 +281,7 @@ supervisor_source.mkdir(mode=0o700, parents=True)
 supervisor_recipe.mkdir(mode=0o700)
 supervisor_output.mkdir(mode=0o700)
 for filename in ('analysis-supervisor.py', 'capture-owner-buffers.py',
-                 'owned_child.py', 'cgroup-snapshot.py'):
+                 'owned_child.py', 'cgroup-snapshot.py', 'readiness-gate.py'):
     shutil.copy2(recipe / filename, supervisor_recipe / filename)
 write(supervisor_recipe / 'sample.sh', '''#!/usr/bin/env bash
 set -eu

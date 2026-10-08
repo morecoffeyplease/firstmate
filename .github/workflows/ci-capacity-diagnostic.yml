@@ -133,16 +133,23 @@ jobs:
           SOURCE_GIT_ROOT: ${{ github.workspace }}/source-git
           LAB_RECIPE_ROOT: ${{ github.workspace }}/.github/labs/ci-capacity
         run: .github/labs/ci-capacity/prepare.sh
+      - name: Check one-minute fixture readiness
+        id: readiness
+        if: steps.prepare.outcome == 'success'
+        timeout-minutes: 1
+        env:
+          LAB_SCENARIO: ${{ matrix.scenario }}
+        run: python3 .github/labs/ci-capacity/readiness-gate.py pre-fixture
       - name: Run bounded Linux tracer fixtures
         id: fixtures
-        if: steps.prepare.outcome == 'success'
+        if: steps.prepare.outcome == 'success' && steps.readiness.outcome == 'success'
         timeout-minutes: 1
         env:
           LAB_RECIPE_ROOT: ${{ github.workspace }}/.github/labs/ci-capacity
           LAB_RUN_ROOT: ${{ runner.temp }}/fm-capacity/${{ github.run_id }}/${{ github.run_attempt }}/${{ matrix.scenario }}
         run: python3 .github/labs/ci-capacity/fixture-check.py
       - name: Measure full lint owner
-        if: steps.prepare.outcome == 'success' && steps.fixtures.outcome == 'success'
+        if: steps.prepare.outcome == 'success' && steps.readiness.outcome == 'success' && steps.fixtures.outcome == 'success'
         timeout-minutes: 45
         env:
           LAB_RECIPE_ROOT: ${{ github.workspace }}/.github/labs/ci-capacity

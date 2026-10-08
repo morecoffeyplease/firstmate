@@ -9,6 +9,7 @@ import time
 from datetime import datetime, timezone
 from pathlib import Path
 from owned_child import OwnedChild
+from readiness_gate import record_readiness
 
 
 scenario, cap_text, analysis_deadline_text, cleanup_deadline_text, root_text, source_text, recipe_text, step_text, bash_path = sys.argv[1:]
@@ -30,6 +31,10 @@ sampler_owner = None
 sampler_stream = None
 stdout_stream = None
 stderr_stream = None
+
+
+class ReadinessDeadlineExpired(RuntimeError):
+    pass
 
 
 def utc_now():
@@ -232,6 +237,7 @@ outcome = {
     'signal': None,
     'analysis_limit_seconds': cap_seconds,
     'analysis_deadline_epoch': analysis_deadline_epoch,
+    'required_analysis_start_deadline_epoch': None,
     'cleanup_deadline_epoch': cleanup_deadline_epoch,
     'analysis_pid': None,
     'observer_results': [],
@@ -288,6 +294,10 @@ try:
         collection_errors.append(f'processes before: exit {before.returncode}')
 
     sampler_stream = start_sampler(bash_path)
+    job_start_epoch = float((root / 'job-start-epoch.txt').read_text())
+    readiness = record_readiness(root, 'analysis-supervisor-ready', job_start_epoch + 60)
+    outcome['required_analysis_start_deadline_epoch'] = readiness['required_analysis_start_deadline_epoch']
+    outcome['analysis_readiness'] = readiness
     outcome.update({'phase': 'resource-observer-started', 'owner_tmp': str(owner_tmp),
                     'retained_output': str(retained), 'sampler_pid': sampler.pid,
                     'sampler_identity': sampler_identity})
@@ -306,6 +316,12 @@ try:
         owner_status = None
         summary = None
         phase = 'analysis-not-started'
+    elif not readiness['admitted']:
+        wrapper_status = 125
+        result = 'setup-window-expired-before-analysis'
+        owner_status = None
+        summary = None
+        phase = 'analysis-not-started-readiness-deadline'
     elif signal_received is not None:
         wrapper_status = 128 + signal_received
         result = 'supervisor-signal-before-analysis'
@@ -338,6 +354,15 @@ try:
             '--owner-exit', str(root / 'owner-step.exit'),
             '--', *command,
         ]
+        launch_readiness = record_readiness(
+            root, 'analysis-owner-launch', job_start_epoch + 60
+        )
+        outcome['analysis_owner_launch_readiness'] = launch_readiness
+        persist_status(outcome)
+        if not launch_readiness['admitted']:
+            raise ReadinessDeadlineExpired(
+                'setup exceeded the one-minute deadline before owner tracer launch; experiment pair is invalid'
+            )
         tracer_stdout = (root / 'tracer-stdout.txt').open('wb')
         tracer_stderr = (root / 'tracer-stderr.txt').open('wb')
         outcome.update({'phase': 'owner-step-running', 'owner_command': command,
@@ -461,7 +486,14 @@ except SystemExit:
     raise
 except BaseException as error:
     wrapper_status = 125
-    outcome.update({'phase': 'supervisor-exception', 'result': 'supervisor-failure',
+    if isinstance(error, ReadinessDeadlineExpired):
+        exception_phase = 'analysis-not-started-readiness-deadline'
+        exception_result = 'setup-window-expired-before-owner-launch'
+        collection_errors.append(str(error))
+    else:
+        exception_phase = 'supervisor-exception'
+        exception_result = 'supervisor-failure'
+    outcome.update({'phase': exception_phase, 'result': exception_result,
                     'wrapper_exit': wrapper_status,
                     'exception': f'{type(error).__name__}: {error}'})
     if analysis is not None:
