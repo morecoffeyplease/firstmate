@@ -5,10 +5,45 @@ recipe_root=${LAB_RECIPE_ROOT:?}
 source_git_root=${SOURCE_GIT_ROOT:?}
 scenario=${LAB_SCENARIO:?}
 expected_tree=fedd0f74ae63ce5963940a105b744497e630259b
-root=${RUNNER_TEMP:?}/fm-capacity/$scenario
+run_id=${GITHUB_RUN_ID:?}
+run_attempt=${GITHUB_RUN_ATTEMPT:?}
+root=${RUNNER_TEMP:?}/fm-capacity/$run_id/$run_attempt/$scenario
 source_root=$root/source
 tool_bin=$RUNNER_TEMP/bin
 mkdir -p "$root" "$tool_bin"
+phase=prepare-start
+printf 'phase=%s\noutcome=in-progress\n' "$phase" > "$root/prepare-status.txt"
+printf '%s\t%s\t%s\n' "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" "$phase" in-progress \
+  >> "$root/phase-journal.tsv"
+prepare_finish() {
+  local status=$?
+  trap - EXIT
+  {
+    printf 'phase=%s\nexit=%s\n' "$phase" "$status"
+    printf 'finished_utc=%s\n' "$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
+  } > "$root/prepare-status.txt.tmp" 2>/dev/null || true
+  mv "$root/prepare-status.txt.tmp" "$root/prepare-status.txt" 2>/dev/null || true
+  printf '%s\t%s\texit=%s\n' "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" "$phase" "$status" \
+    >> "$root/phase-journal.tsv" 2>/dev/null || true
+  exit "$status"
+}
+trap prepare_finish EXIT
+trap 'exit 129' HUP
+trap 'exit 130' INT
+trap 'exit 143' TERM
+set_phase() {
+  phase=$1
+  printf '%s\t%s\tin-progress\n' "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" "$phase" \
+    >> "$root/phase-journal.tsv"
+  printf 'phase=%s\noutcome=in-progress\n' "$phase" > "$root/prepare-status.txt"
+}
+set_phase admission-check
+python3 "$recipe_root/admission-check.py" "$root/admission-before-prepare.json"
+set_phase runner-boundary-check
+{
+  printf 'uname=%s\n' "$(uname -a)"
+  printf 'runner_os=%s\nrunner_arch=%s\n' "${RUNNER_OS:-unavailable}" "${RUNNER_ARCH:-unavailable}"
+} > "$root/runner-boundary.txt"
 test "$(uname -s)" = Linux
 test "$(uname -m)" = x86_64
 test "${RUNNER_OS:-}" = Linux
@@ -18,6 +53,7 @@ record_command() {
   local name=$1
   shift
   local status
+  set_phase "command-$name"
   set +e
   "$@" > "$root/$name.stdout" 2> "$root/$name.stderr"
   status=$?
@@ -45,6 +81,7 @@ mkdir -p "$source_root"
 tar -xf "$root/permanent-source.tar" -C "$source_root"
 printf 'source_root=%s\narchive=%s\n' "$source_root" "$root/permanent-source.tar" \
   > "$root/extraction.txt"
+set_phase runner-facts
 
 record_command runner-uname uname -a
 record_command runner-os cat /etc/os-release
@@ -80,6 +117,7 @@ printf 'source_commit=%s\nsource_tree=%s\n' "$SOURCE_COMMIT" "$expected_source_t
   > "$root/source-git-identity.txt"
 
 set +e
+set_phase canonical-inventory
 CI=true GITHUB_ACTIONS=true LC_ALL=C /usr/bin/bash "$source_root/bin/fm-lint.sh" --list-files \
   > "$root/canonical-roots.txt" 2> "$root/canonical-roots.stderr"
 list_status=$?
@@ -107,6 +145,7 @@ record_command actionlint-required-version /usr/bin/bash "$source_root/bin/fm-li
 grep -Fx '0.11.0' "$root/shellcheck-required-version.stdout"
 grep -Fx '1.7.12' "$root/actionlint-required-version.stdout"
 
+set_phase install-pinned-tools
 set +e
 "$source_root/bin/fm-install-shellcheck.sh" "$tool_bin" > "$root/install-shellcheck.log" 2>&1
 shellcheck_install_status=$?
@@ -129,4 +168,5 @@ sha256sum "$tool_bin/shellcheck" "$tool_bin/actionlint" > "$root/tool-binary-sha
   printf 'workflow_path_before_github_path=%s\n' "$PATH"
 } > "$root/tool-paths.txt"
 printf '%s\n' "$tool_bin" >> "$GITHUB_PATH"
+set_phase preflight-complete
 printf 'preflight=pass\n' > "$root/preflight-result.txt"

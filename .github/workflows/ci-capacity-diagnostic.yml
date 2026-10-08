@@ -19,6 +19,11 @@ jobs:
   capacity:
     name: Capacity ${{ matrix.scenario }} (diagnostic only)
     if: >-
+      github.repository == 'morecoffeyplease/firstmate' &&
+      github.event_name == 'pull_request' &&
+      github.event.action == 'opened' &&
+      github.run_attempt == 1 &&
+      github.event.pull_request.base.ref == 'main' &&
       github.event.pull_request.draft == true &&
       github.event.pull_request.head.ref == 'fm/ci-capacity-design' &&
       github.event.pull_request.head.repo.full_name == github.repository
@@ -33,19 +38,61 @@ jobs:
       LC_ALL: C
       LAB_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
       LAB_MERGE_SHA: ${{ github.sha }}
+      LAB_PULL_REQUEST_NUMBER: ${{ github.event.pull_request.number }}
       LAB_SCENARIO: ${{ matrix.scenario }}
       SOURCE_COMMIT: 7153157693fbc4fccad7ae1e5cebed4800341d4c
     steps:
       - name: Start bounded outer-job clock
+        env:
+          LAB_ADMISSION_REPOSITORY: ${{ github.repository }}
+          LAB_ADMISSION_EVENT: ${{ github.event_name }}
+          LAB_ADMISSION_ACTION: ${{ github.event.action }}
+          LAB_ADMISSION_ATTEMPT: ${{ github.run_attempt }}
+          LAB_ADMISSION_BASE: ${{ github.event.pull_request.base.ref }}
+          LAB_ADMISSION_DRAFT: ${{ github.event.pull_request.draft }}
+          LAB_ADMISSION_HEAD_REF: ${{ github.event.pull_request.head.ref }}
+          LAB_ADMISSION_HEAD_REPOSITORY: ${{ github.event.pull_request.head.repo.full_name }}
+          LAB_ADMISSION_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          LAB_ADMISSION_NUMBER: ${{ github.event.pull_request.number }}
         run: |
           set -eu
-          mkdir -p "$RUNNER_TEMP/fm-capacity/$LAB_SCENARIO"
-          date -u '+%Y-%m-%dT%H:%M:%SZ' > "$RUNNER_TEMP/fm-capacity/$LAB_SCENARIO/job-start-utc.txt"
-          date +%s > "$RUNNER_TEMP/fm-capacity/$LAB_SCENARIO/job-start-epoch.txt"
+          run_root="$RUNNER_TEMP/fm-capacity/$GITHUB_RUN_ID/$GITHUB_RUN_ATTEMPT/$LAB_SCENARIO"
+          mkdir -p "$run_root"
+          python3 - "$GITHUB_EVENT_PATH" "$run_root/admission-before-checkout.json" <<'PY'
+          import json
+          import os
+          import sys
+          from pathlib import Path
+
+          payload = json.loads(Path(sys.argv[1]).read_text())
+          pull = payload.get('pull_request') or {}
+          head = pull.get('head') or {}
+          head_repo = head.get('repo') or {}
+          base = pull.get('base') or {}
+          checks = {
+              'repository': os.environ.get('LAB_ADMISSION_REPOSITORY') == 'morecoffeyplease/firstmate',
+              'event_name': os.environ.get('LAB_ADMISSION_EVENT') == 'pull_request',
+              'event_action': os.environ.get('LAB_ADMISSION_ACTION') == 'opened' and payload.get('action') == 'opened',
+              'run_attempt': os.environ.get('LAB_ADMISSION_ATTEMPT') == '1',
+              'base_ref': os.environ.get('LAB_ADMISSION_BASE') == 'main' and base.get('ref') == 'main',
+              'draft': os.environ.get('LAB_ADMISSION_DRAFT') == 'true' and pull.get('draft') is True,
+              'head_ref': os.environ.get('LAB_ADMISSION_HEAD_REF') == 'fm/ci-capacity-design' and head.get('ref') == 'fm/ci-capacity-design',
+              'head_repository': os.environ.get('LAB_ADMISSION_HEAD_REPOSITORY') == 'morecoffeyplease/firstmate' and head_repo.get('full_name') == 'morecoffeyplease/firstmate',
+              'head_sha': os.environ.get('LAB_ADMISSION_HEAD_SHA') == os.environ.get('LAB_HEAD_SHA') and head.get('sha') == os.environ.get('LAB_HEAD_SHA'),
+              'pull_request_number': os.environ.get('LAB_ADMISSION_NUMBER') == os.environ.get('LAB_PULL_REQUEST_NUMBER') and str(pull.get('number', '')) == os.environ.get('LAB_PULL_REQUEST_NUMBER'),
+          }
+          result = {'checks': checks, 'admitted': all(checks.values()), 'run_id': os.environ.get('GITHUB_RUN_ID'), 'attempt': os.environ.get('GITHUB_RUN_ATTEMPT')}
+          Path(sys.argv[2]).write_text(json.dumps(result, indent=2) + '\n')
+          print(json.dumps(result, indent=2))
+          if not result['admitted']:
+              raise SystemExit('diagnostic admission refused')
+          PY
+          date -u '+%Y-%m-%dT%H:%M:%SZ' > "$run_root/job-start-utc.txt"
+          date +%s > "$run_root/job-start-epoch.txt"
           printf 'workflow=%s\nrun_id=%s\nrun_attempt=%s\nevent=%s\nscenario=%s\n' \
             "$GITHUB_WORKFLOW" "$GITHUB_RUN_ID" "$GITHUB_RUN_ATTEMPT" \
             "$GITHUB_EVENT_NAME" "$LAB_SCENARIO" \
-            > "$RUNNER_TEMP/fm-capacity/$LAB_SCENARIO/run-identity.txt"
+            > "$run_root/run-identity.txt"
       - uses: actions/checkout@v6
         with:
           fetch-depth: 1
@@ -75,6 +122,6 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: ci-capacity-${{ matrix.scenario }}-${{ github.run_id }}-${{ github.run_attempt }}
-          path: ${{ runner.temp }}/fm-capacity/${{ matrix.scenario }}
+          path: ${{ runner.temp }}/fm-capacity/${{ github.run_id }}/${{ github.run_attempt }}/${{ matrix.scenario }}
           if-no-files-found: error
           retention-days: 30

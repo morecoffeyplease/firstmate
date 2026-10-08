@@ -1,0 +1,1 @@
+bin/fm-lint.sh
