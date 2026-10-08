@@ -1,0 +1,80 @@
+name: CI capacity diagnostic (not qualification)
+
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - .github/workflows/ci-capacity-diagnostic.yml
+      - .github/labs/ci-capacity/**
+    types: [opened]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-capacity-diagnostic-${{ github.event.pull_request.number }}
+  cancel-in-progress: false
+
+jobs:
+  capacity:
+    name: Capacity ${{ matrix.scenario }} (diagnostic only)
+    if: >-
+      github.event.pull_request.draft == true &&
+      github.event.pull_request.head.ref == 'fm/ci-capacity-design' &&
+      github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: ubuntu-latest
+    timeout-minutes: 50
+    strategy:
+      fail-fast: false
+      matrix:
+        scenario: [baseline, serial]
+    env:
+      CI: true
+      LC_ALL: C
+      LAB_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+      LAB_MERGE_SHA: ${{ github.sha }}
+      LAB_SCENARIO: ${{ matrix.scenario }}
+      SOURCE_COMMIT: 7153157693fbc4fccad7ae1e5cebed4800341d4c
+    steps:
+      - name: Start bounded outer-job clock
+        run: |
+          set -eu
+          mkdir -p "$RUNNER_TEMP/fm-capacity/$LAB_SCENARIO"
+          date -u '+%Y-%m-%dT%H:%M:%SZ' > "$RUNNER_TEMP/fm-capacity/$LAB_SCENARIO/job-start-utc.txt"
+          date +%s > "$RUNNER_TEMP/fm-capacity/$LAB_SCENARIO/job-start-epoch.txt"
+          printf 'workflow=%s\nrun_id=%s\nrun_attempt=%s\nevent=%s\nscenario=%s\n' \
+            "$GITHUB_WORKFLOW" "$GITHUB_RUN_ID" "$GITHUB_RUN_ATTEMPT" \
+            "$GITHUB_EVENT_NAME" "$LAB_SCENARIO" \
+            > "$RUNNER_TEMP/fm-capacity/$LAB_SCENARIO/run-identity.txt"
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 1
+          persist-credentials: false
+      - uses: actions/checkout@v6
+        with:
+          ref: 7153157693fbc4fccad7ae1e5cebed4800341d4c
+          path: source-git
+          fetch-depth: 1
+          persist-credentials: false
+      - name: Prepare and verify immutable source and pinned tools
+        id: prepare
+        timeout-minutes: 8
+        env:
+          SOURCE_GIT_ROOT: ${{ github.workspace }}/source-git
+          LAB_RECIPE_ROOT: ${{ github.workspace }}/.github/labs/ci-capacity
+        run: .github/labs/ci-capacity/prepare.sh
+      - name: Measure full lint owner
+        if: steps.prepare.outcome == 'success'
+        timeout-minutes: 45
+        env:
+          LAB_RECIPE_ROOT: ${{ github.workspace }}/.github/labs/ci-capacity
+        run: .github/labs/ci-capacity/run-analysis.sh
+      - name: Upload complete diagnostic evidence
+        if: always()
+        timeout-minutes: 5
+        uses: actions/upload-artifact@v4
+        with:
+          name: ci-capacity-${{ matrix.scenario }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/fm-capacity/${{ matrix.scenario }}
+          if-no-files-found: error
+          retention-days: 30
