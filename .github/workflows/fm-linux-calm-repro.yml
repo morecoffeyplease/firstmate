@@ -1,0 +1,139 @@
+name: Focused Linux Calm reproduction
+on:
+  pull_request:
+    types: [opened]
+    branches: [main]
+    paths:
+      - .github/workflows/fm-linux-calm-repro.yml
+      - bin/fm-linux-calm-repro.sh
+      - tests/fixtures/linux-calm-reproduction/observe.py
+permissions:
+  contents: read
+jobs:
+  focused-reproduction:
+    if: github.event.pull_request.draft == true && github.event.pull_request.head.repo.full_name == github.repository
+    name: Focused Calm rendering reproduction
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - name: Preserve hosted runner receipt
+        shell: bash
+        run: |
+          mkdir -p "$RUNNER_TEMP/fm-calm-evidence"
+          {
+            date -u '+utc=%Y-%m-%dT%H:%M:%SZ'
+            printf 'image_os=%s\nimage_version=%s\n' "$(printenv ImageOS 2>/dev/null || echo unknown)" "$(printenv ImageVersion 2>/dev/null || echo unknown)"
+            uname -a
+            cat /etc/os-release
+            id
+          } > "$RUNNER_TEMP/fm-calm-evidence/hosted-runner-receipt.txt" 2>&1
+      - name: Checkout recipe branch
+        uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+      - name: Preserve exact recipe source bytes
+        shell: bash
+        run: |
+          set -e
+          evidence="$RUNNER_TEMP/fm-calm-evidence"
+          mkdir -p "$evidence"
+          cp -- .github/workflows/fm-linux-calm-repro.yml "$evidence/workflow-source.yml"
+          cp -- bin/fm-linux-calm-repro.sh "$evidence/runner-source.sh"
+          cp -- tests/fixtures/linux-calm-reproduction/observe.py "$evidence/observer-generator.py"
+          sha256sum "$evidence/workflow-source.yml" "$evidence/runner-source.sh" "$evidence/observer-generator.py" > "$evidence/recipe-source.sha256"
+      - name: Checkout immutable source head
+        uses: actions/checkout@v6
+        with:
+          ref: 1ec486cee92a9a93045895c21b067ae37e08f3af
+          path: source
+          persist-credentials: false
+      - name: Select task-scoped Node version
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22.23.3
+      - name: Run bounded focused reproduction
+        id: reproduction
+        timeout-minutes: 20
+        shell: bash
+        env:
+          FM_EVIDENCE_DIR: ${{ runner.temp }}/fm-calm-evidence
+        run: |
+          set +e
+          evidence="$FM_EVIDENCE_DIR"
+          {
+            date -u '+utc=%Y-%m-%dT%H:%M:%SZ'
+            printf 'image_os=%s\nimage_version=%s\n' "$(printenv ImageOS 2>/dev/null || echo unknown)" "$(printenv ImageVersion 2>/dev/null || echo unknown)"
+            uname -a
+            cat /etc/os-release
+            id
+            printf 'node=%s\ntmux=%s\nTERM=%s\n' "$(node --version 2>&1 || echo unavailable)" "$(tmux -V 2>&1 || echo unavailable)" "$(printenv TERM 2>/dev/null || echo unset)"
+          } > "$evidence/wrapper-launch-receipt.txt" 2>&1
+          timeout --signal=TERM --kill-after=30s 19m bash bin/fm-linux-calm-repro.sh \
+            > "$evidence/wrapper.stdout" 2> "$evidence/wrapper.stderr"
+          wrapper_rc=$?
+          case "$wrapper_rc" in
+            124|137) wrapper_outcome=timeout-or-child-status-ambiguous ;;
+            *) wrapper_outcome=ordinary-shell-return ;;
+          esac
+          {
+            printf 'wrapper_exit=%s\n' "$wrapper_rc"
+            printf 'wrapper_outcome=%s\n' "$wrapper_outcome"
+            date -u '+returned_utc=%Y-%m-%dT%H:%M:%SZ'
+          } > "$evidence/wrapper-invocation.status"
+          exit "$wrapper_rc"
+      - name: Finalize wrapper status receipt
+        if: always()
+        timeout-minutes: 2
+        shell: bash
+        env:
+          REPRO_OUTCOME: ${{ steps.reproduction.outcome }}
+        run: |
+          evidence="$RUNNER_TEMP/fm-calm-evidence"
+          mkdir -p "$evidence"
+          if [ ! -s "$evidence/wrapper-invocation.status" ]; then
+            {
+              printf 'workflow_step_outcome=%s\n' "$REPRO_OUTCOME"
+              date -u '+finalized_utc=%Y-%m-%dT%H:%M:%SZ'
+              if [ "$REPRO_OUTCOME" = skipped ]; then
+                printf 'wrapper_exit=not-invoked\n'
+                printf 'wrapper_outcome=prior-step-prevented-invocation\n'
+              else
+                printf 'wrapper_exit=unknown\n'
+                printf 'wrapper_outcome=step-ended-before-status-receipt\n'
+              fi
+            } > "$evidence/wrapper-invocation.status"
+          else
+            printf 'workflow_step_outcome=%s\n' "$REPRO_OUTCOME" >> "$evidence/wrapper-invocation.status"
+          fi
+          if timeout --signal=TERM --kill-after=2s 28s python3 - "$evidence" <<'PY'
+          import hashlib
+          import os
+          import sys
+          from pathlib import Path
+
+          root = Path(sys.argv[1])
+          manifest = root / "SHA256SUMS"
+          temporary = root / "SHA256SUMS.tmp"
+          files = sorted(path for path in root.rglob("*") if path.is_file() and not path.is_symlink() and path not in {manifest, temporary})
+          with temporary.open("w") as output:
+              for path in files:
+                  digest = hashlib.sha256(path.read_bytes()).hexdigest()
+                  output.write(f"{digest}  {path.relative_to(root)}\n")
+          os.replace(temporary, manifest)
+          PY
+          then
+            :
+          else
+            hash_rc=$?
+            printf 'evidence_hash_exit=%s\n' "$hash_rc" > "$evidence/evidence-collection.failure"
+            exit 70
+          fi
+      - name: Upload diagnostic evidence
+        if: always()
+        timeout-minutes: 3
+        uses: actions/upload-artifact@v4
+        with:
+          name: linux-calm-reproduction-${{ github.run_id }}
+          path: ${{ runner.temp }}/fm-calm-evidence/
+          if-no-files-found: error
+          retention-days: 7
