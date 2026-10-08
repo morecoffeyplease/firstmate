@@ -11,12 +11,19 @@ SOURCE="$GITHUB_WORKSPACE/source"
 SOURCE_FIXTURE="$SOURCE/tests/fm-calm-pi-extension.test.sh"
 WORK="$RUNNER_TEMP/fm-calm-worktree-$$"
 EXTRACTED="$RUNNER_TEMP/fm-calm-extracted-$$"
+COUNTERFACTUAL="$RUNNER_TEMP/fm-calm-counterfactual-$$"
 SCRATCH="$RUNNER_TEMP/fm-calm-scratch-$$"
-OBSERVER="$WORK/tests/fm-calm-pi-extension.linux-observe.test.sh"
+COUNTERFACTUAL_FIXTURE_SOURCE="$GITHUB_WORKSPACE/tests/fixtures/linux-calm-reproduction/fm-calm-pi-extension.counterfactual.test.sh"
+COUNTERFACTUAL_FIXTURE="$COUNTERFACTUAL/tests/fm-calm-pi-extension.test.sh"
+COUNTERFACTUAL_FIXTURE_SHA256=024a7d9597bd0e660f5fd0eaa37483a594dd827080c24898576772e276fdb0f2
+COUNTERFACTUAL_OBSERVER="$COUNTERFACTUAL/tests/fm-calm-pi-extension.linux-observe.test.sh"
+OBSERVER="$COUNTERFACTUAL_OBSERVER"
 PRIMARY_STATUS=70
 CLEANUP_STATUS=0
 SAFE_TO_REMOVE_TASK_DIRS=1
 OBSERVER_CUSTODY_STATUS=not-verified
+COUNTERFACTUAL_CUSTODY_STATUS=not-verified
+COUNTERFACTUAL_FINAL_RESULT=not-attempted
 TREE_EXPECTED=
 SOURCE_PRESERVE=0
 SOURCE_FINAL_RESULT=not-attempted
@@ -40,6 +47,59 @@ write_checked_receipt() {
     printf 'receipt_write_failure=%s exit=%s target=%s\n' "$label" "$rc" "$target" >> "$EVIDENCE/receipt-write-failures.log" 2>/dev/null || true
     return 1
   fi
+}
+
+verify_counterfactual_candidate_input() {
+  local phase=$1 source_hash_rc=125 evidence_hash_rc=125 compare_rc=125 source_hash='' evidence_hash='' content
+  local source_receipt="$EVIDENCE/counterfactual-candidate-$phase-source.sha256"
+  local evidence_receipt="$EVIDENCE/counterfactual-candidate-$phase-evidence.sha256"
+  if [[ -f "$COUNTERFACTUAL_FIXTURE_SOURCE" && ! -L "$COUNTERFACTUAL_FIXTURE_SOURCE" ]] &&
+     timeout --signal=TERM --kill-after=2s 8s sha256sum "$COUNTERFACTUAL_FIXTURE_SOURCE" > "$source_receipt" 2> "$source_receipt.stderr"; then source_hash_rc=0; else source_hash_rc=$?; fi
+  if [[ -f "$EVIDENCE/counterfactual-fixture-recipe-input.sh" && ! -L "$EVIDENCE/counterfactual-fixture-recipe-input.sh" ]] &&
+     timeout --signal=TERM --kill-after=2s 8s sha256sum "$EVIDENCE/counterfactual-fixture-recipe-input.sh" > "$evidence_receipt" 2> "$evidence_receipt.stderr"; then evidence_hash_rc=0; else evidence_hash_rc=$?; fi
+  if [[ "$source_hash_rc" -eq 0 && "$evidence_hash_rc" -eq 0 ]] &&
+     read -r source_hash _ < "$source_receipt" && read -r evidence_hash _ < "$evidence_receipt" &&
+     [[ "$source_hash" == "$COUNTERFACTUAL_FIXTURE_SHA256" && "$evidence_hash" == "$COUNTERFACTUAL_FIXTURE_SHA256" ]]; then
+    if timeout --signal=TERM --kill-after=2s 8s cmp -s -- "$COUNTERFACTUAL_FIXTURE_SOURCE" "$EVIDENCE/counterfactual-fixture-recipe-input.sh" 2> "$EVIDENCE/counterfactual-candidate-$phase-compare.stderr"; then compare_rc=0; else compare_rc=$?; fi
+  fi
+  content="phase=$phase"$'\n'"pinned_sha256=$COUNTERFACTUAL_FIXTURE_SHA256"$'\n'"source_hash_exit=$source_hash_rc"$'\n'"evidence_hash_exit=$evidence_hash_rc"$'\n'"byte_compare_exit=$compare_rc"$'\n'"source_hash=$source_hash"$'\n'"evidence_hash=$evidence_hash"
+  if [[ "$source_hash_rc" -eq 0 && "$evidence_hash_rc" -eq 0 && "$compare_rc" -eq 0 && "$source_hash" == "$evidence_hash" ]]; then
+    write_checked_receipt "$EVIDENCE/counterfactual-candidate-$phase.status" counterfactual-candidate-input "$content" || return 1
+    return 0
+  fi
+  write_checked_receipt "$EVIDENCE/counterfactual-candidate-$phase.failure" counterfactual-candidate-input-failure "$content" || true
+  return 1
+}
+
+verify_counterfactual_binding() {
+  local phase=$1 head_rc=125 tree_rc=125 status_rc=125 fixture_hash_rc=125 actual_head='' actual_tree='' actual_status='' fixture_hash='' expected_status content
+  local prefix="$EVIDENCE/counterfactual-$phase"
+  local expected_fixture_status=' M tests/fm-calm-pi-extension.test.sh'
+  if [[ -e "$COUNTERFACTUAL_OBSERVER" || -L "$COUNTERFACTUAL_OBSERVER" ]]; then
+    expected_fixture_status+=$'\n?? tests/fm-calm-pi-extension.linux-observe.test.sh'
+  fi
+  if [[ -d "$COUNTERFACTUAL" && ! -L "$COUNTERFACTUAL" ]]; then
+    if git -C "$COUNTERFACTUAL" rev-parse HEAD > "$prefix.head" 2> "$prefix.head.stderr"; then head_rc=0; else head_rc=$?; fi
+    if git -C "$COUNTERFACTUAL" rev-parse 'HEAD^{tree}' > "$prefix.tree" 2> "$prefix.tree.stderr"; then tree_rc=0; else tree_rc=$?; fi
+    if git -C "$COUNTERFACTUAL" status --porcelain --untracked-files=all > "$prefix.status" 2> "$prefix.status.stderr"; then status_rc=0; else status_rc=$?; fi
+  fi
+  if [[ -f "$COUNTERFACTUAL_FIXTURE" && ! -L "$COUNTERFACTUAL_FIXTURE" ]] &&
+     timeout --signal=TERM --kill-after=2s 8s sha256sum "$COUNTERFACTUAL_FIXTURE" > "$prefix.fixture.sha256" 2> "$prefix.fixture.sha256.stderr"; then fixture_hash_rc=0; else fixture_hash_rc=$?; fi
+  if [[ "$head_rc" -eq 0 ]]; then actual_head="$(< "$prefix.head")"; fi
+  if [[ "$tree_rc" -eq 0 ]]; then actual_tree="$(< "$prefix.tree")"; fi
+  if [[ "$status_rc" -eq 0 ]]; then actual_status="$(< "$prefix.status")"; fi
+  if [[ "$fixture_hash_rc" -eq 0 ]]; then read -r fixture_hash _ < "$prefix.fixture.sha256" || fixture_hash=''; fi
+  content="phase=$phase"$'\n'"result=failed"$'\n'"expected_head=$EXPECTED_HEAD"$'\n'"actual_head=$actual_head"$'\n'"expected_tree=$TREE_EXPECTED"$'\n'"actual_tree=$actual_tree"$'\n'"expected_candidate_sha256=$COUNTERFACTUAL_FIXTURE_SHA256"$'\n'"actual_candidate_sha256=$fixture_hash"$'\n'"head_exit=$head_rc"$'\n'"tree_exit=$tree_rc"$'\n'"status_exit=$status_rc"$'\n'"fixture_hash_exit=$fixture_hash_rc"$'\n'"expected_status=$expected_fixture_status"$'\n'"actual_status=$actual_status"
+  if [[ "$head_rc" -eq 0 && "$tree_rc" -eq 0 && "$status_rc" -eq 0 && "$fixture_hash_rc" -eq 0 &&
+        "$actual_head" == "$EXPECTED_HEAD" && "$actual_tree" == "$TREE_EXPECTED" &&
+        "$fixture_hash" == "$COUNTERFACTUAL_FIXTURE_SHA256" && "$actual_status" == "$expected_fixture_status" ]] &&
+     verify_counterfactual_candidate_input "$phase"; then
+    content="phase=$phase"$'\n'"result=verified"$'\n'"expected_head=$EXPECTED_HEAD"$'\n'"actual_head=$actual_head"$'\n'"expected_tree=$TREE_EXPECTED"$'\n'"actual_tree=$actual_tree"$'\n'"candidate_sha256=$fixture_hash"$'\n'"head_exit=0"$'\n'"tree_exit=0"$'\n'"status_exit=0"$'\n'"fixture_hash_exit=0"$'\n'"git_status=$actual_status"
+    write_checked_receipt "$prefix.binding.status" counterfactual-binding "$content" || return 1
+    return 0
+  fi
+  write_checked_receipt "$prefix.binding.failure" counterfactual-binding-failure "$content" || true
+  return 1
 }
 
 git_receipt() {
@@ -80,7 +140,7 @@ git_receipt() {
 }
 
 verify_observer_custody() {
-  local phase=$1 original_hash_rc copy_hash_rc compare_rc original_hash= copy_hash= initial_original_hash= initial_copy_hash= initial_match=not-applicable
+  local phase=$1 original_hash_rc copy_hash_rc compare_rc original_hash='' copy_hash='' initial_original_hash='' initial_copy_hash='' initial_match=not-applicable
   local original_receipt="$EVIDENCE/observer-$phase-original.sha256"
   local copy_receipt="$EVIDENCE/observer-$phase-copy.sha256"
   if timeout --signal=TERM --kill-after=2s 8s sha256sum "$OBSERVER" > "$original_receipt" 2> "$original_receipt.stderr"; then original_hash_rc=0; else original_hash_rc=$?; fi
@@ -202,7 +262,7 @@ capture_preserved_task_paths() {
       source_missing=1
     fi
   fi
-  for path in "$WORK" "$EXTRACTED" "$SCRATCH"; do
+  for path in "$WORK" "$EXTRACTED" "$COUNTERFACTUAL" "$SCRATCH"; do
     if [[ -e "$path" || -L "$path" ]]; then
       paths+=("$path")
       tar_args+=(-C "$RUNNER_TEMP" "${path##*/}")
@@ -292,6 +352,18 @@ finish_cleanup() {
     CLEANUP_STATUS=1
     SAFE_TO_REMOVE_TASK_DIRS=0
   fi
+  if [[ "$COUNTERFACTUAL_CUSTODY_STATUS" == verified ]]; then
+    if ! verify_counterfactual_binding before-cleanup; then
+      echo 'candidate fixture binding failed before cleanup; preserving all task paths' >> "$EVIDENCE/cleanup.log"
+      COUNTERFACTUAL_CUSTODY_STATUS=failed
+      CLEANUP_STATUS=1
+      SAFE_TO_REMOVE_TASK_DIRS=0
+    fi
+  else
+    echo 'candidate fixture custody was not verified; preserving all task paths' >> "$EVIDENCE/cleanup.log"
+    CLEANUP_STATUS=1
+    SAFE_TO_REMOVE_TASK_DIRS=0
+  fi
   if [[ -e "$OBSERVER" ]]; then
     if [[ "$SAFE_TO_REMOVE_TASK_DIRS" -eq 1 && "$OBSERVER_CUSTODY_STATUS" == verified ]]; then
       if verify_observer_custody cleanup; then
@@ -320,8 +392,16 @@ finish_cleanup() {
     SAFE_TO_REMOVE_TASK_DIRS=0
   fi
   if [[ "$SAFE_TO_REMOVE_TASK_DIRS" -eq 1 ]]; then
+    if ! verify_counterfactual_binding final; then
+      echo 'final candidate fixture binding failed; preserving all task paths' >> "$EVIDENCE/cleanup.log"
+      COUNTERFACTUAL_CUSTODY_STATUS=failed
+      CLEANUP_STATUS=1
+      SAFE_TO_REMOVE_TASK_DIRS=0
+    fi
+  fi
+  if [[ "$SAFE_TO_REMOVE_TASK_DIRS" -eq 1 ]]; then
     local task_path
-    for task_path in "$WORK" "$EXTRACTED" "$SCRATCH"; do
+    for task_path in "$WORK" "$EXTRACTED" "$COUNTERFACTUAL" "$SCRATCH"; do
       if [[ -e "$task_path" || -L "$task_path" ]] && { [[ ! -d "$task_path" ]] || [[ -L "$task_path" ]]; }; then
         printf 'task_path_type=unexpected\npath=%s\n' "$task_path" >> "$EVIDENCE/cleanup.log"
         CLEANUP_STATUS=1
@@ -334,10 +414,10 @@ finish_cleanup() {
     local git_dir="$path/.git"
     if [[ ! -e "$path" && ! -L "$path" ]]; then
       outcome=unknown
-      reason=path-not-present
+      reason='path-not-present'
     elif [[ -L "$path" || ! -d "$path" ]]; then
       outcome=unknown
-      reason=path-type-unexpected
+      reason='path-type-unexpected'
     elif [[ ! -e "$git_dir" && ! -L "$git_dir" ]]; then
       outcome=unknown
       reason=git-metadata-not-present
@@ -355,8 +435,8 @@ finish_cleanup() {
       outcome=failed
       reason=git-command-failed-or-head-tree-status-mismatch
     fi
-    if [[ "$label" == work && -e "$OBSERVER" ]]; then
-      content=$'retained_observer=yes\nreason=observer-preserved-for-custody\nwork_status_expected=dirty-untracked-observer'
+    if [[ "$label" == counterfactual && -e "$OBSERVER" ]]; then
+      content=$'retained_observer=yes\nreason=observer-preserved-for-custody\ncounterfactual_status_expected=dirty-fixture-and-observer'
       if ! write_checked_receipt "$EVIDENCE/git-work-final-retained-observer.txt" work-retained-observer "$content"; then
         outcome=failed
         reason=retained-observer-note-write-failed
@@ -383,6 +463,19 @@ finish_cleanup() {
   final_git_proof source "$SOURCE" "${TREE_EXPECTED:-}" || true
   final_git_proof extracted "$EXTRACTED" "${TREE_EXPECTED:-}" || true
   final_git_proof work "$WORK" "${TREE_EXPECTED:-}" || true
+  if [[ -e "$COUNTERFACTUAL" || -L "$COUNTERFACTUAL" ]]; then
+    if [[ "$COUNTERFACTUAL_CUSTODY_STATUS" == verified ]] && verify_counterfactual_binding before-removal; then
+      COUNTERFACTUAL_FINAL_RESULT=verified-before-removal
+    else
+      COUNTERFACTUAL_FINAL_RESULT=preserved-custody-unverified
+      CLEANUP_STATUS=1
+      SAFE_TO_REMOVE_TASK_DIRS=0
+    fi
+  else
+    COUNTERFACTUAL_FINAL_RESULT=missing-before-removal
+    CLEANUP_STATUS=1
+    SAFE_TO_REMOVE_TASK_DIRS=0
+  fi
   if [[ "$SAFE_TO_REMOVE_TASK_DIRS" -eq 1 ]]; then
     if [[ -d "$WORK" ]]; then
       if timeout --signal=TERM --kill-after=2s 8s rm -rf -- "$WORK"; then :; else CLEANUP_STATUS=1; SAFE_TO_REMOVE_TASK_DIRS=0; fi
@@ -390,10 +483,28 @@ finish_cleanup() {
     if [[ "$SAFE_TO_REMOVE_TASK_DIRS" -eq 1 && -d "$EXTRACTED" ]]; then
       if timeout --signal=TERM --kill-after=2s 8s rm -rf -- "$EXTRACTED"; then :; else CLEANUP_STATUS=1; SAFE_TO_REMOVE_TASK_DIRS=0; fi
     fi
+    if [[ "$SAFE_TO_REMOVE_TASK_DIRS" -eq 1 && -d "$COUNTERFACTUAL" ]]; then
+      if timeout --signal=TERM --kill-after=2s 8s rm -rf -- "$COUNTERFACTUAL"; then COUNTERFACTUAL_FINAL_RESULT=removed-after-custody-verified; else CLEANUP_STATUS=1; SAFE_TO_REMOVE_TASK_DIRS=0; fi
+    fi
     if [[ "$SAFE_TO_REMOVE_TASK_DIRS" -eq 1 && -d "$SCRATCH" ]]; then
       if timeout --signal=TERM --kill-after=2s 8s rm -rf -- "$SCRATCH"; then :; else CLEANUP_STATUS=1; SAFE_TO_REMOVE_TASK_DIRS=0; fi
     fi
   fi
+  if [[ ! -e "$COUNTERFACTUAL" && ! -L "$COUNTERFACTUAL" &&
+        "$SAFE_TO_REMOVE_TASK_DIRS" -eq 1 && "$COUNTERFACTUAL_CUSTODY_STATUS" == verified ]]; then
+    COUNTERFACTUAL_FINAL_RESULT=removed-after-custody-verified
+  elif [[ -e "$COUNTERFACTUAL" || -L "$COUNTERFACTUAL" ]]; then
+    if [[ "$COUNTERFACTUAL_CUSTODY_STATUS" == verified ]] && verify_counterfactual_binding final-preserved; then
+      COUNTERFACTUAL_FINAL_RESULT=preserved-with-exact-fixture-delta
+    else
+      COUNTERFACTUAL_FINAL_RESULT=preserved-custody-unverified
+      CLEANUP_STATUS=1
+    fi
+  else
+    COUNTERFACTUAL_FINAL_RESULT=unknown
+    CLEANUP_STATUS=1
+  fi
+  write_checked_receipt "$EVIDENCE/counterfactual-final.path-status" counterfactual-final-path "result=$COUNTERFACTUAL_FINAL_RESULT" || CLEANUP_STATUS=1
   if [[ "$SAFE_TO_REMOVE_TASK_DIRS" -eq 0 ]]; then
     capture_preserved_task_paths || CLEANUP_STATUS=1
   fi
@@ -403,11 +514,13 @@ finish_cleanup() {
   cleanup_content+=$'\n'"final_source=$SOURCE_FINAL_RESULT"
   cleanup_content+=$'\n'"final_extracted=$EXTRACTED_FINAL_RESULT"
   cleanup_content+=$'\n'"final_work=$WORK_FINAL_RESULT"
+  cleanup_content+=$'\n'"final_counterfactual=$COUNTERFACTUAL_FINAL_RESULT"
   cleanup_content+=$'\n'"source_archive_requested=$([[ "$SOURCE_PRESERVE" -eq 1 ]] && echo yes || echo no)"
   cleanup_content+=$'\n'"observer_copy_retained=$([[ -f "$EVIDENCE/observer-copy.sh" ]] && echo yes || echo no)"
   cleanup_content+=$'\n'"fixture_source_retained=$([[ -f "$EVIDENCE/fixture-source.sh" ]] && echo yes || echo no)"
   cleanup_content+=$'\n'"archive_retained=$([[ -f "$EVIDENCE/source-head.tar" || -f "$EVIDENCE/preserved-task-paths.tar" ]] && echo yes || echo no)"
   cleanup_content+=$'\n'"preserved_worktree=$([[ -e "$WORK" || -L "$WORK" ]] && echo yes || echo no)"
+  cleanup_content+=$'\n'"preserved_counterfactual=$([[ -e "$COUNTERFACTUAL" || -L "$COUNTERFACTUAL" ]] && echo yes || echo no)"
   cleanup_content+=$'\n'"preserved_extracted_tree=$([[ -e "$EXTRACTED" || -L "$EXTRACTED" ]] && echo yes || echo no)"
   cleanup_content+=$'\n'"preserved_scratch=$([[ -e "$SCRATCH" || -L "$SCRATCH" ]] && echo yes || echo no)"
   if ! write_checked_receipt "$EVIDENCE/cleanup-receipt.txt" cleanup-summary "$cleanup_content"; then
@@ -461,8 +574,20 @@ done <<'FILES'
 .github/workflows/fm-linux-calm-repro.yml|workflow-source.yml
 bin/fm-linux-calm-repro.sh|runner-source.sh
 tests/fixtures/linux-calm-reproduction/observe.py|observer-generator.py
+tests/fixtures/linux-calm-reproduction/fm-calm-pi-extension.counterfactual.test.sh|counterfactual-fixture-recipe-source.sh
 FILES
-sha256sum "$EVIDENCE/workflow-source.yml" "$EVIDENCE/runner-source.sh" "$EVIDENCE/observer-generator.py" > "$EVIDENCE/recipe-source.sha256" || fail_stage recipe-hash 70
+sha256sum "$EVIDENCE/workflow-source.yml" "$EVIDENCE/runner-source.sh" "$EVIDENCE/observer-generator.py" "$EVIDENCE/counterfactual-fixture-recipe-source.sh" > "$EVIDENCE/recipe-source.sha256" || fail_stage recipe-hash 70
+if [[ ! -f "$COUNTERFACTUAL_FIXTURE_SOURCE" || -L "$COUNTERFACTUAL_FIXTURE_SOURCE" ]] ||
+   ! cp -- "$COUNTERFACTUAL_FIXTURE_SOURCE" "$EVIDENCE/counterfactual-fixture-recipe-input.sh"; then
+  echo 'pinned counterfactual fixture input unavailable or not a regular file' > "$EVIDENCE/counterfactual-candidate-source.failure"
+  fail_stage counterfactual-candidate-source 66
+fi
+if ! verify_counterfactual_candidate_input recipe-source; then
+  echo 'pinned counterfactual fixture source or retained bytes failed digest/custody verification' > "$EVIDENCE/counterfactual-candidate-source.failure"
+  SAFE_TO_REMOVE_TASK_DIRS=0
+  fail_stage counterfactual-candidate-source 64
+fi
+printf 'recipe_candidate_fixture_sha256=%s\n' "$COUNTERFACTUAL_FIXTURE_SHA256" > "$EVIDENCE/counterfactual-candidate-pinned.sha256" || fail_stage counterfactual-candidate-receipt 70
 
 if [[ -f "$SOURCE_FIXTURE" ]]; then
   if cp -- "$SOURCE_FIXTURE" "$EVIDENCE/fixture-source.sh"; then
@@ -535,6 +660,42 @@ if [[ "$(sha256sum "$WORK/tests/fm-calm-pi-extension.test.sh" | cut -d ' ' -f 1)
   fail_stage worktree-qualification 64
 fi
 record worktree-qualification 0
+if [[ -e "$COUNTERFACTUAL" || -L "$COUNTERFACTUAL" ]]; then
+  echo 'counterfactual path already exists' > "$EVIDENCE/counterfactual-path.failure"
+  SAFE_TO_REMOVE_TASK_DIRS=0
+  fail_stage counterfactual-path 64
+fi
+if timeout --signal=TERM --kill-after=5s 25s cp -a "$WORK" "$COUNTERFACTUAL"; then record counterfactual-copy 0; else rc=$?; SAFE_TO_REMOVE_TASK_DIRS=0; fail_stage counterfactual-copy "$rc"; fi
+if ! git_receipt counterfactual-baseline "$COUNTERFACTUAL" "$EXPECTED_HEAD" "$TREE_EXPECTED"; then
+  echo 'counterfactual baseline copy did not retain the qualified original Git identity and clean status' > "$EVIDENCE/counterfactual-baseline.failure"
+  SAFE_TO_REMOVE_TASK_DIRS=0
+  fail_stage counterfactual-baseline 64
+fi
+if [[ "$(sha256sum "$COUNTERFACTUAL/tests/fm-calm-pi-extension.test.sh" | cut -d ' ' -f 1)" != "$FIXTURE_HASH" ]]; then
+  echo 'counterfactual baseline fixture differs from the original fixture digest' > "$EVIDENCE/counterfactual-original-fixture.failure"
+  SAFE_TO_REMOVE_TASK_DIRS=0
+  fail_stage counterfactual-original-fixture 64
+fi
+if ! verify_counterfactual_candidate_input before-copy; then
+  echo 'counterfactual recipe input custody failed before copy' > "$EVIDENCE/counterfactual-candidate-before-copy.failure"
+  SAFE_TO_REMOVE_TASK_DIRS=0
+  fail_stage counterfactual-candidate-before-copy 64
+fi
+if timeout --signal=TERM --kill-after=2s 8s cp -- "$EVIDENCE/counterfactual-fixture-recipe-input.sh" "$COUNTERFACTUAL_FIXTURE"; then
+  record counterfactual-fixture-copy 0
+else
+  rc=$?
+  SAFE_TO_REMOVE_TASK_DIRS=0
+  fail_stage counterfactual-fixture-copy "$rc"
+fi
+if ! verify_counterfactual_binding fixture-only; then
+  echo 'derived counterfactual does not contain only the pinned fixture delta' > "$EVIDENCE/counterfactual-fixture-only.failure"
+  SAFE_TO_REMOVE_TASK_DIRS=0
+  COUNTERFACTUAL_CUSTODY_STATUS=failed
+  fail_stage counterfactual-fixture-only 64
+fi
+COUNTERFACTUAL_CUSTODY_STATUS=verified
+record counterfactual-fixture-only 0
 if timeout --signal=TERM --kill-after=10s 180s npm install --prefix "$SCRATCH/npm" --no-audit --no-fund '@earendil-works/pi-coding-agent@1.1.0' > "$EVIDENCE/install.log" 2>&1; then
   printf '0\n' > "$EVIDENCE/install.exit"; record pi-install 0
 else
@@ -551,23 +712,32 @@ fi
 if [[ "$(cat "$EVIDENCE/pi-package-version.txt")" != 1.1.0 ]]; then echo 'Pi package metadata mismatch' > "$EVIDENCE/runtime-qualification.failure"; fail_stage pi-package-version 64; fi
 if pi --version > "$EVIDENCE/pi-version.txt" 2>&1; then record pi-cli-version 0; else rc=$?; printf '%s\n' "$rc" > "$EVIDENCE/pi-version.exit"; fail_stage pi-cli-version "$rc"; fi
 if npm ls --prefix "$SCRATCH/npm" --all --json > "$EVIDENCE/npm-tree.json" 2> "$EVIDENCE/npm-tree.stderr"; then record npm-dependency-tree 0; else rc=$?; printf '%s\n' "$rc" > "$EVIDENCE/npm-tree.exit"; fail_stage npm-dependency-tree "$rc"; fi
-if python3 "$EVIDENCE/observer-generator.py" --source "$FIXTURE" --output "$OBSERVER" --evidence "$EVIDENCE" --expected-source-sha256 "$FIXTURE_HASH" > "$EVIDENCE/observer-generator.log" 2>&1; then
+if python3 "$EVIDENCE/observer-generator.py" --source "$COUNTERFACTUAL_FIXTURE" --output "$COUNTERFACTUAL_OBSERVER" --evidence "$EVIDENCE" --expected-source-sha256 "$COUNTERFACTUAL_FIXTURE_SHA256" > "$EVIDENCE/observer-generator.log" 2>&1; then
   record observer-generation 0
 else
   rc=$?; printf '%s\n' "$rc" > "$EVIDENCE/observer-generator.exit"; fail_stage observer-generation "$rc"
 fi
-if verify_observer_custody before-fixture; then
+if [[ "$(cat "$EVIDENCE/observer-source.sha256" 2>/dev/null)" != "$COUNTERFACTUAL_FIXTURE_SHA256" ]] ||
+   ! verify_counterfactual_binding observer-generated ||
+   ! verify_observer_custody before-fixture; then
+  OBSERVER_CUSTODY_STATUS=failed
+  COUNTERFACTUAL_CUSTODY_STATUS=failed
+  SAFE_TO_REMOVE_TASK_DIRS=0
+  echo 'observer input, output, or candidate binding failed custody verification' > "$EVIDENCE/observer-qualification.failure"
+  fail_stage observer-retention 70
+else
   OBSERVER_CUSTODY_STATUS=verified
   record observer-retention 0
-else
-  OBSERVER_CUSTODY_STATUS=failed
-  SAFE_TO_REMOVE_TASK_DIRS=0
-  echo 'observer hash command or byte-equality verification failed; original preserved' > "$EVIDENCE/observer-qualification.failure"
-  fail_stage observer-retention 70
 fi
 printf 'started\n' > "$EVIDENCE/fixture-started"
 export FM_EVIDENCE_DIR="$EVIDENCE"
-if timeout --signal=TERM --kill-after=10s 900s "$WORK/bin/fm-test-run.sh" "$OBSERVER" --jobs 1 > "$EVIDENCE/runner.log" 2>&1; then
+if ! verify_counterfactual_binding before-fixture; then
+  echo 'candidate fixture or observer binding changed before whole-fixture invocation' > "$EVIDENCE/counterfactual-before-run.failure"
+  SAFE_TO_REMOVE_TASK_DIRS=0
+  COUNTERFACTUAL_CUSTODY_STATUS=failed
+  fail_stage counterfactual-before-run 64
+fi
+if timeout --signal=TERM --kill-after=10s 900s "$COUNTERFACTUAL/bin/fm-test-run.sh" "$COUNTERFACTUAL_OBSERVER" --jobs 1 > "$EVIDENCE/runner.log" 2>&1; then
   PRIMARY_STATUS=0
 else
   PRIMARY_STATUS=$?
