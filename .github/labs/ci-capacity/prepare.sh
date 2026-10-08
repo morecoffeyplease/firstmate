@@ -195,3 +195,4 @@ sha256sum "$tool_bin/shellcheck" "$tool_bin/actionlint" > "$root/tool-binary-sha
 printf '%s\n' "$tool_bin" >> "$GITHUB_PATH"
 set_phase preflight-complete
 printf 'preflight=pass\n' > "$root/preflight-result.txt"
+python3 "$recipe_root/lifecycle_record.py" "$root" QUALIFY 'source hashes, pins, and canonical inventory passed'

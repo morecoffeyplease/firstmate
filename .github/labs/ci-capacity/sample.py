@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 import contextlib
 import io
+import os
 import runpy
 import sys
 import time
@@ -11,6 +12,14 @@ from pathlib import Path
 output_path = Path(sys.argv[1]) / 'resources-samples.log'
 interval = float(sys.argv[2])
 recipe_root = Path(sys.argv[3])
+ready_path = Path(sys.argv[1]) / 'resource-sampler-ready.txt'
+ready_descriptor = ready_path.open('x')
+try:
+    ready_descriptor.write('ready\n')
+    ready_descriptor.flush()
+    os.fsync(ready_descriptor.fileno())
+finally:
+    ready_descriptor.close()
 
 
 def process_snapshot():

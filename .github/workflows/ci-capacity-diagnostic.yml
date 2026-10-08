@@ -65,6 +65,35 @@ jobs:
           printf 'phase=job-bootstrap\noutcome=in-progress\n' > "$run_root/job-status.txt"
           date -u '+%Y-%m-%dT%H:%M:%SZ\tjob-bootstrap\tin-progress' \
             >> "$run_root/phase-journal.tsv"
+          python3 - "$run_root" <<'PY'
+          import sys
+          import time
+          from datetime import datetime, timezone
+          from pathlib import Path
+          root = Path(sys.argv[1])
+          wall_ns = time.time_ns()
+          monotonic_ns = time.monotonic_ns()
+          (root / 'job-start-utc.txt').write_text(
+              datetime.fromtimestamp(wall_ns / 1_000_000_000, timezone.utc).isoformat() + '\n')
+          (root / 'job-start-epoch.txt').write_text(f'{wall_ns / 1_000_000_000:.9f}\n')
+          (root / 'job-start-monotonic-ns.txt').write_text(f'{monotonic_ns}\n')
+          PY
+          python3 - "$run_root/lifecycle-journal.tsv" <<'PY'
+          import os
+          import sys
+          import time
+          descriptor = os.open(sys.argv[1], os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+          try:
+              os.write(descriptor, f'{time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())}\tPREPARE\tjob started\n'.encode())
+              os.fsync(descriptor)
+          finally:
+              os.close(descriptor)
+          directory = os.open(sys.argv[1].rsplit('/', 1)[0], os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC)
+          try:
+              os.fsync(directory)
+          finally:
+              os.close(directory)
+          PY
           finish_job_bootstrap() {
             status=$?
             trap - EXIT
@@ -110,8 +139,6 @@ jobs:
               raise SystemExit('diagnostic admission refused')
           PY
           job_phase=clock-start-recorded
-          date -u '+%Y-%m-%dT%H:%M:%SZ' > "$run_root/job-start-utc.txt"
-          date +%s > "$run_root/job-start-epoch.txt"
           printf 'workflow=%s\nrun_id=%s\nrun_attempt=%s\nevent=%s\nscenario=%s\n' \
             "$GITHUB_WORKFLOW" "$GITHUB_RUN_ID" "$GITHUB_RUN_ATTEMPT" \
             "$GITHUB_EVENT_NAME" "$LAB_SCENARIO" \

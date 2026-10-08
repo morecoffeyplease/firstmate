@@ -1,32 +1,86 @@
 #!/usr/bin/env python3
 import json
-import os
 import sys
 import time
 from pathlib import Path
+import os
 
 
 def record_readiness(root, stage, deadline):
     root = Path(root)
-    started = float((root / 'job-start-epoch.txt').read_text())
+    started_epoch = float((root / 'job-start-epoch.txt').read_text())
+    started_ns = int((root / 'job-start-monotonic-ns.txt').read_text())
+    started = started_ns / 1_000_000_000
+    deadline_monotonic = started + 60
+    observed_monotonic = time.monotonic()
     observed = time.time()
-    admitted = observed <= deadline
+    admitted = observed_monotonic <= deadline_monotonic and observed <= deadline
     result = {
         'run_id': os.environ.get('GITHUB_RUN_ID'),
         'run_attempt': os.environ.get('GITHUB_RUN_ATTEMPT'),
         'scenario': os.environ.get('LAB_SCENARIO'),
         'stage': stage,
-        'job_start_epoch': started,
+        'job_start_epoch': started_epoch,
+        'job_start_monotonic_ns': started_ns,
         'required_analysis_start_deadline_epoch': deadline,
+        'required_analysis_start_deadline_monotonic': deadline_monotonic,
         'observed_epoch': observed,
-        'elapsed_seconds': round(observed - started, 3),
+        'observed_monotonic': observed_monotonic,
+        'elapsed_seconds': round(observed_monotonic - started, 6),
         'admitted': admitted,
         'pair_result': 'pending both matrix artifacts' if admitted else 'invalid readiness deadline exceeded',
     }
     target = root / f'analysis-readiness-{stage}.json'
     temporary = target.with_suffix('.json.tmp')
-    temporary.write_text(json.dumps(result, indent=2) + '\n')
+    if time.monotonic() > deadline_monotonic:
+        result['admitted'] = False
+        result['pair_result'] = 'invalid readiness deadline exceeded during record creation'
+    descriptor = os.open(temporary, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+    try:
+        payload = (json.dumps(result, indent=2) + '\n').encode()
+        view = memoryview(payload)
+        while view:
+            written = os.write(descriptor, view)
+            if written <= 0:
+                raise OSError('short readiness record write')
+            view = view[written:]
+        os.fsync(descriptor)
+    except BaseException:
+        try:
+            os.unlink(temporary)
+        except OSError:
+            pass
+        raise
+    finally:
+        os.close(descriptor)
     os.replace(temporary, target)
+    directory = os.open(root, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC)
+    try:
+        os.fsync(directory)
+    finally:
+        os.close(directory)
+    if time.monotonic() > deadline_monotonic:
+        result['admitted'] = False
+        result['pair_result'] = 'invalid readiness deadline exceeded after durable record'
+        late = target.with_suffix('.json.late.tmp')
+        late_descriptor = os.open(late, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+        try:
+            payload = (json.dumps(result, indent=2) + '\n').encode()
+            view = memoryview(payload)
+            while view:
+                written = os.write(late_descriptor, view)
+                if written <= 0:
+                    raise OSError('short late readiness record write')
+                view = view[written:]
+            os.fsync(late_descriptor)
+        finally:
+            os.close(late_descriptor)
+        os.replace(late, target)
+        directory = os.open(root, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC)
+        try:
+            os.fsync(directory)
+        finally:
+            os.close(directory)
     return result
 
 
