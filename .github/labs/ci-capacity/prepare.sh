@@ -21,8 +21,8 @@ prepare_finish() {
     mv "$root/prepare-status.txt.tmp" "$root/prepare-status.txt" 2>/dev/null || true
     printf '%s\t%s\texit=%s\n' "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" "$phase" "$status" \
       >> "$root/phase-journal.tsv" 2>/dev/null || true
-    if [[ -n "${recipe_root:-}" && -f "$recipe_root/readiness-gate.py" ]]; then
-      python3 "$recipe_root/readiness-gate.py" prepare-end "$root" \
+    if [[ -n "${recipe_root:-}" && -f "$recipe_root/readiness_gate.py" ]]; then
+      python3 "$recipe_root/readiness_gate.py" prepare-end "$root" \
         >> "$root/prepare-readiness.log" 2>&1 || true
     fi
   else

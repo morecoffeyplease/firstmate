@@ -32,14 +32,14 @@ def record_readiness(root, stage, deadline):
 
 def main():
     if len(sys.argv) not in (2, 3):
-        raise SystemExit('usage: readiness-gate.py pre-fixture | prepare-end <run-root>')
+        raise SystemExit('usage: readiness_gate.py pre-fixture | prepare-end <run-root>')
     if sys.argv[1] == 'prepare-end' and len(sys.argv) == 3:
         root = Path(sys.argv[2])
         job_start = float((root / 'job-start-epoch.txt').read_text())
         print(json.dumps(record_readiness(root, 'prepare-ended', job_start + 60), indent=2))
         return
     if sys.argv[1] != 'pre-fixture' or len(sys.argv) != 2:
-        raise SystemExit('usage: readiness-gate.py pre-fixture | prepare-end <run-root>')
+        raise SystemExit('usage: readiness_gate.py pre-fixture | prepare-end <run-root>')
     runner_temp = Path(os.environ['RUNNER_TEMP'])
     run_id = os.environ['GITHUB_RUN_ID']
     attempt = os.environ['GITHUB_RUN_ATTEMPT']

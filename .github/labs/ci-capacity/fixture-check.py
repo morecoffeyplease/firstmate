@@ -9,6 +9,7 @@ import sys
 import time
 from datetime import datetime, timezone
 from pathlib import Path
+from types import SimpleNamespace
 
 
 recipe = Path(__file__).resolve().parent
@@ -68,64 +69,54 @@ def run_tracer(name, owner_text, timeout=4, send_signal=None):
     write(step, 'owner.sh\n')
     stdout_path = output / 'owner.stdout'
     stderr_path = output / 'owner.stderr'
-    ready_path = output / 'tracer-ready.txt'
-    tracer_stdout = (output / 'tracer.stdout').open('wb')
-    tracer_stderr = (output / 'tracer.stderr').open('wb')
+    ready_path = output / 'controller-ready.txt'
     environment = os.environ.copy()
     environment.update({'TMPDIR': str(owner_tmp), 'CI': 'true',
                         'GITHUB_ACTIONS': 'true', 'LC_ALL': 'C'})
-    command = [python, str(recipe / 'capture-owner-buffers.py'),
-               '--owner-tmp', str(owner_tmp), '--destination', str(retained),
-               '--cwd', str(source), '--stdout', str(stdout_path),
-               '--stderr', str(stderr_path), '--ready', str(ready_path),
-               '--cleanup-deadline', str(time.time() + timeout),
-               '--owner-exit', str(output / 'owner-step.exit'),
-               '--', bash, '-e', str(step)]
+    command = [bash, '-e', str(step)]
     (output / 'command.json').write_text(json.dumps({
         'argv': command, 'cwd': str(source), 'TMPDIR': str(owner_tmp),
+        'controller': 'in-process trace_capture.run_capture',
         'environment': {'CI': 'true', 'GITHUB_ACTIONS': 'true', 'LC_ALL': 'C',
                         'FM_LINT_JOBS': 'unset', 'FM_LINT_TELEMETRY': 'unset'},
         'timeout_seconds': timeout, 'signal': send_signal,
     }, indent=2) + '\n')
-    process = subprocess.Popen(command, cwd=source, env=environment,
-                               stdout=tracer_stdout, stderr=tracer_stderr,
-                               start_new_session=True)
-    cleanup = {'term_sent': False, 'kill_group_sent': False}
-    try:
-        ready_deadline = time.monotonic() + min(timeout, 2)
-        while not ready_path.exists() and process.poll() is None and time.monotonic() < ready_deadline:
-            time.sleep(0.01)
-        if send_signal is not None:
-            if not ready_path.exists():
-                raise AssertionError(f'{name}: tracer readiness marker missing')
-            process.send_signal(send_signal)
-        try:
-            returncode = process.wait(timeout=timeout)
-        except subprocess.TimeoutExpired as error:
-            raise AssertionError(f'{name}: fixture exceeded {timeout}s') from error
-    finally:
-        if process.poll() is None:
-            process.send_signal(signal.SIGTERM)
-            cleanup['term_sent'] = True
-            try:
-                process.wait(timeout=1)
-            except subprocess.TimeoutExpired:
-                # This is only the private session created for this fixture case.
-                try:
-                    os.killpg(process.pid, signal.SIGKILL)
-                    cleanup['kill_group_sent'] = True
-                except ProcessLookupError:
-                    pass
-                process.wait(timeout=2)
-        cleanup['returncode'] = process.poll()
-        (output / 'cleanup.json').write_text(json.dumps(cleanup, indent=2) + '\n')
-        tracer_stdout.close()
-        tracer_stderr.close()
+    sys.path.insert(0, str(recipe))
+    from trace_capture import run_capture
+
+    owner_exec_seen = False
+
+    def record_exec(record):
+        nonlocal owner_exec_seen
+        owner_exec_seen = True
+        (output / 'owner-exec.json').write_text(json.dumps(record, indent=2) + '\n')
+
+    def requested_stop():
+        if send_signal is not None and owner_exec_seen:
+            return f'signal-{send_signal}'
+        if time.monotonic() >= analysis_deadline:
+            return 'analysis-deadline'
+        return None
+
+    analysis_deadline = time.monotonic() + timeout
+    args = SimpleNamespace(
+        owner_tmp=str(owner_tmp), destination=str(retained), cwd=str(source),
+        stdout=str(stdout_path), stderr=str(stderr_path), ready=str(ready_path),
+        cleanup_deadline=time.time() + timeout + 2, owner_exit=str(output / 'owner-step.exit'),
+        command=command, owner_script_path=str(owner), exec_deadline_epoch=time.time() + 60,
+        owner_exec_callback=record_exec, expected_signal_for_fixtures=True,
+    )
+    returncode, summary = run_capture(args, requested_stop)
+    if not ready_path.exists():
+        raise AssertionError(f'{name}: in-process controller readiness marker missing')
+    cleanup = {'controller': 'sole process owns tracee wait and cleanup',
+               'returncode': returncode, 'owner_wait': summary.get('owner_wait'),
+               'errors': summary.get('errors')}
+    (output / 'cleanup.json').write_text(json.dumps(cleanup, indent=2) + '\n')
     summary_path = retained / 'capture-summary.json'
-    summary = json.loads(summary_path.read_text()) if summary_path.exists() else None
-    (output / 'tracer-exit.txt').write_text(f'{returncode}\n')
-    if summary is None:
+    if not summary_path.exists():
         raise AssertionError(f'{name}: capture summary missing')
+    (output / 'controller-exit.txt').write_text(f'{returncode}\n')
     return case, output, returncode, summary
 
 
@@ -280,8 +271,8 @@ supervisor_output = supervisor_case / 'evidence'
 supervisor_source.mkdir(mode=0o700, parents=True)
 supervisor_recipe.mkdir(mode=0o700)
 supervisor_output.mkdir(mode=0o700)
-for filename in ('analysis-supervisor.py', 'capture-owner-buffers.py',
-                 'owned_child.py', 'cgroup-snapshot.py', 'readiness-gate.py'):
+for filename in ('analysis-supervisor.py', 'trace_capture.py', 'owned_child.py',
+                 'cgroup-snapshot.py', 'readiness_gate.py'):
     shutil.copy2(recipe / filename, supervisor_recipe / filename)
 write(supervisor_recipe / 'sample.sh', '''#!/usr/bin/env bash
 set -eu

@@ -1,7 +1,6 @@
 #!/usr/bin/env python3
 """Run and trace one lint owner, retaining its shard buffers before unlink."""
 
-import argparse
 import ctypes
 import errno
 import hashlib
@@ -44,6 +43,7 @@ SECCOMP_RET_TRACE = 0x7FF00000
 SECCOMP_RET_ALLOW = 0x7FFF0000
 PR_SET_SECCOMP = 22
 PR_SET_NO_NEW_PRIVS = 38
+PR_SET_PDEATHSIG = 1
 SECCOMP_MODE_FILTER = 2
 RESOLVE_NO_MAGICLINKS = 0x02
 RESOLVE_BENEATH = 0x08
@@ -82,7 +82,6 @@ class UserRegs(ctypes.Structure):
 
 
 libc = ctypes.CDLL(None, use_errno=True)
-stop_signal = None
 errors = []
 
 
@@ -128,8 +127,12 @@ def install_unlink_filter():
                           ctypes.byref(program)), 'PR_SET_SECCOMP')
 
 
-def tracee_exec(command, cwd, stdout_path, stderr_path):
+def tracee_exec(command, cwd, stdout_path, stderr_path, parent_pid):
     try:
+        check_call(libc.prctl(PR_SET_PDEATHSIG, signal.SIGKILL, 0, 0, 0),
+                   'PR_SET_PDEATHSIG')
+        if os.getppid() != parent_pid:
+            os._exit(125)
         if ptrace(PTRACE_TRACEME, 0) != 0:
             os._exit(125)
         os.kill(os.getpid(), signal.SIGSTOP)
@@ -158,7 +161,7 @@ def task_record(pid):
         status = Path(f'/proc/{pid}/status').read_text().splitlines()
         tgid = int(next(line.split()[1] for line in status if line.startswith('Tgid:')))
         pidfd = None if tgid != pid else os.pidfd_open(pid, 0)
-        return {'identity': identity, 'pidfd': pidfd, 'bootstrap': True}
+        return {'identity': identity, 'pidfd': pidfd, 'bootstrap': True, 'bound': True}
     except (OSError, AttributeError, IndexError) as error:
         raise TraceFailure(f'cannot bind traced child {pid} identity: {error}') from error
 
@@ -223,7 +226,9 @@ def normalized_candidate(pid, directory_fd, path_text, owner_root):
 
 
 def open_beneath(root_fd, relative):
-    how = OpenHow(os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW, 0,
+    # O_NONBLOCK makes a malicious or unexpected FIFO fail the following type
+    # check without hanging the sole controller before it can retain evidence.
+    how = OpenHow(os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW | os.O_NONBLOCK, 0,
                   RESOLVE_BENEATH | RESOLVE_NO_MAGICLINKS)
     result = libc.syscall(SYS_OPENAT2, root_fd, relative.encode(),
                           ctypes.byref(how), ctypes.sizeof(how))
@@ -253,7 +258,14 @@ def capture_target(pid, regs, owner_root, owner_fd, destination, held, events):
         os.close(descriptor)
         raise TraceFailure(f'target is not a regular file: {relative}')
     if relative in held:
+        previous = held[relative]
+        if (metadata.st_dev, metadata.st_ino) != (previous['dev'], previous['ino']):
+            os.close(descriptor)
+            raise TraceFailure(f'target identity changed during capture: {relative}')
         os.close(descriptor)
+        events.append({'pid': pid, 'syscall': 'unlinkat' if syscall_number == SYS_UNLINKAT else 'unlink',
+                       'path': relative, 'dev': metadata.st_dev, 'ino': metadata.st_ino,
+                       'opened_before_resume': True, 'already_retained': True})
         return
     target = destination / relative
     target.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
@@ -263,7 +275,7 @@ def capture_target(pid, regs, owner_root, owner_fd, destination, held, events):
                    'opened_before_resume': True})
 
 
-def copy_fd(descriptor, target):
+def copy_fd(descriptor, target, deadline):
     digest = hashlib.sha256()
     size = 0
     temporary = target.with_name(target.name + '.partial')
@@ -271,6 +283,8 @@ def copy_fd(descriptor, target):
     try:
         offset = 0
         while True:
+            if time.monotonic() >= deadline:
+                raise TimeoutError(f'evidence copy exceeded common finalization deadline: {target}')
             chunk = os.pread(descriptor, 1024 * 1024, offset)
             if not chunk:
                 break
@@ -288,8 +302,10 @@ def copy_fd(descriptor, target):
     return {'bytes': size, 'sha256': digest.hexdigest()}
 
 
-def capture_present_targets(owner_root, owner_fd, held):
+def capture_present_targets(owner_root, owner_fd, held, deadline):
     for current, directories, filenames in os.walk(owner_root, followlinks=False):
+        if time.monotonic() >= deadline:
+            raise TimeoutError('owner-buffer scan exceeded common finalization deadline')
         directories[:] = [name for name in directories
                           if not os.path.islink(os.path.join(current, name))]
         for filename in filenames:
@@ -312,17 +328,13 @@ def write_result(path, value):
     os.replace(temporary, path)
 
 
-def persist_owner_wait(destination, exit_path, owner_wait):
+def persist_owner_wait(destination, exit_path, owner_wait, owner_wait_path=None):
     write_result(destination / 'owner-step.wait.json', owner_wait)
+    if owner_wait_path is not None:
+        write_result(Path(owner_wait_path), owner_wait)
     temporary = exit_path.with_suffix(exit_path.suffix + '.tmp')
     temporary.write_text(f"{owner_wait['status']}\n")
     os.replace(temporary, exit_path)
-
-
-def mark_signal(signum, _frame):
-    global stop_signal
-    if stop_signal is None:
-        stop_signal = signum
 
 
 def wait_for_tracee(pid, flags):
@@ -332,18 +344,10 @@ def wait_for_tracee(pid, flags):
         return 0, 0
 
 
-def main():
-    parser = argparse.ArgumentParser()
-    parser.add_argument('--owner-tmp', required=True)
-    parser.add_argument('--destination', required=True)
-    parser.add_argument('--cwd', required=True)
-    parser.add_argument('--stdout', required=True)
-    parser.add_argument('--stderr', required=True)
-    parser.add_argument('--ready', required=True)
-    parser.add_argument('--cleanup-deadline', required=True, type=float)
-    parser.add_argument('--owner-exit', required=True)
-    parser.add_argument('command', nargs=argparse.REMAINDER)
-    args = parser.parse_args()
+def run_capture(args, stop_requested=None):
+    """Trace the owner synchronously inside the sole analysis controller."""
+    global errors
+    errors = []
     command = args.command[1:] if args.command and args.command[0] == '--' else args.command
     if not command or platform.system() != 'Linux' or platform.machine() != 'x86_64':
         raise TraceFailure('tracer requires a Linux x86_64 owner command')
@@ -351,24 +355,26 @@ def main():
     owner_fd = os.open(owner_root, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC)
     destination = Path(args.destination)
     destination.mkdir(mode=0o700, parents=True, exist_ok=True)
-    for signum in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP):
-        signal.signal(signum, mark_signal)
     Path(args.ready).write_text('ptrace-child-tracer-ready\n')
 
+    controller_pid = os.getpid()
     root_pid = os.fork()
     if root_pid == 0:
-        tracee_exec(command, args.cwd, args.stdout, args.stderr)
+        tracee_exec(command, args.cwd, args.stdout, args.stderr, controller_pid)
         os._exit(125)
 
-    tasks = {root_pid: task_record(root_pid)}
+    tasks = {}
     held = {}
     events = []
     owner_wait = None
     trace_error = None
     exec_seen = False
+    owner_exec = None
     security_attributes = None
     root_exit_seen = False
     orphan_term_started = None
+    controller_stop = None
+    controller_term_started = None
     cleanup_deadline = time.monotonic() + max(args.cleanup_deadline - time.time(), 0)
     tracer_self_before = resource.getrusage(resource.RUSAGE_SELF)
     tracer_children_before = resource.getrusage(resource.RUSAGE_CHILDREN)
@@ -380,20 +386,51 @@ def main():
             if waited != 0:
                 break
             time.sleep(0.01)
+        if waited == root_pid and (os.WIFEXITED(status) or os.WIFSIGNALED(status)):
+            owner_wait = {'kind': 'exit' if os.WIFEXITED(status) else 'signal',
+                          'status': os.waitstatus_to_exitcode(status),
+                          'raw_wait_status': status, 'owner_exec_observed': False}
+            root_exit_seen = True
+            persist_owner_wait(destination, Path(args.owner_exit), owner_wait,
+                               getattr(args, 'owner_wait', None))
         if waited != root_pid or not os.WIFSTOPPED(status) or os.WSTOPSIG(status) != signal.SIGSTOP:
             raise TraceFailure(f'owner bootstrap stop missing: wait={waited} status={status}')
         ptrace(PTRACE_SETOPTIONS, root_pid, 0, OPTIONS)
+        tasks[root_pid] = {'identity': None, 'pidfd': None, 'bootstrap': False,
+                           'bound': False}
+        tasks[root_pid] = task_record(root_pid)
         tasks[root_pid]['bootstrap'] = False
         ptrace(PTRACE_CONT, root_pid, 0, 0)
 
         while tasks:
-            if stop_signal is not None:
-                signal_targets = ([tasks[root_pid]] if root_pid in tasks
-                                  else list(tasks.values()))
-                for task in signal_targets:
-                    if task.get('pidfd') is not None and not task.get('signal_sent'):
-                        send_pidfd_signal(task, stop_signal)
-                        task['signal_sent'] = True
+            requested_stop = stop_requested() if stop_requested else None
+            if requested_stop and controller_stop is None:
+                controller_stop = requested_stop
+                controller_term_started = time.monotonic()
+                requested_signal = signal.SIGTERM
+                if requested_stop.startswith('signal-'):
+                    try:
+                        requested_signal = int(requested_stop.removeprefix('signal-'))
+                    except ValueError:
+                        raise TraceFailure(f'invalid controller signal request: {requested_stop}')
+                target_pid = (owner_exec or {}).get('pid', root_pid)
+                stop_task = tasks.get(target_pid)
+                if stop_task and stop_task.get('pidfd') is not None:
+                    send_pidfd_signal(stop_task, requested_signal)
+                elif stop_task and not stop_task.get('bound'):
+                    os.kill(target_pid, requested_signal)
+                events.append({'event': 'controller-stop', 'reason': requested_stop,
+                               'signal': requested_signal, 'target_pid': target_pid})
+                expected_signal = (controller_stop.startswith('signal-') and
+                                   getattr(args, 'expected_signal_for_fixtures', False))
+                if not expected_signal:
+                    errors.append(f'controller requested bounded stop: {controller_stop}')
+            if controller_stop and controller_term_started is not None:
+                if time.monotonic() >= min(controller_term_started + 2, cleanup_deadline):
+                    for task in list(tasks.values()):
+                        if task.get('pidfd') is not None and not task.get('controller_kill_sent'):
+                            send_pidfd_signal(task, signal.SIGKILL)
+                            task['controller_kill_sent'] = True
             live_tasks = {pid: task for pid, task in tasks.items() if task_is_live(pid, task)}
             if root_exit_seen and live_tasks:
                 now = time.monotonic()
@@ -422,7 +459,8 @@ def main():
                                   'raw_wait_status': status}
                     root_exit_seen = True
                     try:
-                        persist_owner_wait(destination, Path(args.owner_exit), owner_wait)
+                        persist_owner_wait(destination, Path(args.owner_exit), owner_wait,
+                                           getattr(args, 'owner_wait', None))
                     except OSError as error:
                         errors.append(f'persist owner exit before cleanup: {error}')
                 if task:
@@ -437,7 +475,8 @@ def main():
                                   'raw_wait_status': status, 'signal': signum}
                     root_exit_seen = True
                     try:
-                        persist_owner_wait(destination, Path(args.owner_exit), owner_wait)
+                        persist_owner_wait(destination, Path(args.owner_exit), owner_wait,
+                                           getattr(args, 'owner_wait', None))
                     except OSError as error:
                         errors.append(f'persist owner exit before cleanup: {error}')
                 if task:
@@ -464,8 +503,9 @@ def main():
                 child_pid = int(message.value)
                 if child_pid <= 0:
                     raise TraceFailure(f'ptrace birth event returned invalid pid {child_pid}')
-                tasks[child_pid] = task_record(child_pid)
-                tasks[child_pid]['bootstrap'] = True
+                tasks[child_pid] = {'identity': None, 'pidfd': None,
+                                    'bootstrap': True, 'bound': False}
+                tasks[child_pid].update(task_record(child_pid))
                 events.append({'event': 'birth', 'kind': event, 'parent': waited,
                                'child': child_pid})
                 ptrace(PTRACE_CONT, waited, 0, 0)
@@ -481,6 +521,64 @@ def main():
             if event == PTRACE_EVENT_EXEC and waited == root_pid:
                 exec_seen = True
             if event == PTRACE_EVENT_EXEC:
+                exec_message = ctypes.c_ulong()
+                ptrace(PTRACE_GETEVENTMSG, waited, 0, ctypes.byref(exec_message))
+                former_tid = int(exec_message.value)
+                if former_tid and former_tid != waited:
+                    former_task = tasks.pop(former_tid, None)
+                    displaced_task = tasks.pop(waited, None)
+                    if former_task is None:
+                        raise TraceFailure(
+                            f'non-leader exec remap references unowned tid {former_tid}'
+                        )
+                    if displaced_task and displaced_task.get('pidfd') is not None:
+                        former_task['pidfd'] = displaced_task['pidfd']
+                    else:
+                        former_task['pidfd'] = os.pidfd_open(waited, 0)
+                    former_task['identity'] = process_identity(waited)
+                    former_task['bound'] = True
+                    tasks[waited] = former_task
+                    task = former_task
+                    events.append({'event': 'exec-tid-remap', 'former_tid': former_tid,
+                                   'leader_pid': waited})
+                exec_epoch = time.time()
+                exec_argv = Path(f'/proc/{waited}/cmdline').read_bytes().split(b'\0')
+                exec_text = [item.decode('utf-8', 'replace') for item in exec_argv if item]
+                executable = os.path.realpath(f'/proc/{waited}/exe')
+                expected_executable = os.path.realpath(command[0])
+                if waited == root_pid:
+                    if executable != expected_executable or not any(
+                            os.path.realpath(item) == os.path.realpath(args.command[-1])
+                            for item in exec_text[1:] if item.startswith('/') ):
+                        raise TraceFailure(
+                            f'controller exec identity did not match the requested Actions step: '
+                            f'executable={executable}; argv={exec_text}'
+                        )
+                expected_owner = os.path.realpath(args.owner_script_path)
+                tracee_cwd = os.path.realpath(f'/proc/{waited}/cwd')
+                owner_script_seen = any(
+                    os.path.realpath(item if os.path.isabs(item)
+                                     else os.path.join(tracee_cwd, item)) == expected_owner
+                    for item in exec_text[1:] if not item.startswith('-')
+                )
+                if owner_script_seen and owner_exec is None:
+                    if executable != expected_executable:
+                        raise TraceFailure(
+                            f'lint owner interpreter changed unexpectedly: {executable}'
+                        )
+                    owner_exec = {'pid': waited, 'executable': executable,
+                                  'script': expected_owner, 'argv': exec_text,
+                                  'epoch': exec_epoch,
+                                  'utc': time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime(exec_epoch))}
+                    exec_deadline = getattr(args, 'exec_deadline_epoch', None)
+                    if exec_deadline is not None and exec_epoch > exec_deadline:
+                        raise TraceFailure(
+                            f'lint owner exec crossed the one-minute readiness boundary: '
+                            f'exec={exec_epoch:.6f}; deadline={exec_deadline:.6f}'
+                        )
+                    callback = getattr(args, 'owner_exec_callback', None)
+                    if callback:
+                        callback(owner_exec)
                 attributes = {}
                 for line in Path(f'/proc/{waited}/status').read_text().splitlines():
                     if line.startswith(('NoNewPrivs:', 'Seccomp:')):
@@ -507,18 +605,58 @@ def main():
     except BaseException as error:
         trace_error = f'{type(error).__name__}: {error}'
         errors.append(trace_error)
-        for task in list(tasks.values()):
+        if root_pid not in tasks and not root_exit_seen:
+            try:
+                os.kill(root_pid, signal.SIGKILL)
+                waited, status = wait_for_tracee(root_pid, WAIT_ALL | os.WNOHANG)
+                if waited == 0:
+                    ptrace(PTRACE_CONT, root_pid, 0, signal.SIGKILL)
+                    waited, status = wait_for_tracee(root_pid, 0)
+                if waited == root_pid and (os.WIFEXITED(status) or os.WIFSIGNALED(status)):
+                    owner_wait = {'kind': 'exit' if os.WIFEXITED(status) else 'signal',
+                                  'status': os.waitstatus_to_exitcode(status),
+                                  'raw_wait_status': status,
+                                  'owner_exec_observed': False}
+                    root_exit_seen = True
+                    try:
+                        persist_owner_wait(destination, Path(args.owner_exit), owner_wait,
+                                           getattr(args, 'owner_wait', None))
+                    except OSError as write_error:
+                        errors.append(f'persist bootstrap failure wait status: {write_error}')
+            except (ChildProcessError, OSError) as cleanup_error:
+                errors.append(f'bootstrap child cleanup/wait failed: {cleanup_error}')
+        for pid, task in list(tasks.items()):
             if task.get('pidfd') is not None:
                 try:
                     send_pidfd_signal(task, signal.SIGKILL)
                 except (OSError, TraceFailure) as signal_error:
                     errors.append(f'kill traced child: {signal_error}')
+            elif not task.get('bound'):
+                try:
+                    os.kill(pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
         while tasks and time.monotonic() < cleanup_deadline:
             waited, status = wait_for_tracee(-1, WAIT_ALL | os.WNOHANG)
             if waited == 0:
                 time.sleep(0.01)
                 continue
+            if waited == root_pid and owner_wait is None and (
+                    os.WIFEXITED(status) or os.WIFSIGNALED(status)):
+                owner_wait = {'kind': 'exit' if os.WIFEXITED(status) else 'signal',
+                              'status': os.waitstatus_to_exitcode(status),
+                              'raw_wait_status': status, 'owner_exec_observed': exec_seen}
+                root_exit_seen = True
+                try:
+                    persist_owner_wait(destination, Path(args.owner_exit), owner_wait,
+                                       getattr(args, 'owner_wait', None))
+                except OSError as write_error:
+                    errors.append(f'persist owner wait during failure cleanup: {write_error}')
             task = tasks.pop(waited, None)
+            if task is None and os.WIFSTOPPED(status):
+                errors.append(f'cleanup wait observed unbound traced pid {waited}')
+                task = {'pidfd': None, 'identity': None, 'bootstrap': False,
+                        'bound': False}
             if task and os.WIFSTOPPED(status):
                 try:
                     ptrace(PTRACE_CONT, waited, 0, signal.SIGKILL)
@@ -527,6 +665,8 @@ def main():
                     errors.append(f'resume killed tracee {waited}: {resume_error}')
             elif task and task.get('pidfd') is not None:
                 os.close(task['pidfd'])
+        if tasks:
+            errors.append(f'{len(tasks)} ptrace-owned task(s) remained at the common cleanup deadline')
         if root_pid not in tasks and owner_wait is None:
             try:
                 waited, status = wait_for_tracee(root_pid, WAIT_ALL | os.WNOHANG)
@@ -540,15 +680,21 @@ def main():
         tracer_self_after = resource.getrusage(resource.RUSAGE_SELF)
         tracer_children_after = resource.getrusage(resource.RUSAGE_CHILDREN)
         files = {}
+        for task in tasks.values():
+            if task.get('pidfd') is not None:
+                try:
+                    os.close(task['pidfd'])
+                except OSError as error:
+                    errors.append(f'close traced pidfd: {error}')
         try:
-            capture_present_targets(owner_root, owner_fd, held)
+            capture_present_targets(owner_root, owner_fd, held, cleanup_deadline)
         except (OSError, TraceFailure) as error:
             errors.append(f'capture still-present owner buffers: {error}')
         for relative, record in held.items():
             try:
                 target = destination / relative
                 files[relative] = {
-                    **copy_fd(record['fd'], target),
+                    **copy_fd(record['fd'], target, cleanup_deadline),
                     'dev': record['dev'], 'ino': record['ino'],
                 }
             except OSError as error:
@@ -558,12 +704,25 @@ def main():
                     os.close(record['fd'])
                 except OSError:
                     pass
+        if owner_wait is None:
+            try:
+                (Path(args.owner_exit)).write_text('unavailable\n')
+                unavailable_wait = {
+                    'status': None, 'reason': 'owner wait status unavailable',
+                    'trace_error': trace_error,
+                }
+                write_result(destination / 'owner-step.wait.json', unavailable_wait)
+                if getattr(args, 'owner_wait', None) is not None:
+                    write_result(Path(args.owner_wait), unavailable_wait)
+            except OSError as error:
+                errors.append(f'persist unavailable owner wait: {error}')
         summary = {
             'owner_tmp': owner_root,
             'owner_wait': owner_wait if exec_seen else None,
+            'owner_exec': owner_exec,
             'tracee_setup_wait': owner_wait if not exec_seen else None,
             'trace_error': trace_error,
-            'finalized': not errors and owner_wait is not None,
+            'finalized': not errors and owner_wait is not None and owner_exec is not None,
             'files': files,
             'unlink_events': events,
             'seccomp_event_count': seccomp_event_count,
@@ -578,6 +737,7 @@ def main():
             'errors': errors,
             'security_attributes': security_attributes,
             'tracing': 'own-child seccomp RET_TRACE + ptrace',
+            'controller_stop': controller_stop,
         }
         try:
             write_result(destination / 'capture-summary.json', summary)
@@ -587,16 +747,9 @@ def main():
         os.close(owner_fd)
 
     if errors or owner_wait is None:
-        return 125
-    if owner_wait['status'] < 0:
-        return 128 + abs(owner_wait['status'])
-    return owner_wait['status']
-
-
-if __name__ == '__main__':
-    try:
-        status = main()
-    except BaseException as error:
-        print(f'owner tracer failed: {type(error).__name__}: {error}', file=sys.stderr)
         status = 125
-    raise SystemExit(status)
+    elif owner_wait['status'] < 0:
+        status = 128 + abs(owner_wait['status'])
+    else:
+        status = owner_wait['status']
+    return status, summary

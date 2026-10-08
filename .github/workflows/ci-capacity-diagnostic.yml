@@ -139,7 +139,7 @@ jobs:
         timeout-minutes: 1
         env:
           LAB_SCENARIO: ${{ matrix.scenario }}
-        run: python3 .github/labs/ci-capacity/readiness-gate.py pre-fixture
+        run: python3 .github/labs/ci-capacity/readiness_gate.py pre-fixture
       - name: Run bounded Linux tracer fixtures
         id: fixtures
         if: steps.prepare.outcome == 'success' && steps.readiness.outcome == 'success'
