@@ -290,11 +290,16 @@ Route durable knowledge to its most specific owner:
 - Captain preferences shared across secondmate domains belong in the primary home's `data/captain-shared.md` under the `secondmate-provisioning` contract.
 - Fleet-local operational facts belong in curated, home-local `data/learnings.md`.
 - Task-scoped notes belong with the backlog item, and investigation findings belong in the scout report.
-- Knowledge useful to almost every contributor to one project belongs in that project's committed `AGENTS.md`.
+- Project-intrinsic agent guidance belongs in the project's committed `AGENTS.md`, with `CLAUDE.md` as its real `@AGENTS.md` import pointer.
+  Routine workers may correct existing guidance only when evidence shows it is factually wrong; missing guidance is not an error, and routine work does not add instructions, headings, or lesson pointers.
+  New project-specific findings stay with task evidence or an already-existing authoritative project destination; they do not by themselves authorize new `AGENTS.md` instructions.
+  Explicit human or task authorization may direct additions, and guarded manual initialization remains available.
 - Knowledge general to every firstmate user belongs in this repo's shared tracked surface.
 
 Firstmate never writes a project's `AGENTS.md` directly.
-A crewmate creates or updates it lazily through the project's selected delivery path, using `bin/fm-ensure-agents-md.sh` and preferring pointers to authoritative sources over copied detail.
+A crewmate corrects factually wrong existing project guidance through the selected delivery path, replacing the false wording and preserving unrelated content.
+Do not run `bin/fm-ensure-agents-md.sh` to make a correction: it may initialize the file or insert governance guidance, and missing project guidance is not a correction.
+Use the helper only for guarded manual initialization or when explicit human or task authorization directs an addition that needs its setup behavior.
 Keep fleet delivery posture and captain-private strategy out of project memory.
 When the captain invokes `/stow`, load the `stow` skill for its memory curation, knowledge routing, and persistence of the open work records this session is holding; it files and corrects only the open work that session is holding, and never reconciles the backlog against repository or PR reality.
 

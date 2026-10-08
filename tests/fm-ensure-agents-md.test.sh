@@ -43,7 +43,22 @@ test_created_agents_md_includes_self_governance() {
     "self-governance section lost rewrite-or-prune guidance"
   assert_grep "When updating this file, preserve this bar for all agents and keep entries concise." "$agents" \
     "self-governance section lost all-agents maintenance guidance"
+  assert_grep "Routine workers correct existing text only when evidence shows it is factually wrong" "$agents" \
+    "manual initialization skeleton omitted the corrections-only policy"
+  assert_no_grep "Add durable project-specific notes here as they are discovered through real work." "$agents" \
+    "manual initialization skeleton invites routine lesson additions"
   pass "fm-ensure-agents-md.sh: created AGENTS.md includes self-governance section"
+}
+
+test_help_reserves_helper_for_initialization_or_authorized_additions() {
+  local out
+  out=$("$ROOT/bin/fm-ensure-agents-md.sh" --help 2>&1) \
+    || fail "fm-ensure-agents-md.sh --help failed"
+  assert_contains "$out" "Use for guarded manual initialization or explicitly authorized additions" \
+    "helper help omitted its explicit-use boundary"
+  assert_contains "$out" "Do not run for a routine factual correction" \
+    "helper help does not warn against insertion during corrections"
+  pass "fm-ensure-agents-md.sh: public help reserves setup behavior for explicit use"
 }
 
 test_fresh_setup_writes_real_claude_pointer() {
@@ -416,6 +431,7 @@ test_lowercase_agents_md_refuses_case_fragile_pointer() {
 }
 
 test_created_agents_md_includes_self_governance
+test_help_reserves_helper_for_initialization_or_authorized_additions
 test_fresh_setup_writes_real_claude_pointer
 test_promoted_claude_md_includes_self_governance
 test_promoted_claude_md_without_trailing_newline_keeps_blank_separator

@@ -317,7 +317,7 @@ test_faster_paths_use_configured_authority_without_stacked_review() {
   pass "fm-brief.sh: faster paths use configured authority without stacked review"
 }
 
-# Pin the project-memory wording in the generated ship brief.
+# Pin the corrections-only project-memory policy in the generated ship brief.
 test_ship_project_memory_wording() {
   local home id brief
   home="$TMP_ROOT/project-memory-home"
@@ -326,13 +326,17 @@ test_ship_project_memory_wording() {
   FM_HOME="$home" "$ROOT/bin/fm-brief.sh" "$id" some-proj --mode direct-PR >/dev/null 2>&1
   brief="$home/data/$id/brief.md"
   assert_present "$brief" "brief was not scaffolded"
-  assert_grep "Record only project knowledge useful to almost every future session." "$brief" \
-    "project-memory contract lost the durable-knowledge bar"
-  assert_grep "prefer a pointer to the authoritative file, command, or doc over copying the detail" "$brief" \
-    "project-memory contract lost pointer-over-copy guidance"
-  assert_grep "follow \`$ROOT/bin/fm-ensure-agents-md.sh\`'s self-governance contract" "$brief" \
-    "project-memory contract no longer defers to the ensure helper"
-  pass "fm-brief.sh: ship project-memory wording carries the AGENTS.md authoring bar"
+  assert_grep "Routine work may change project \`AGENTS.md\`/\`CLAUDE.md\` guidance only to correct existing text that evidence shows is factually wrong" "$brief" \
+    "project-memory contract lost the factual-correction rule"
+  assert_grep "Missing guidance is not an error to correct" "$brief" \
+    "project-memory contract treats absent guidance as a defect"
+  assert_grep "do not add instructions, headings, lesson pointers, or run \`$ROOT/bin/fm-ensure-agents-md.sh\` for a correction" "$brief" \
+    "project-memory contract permits helper insertion during a correction"
+  assert_grep "Explicit human or task authorization may direct additions" "$brief" \
+    "project-memory contract lost the explicit-addition path"
+  assert_no_grep "If \`AGENTS.md\` or \`CLAUDE.md\` already exists" "$brief" \
+    "project-memory contract still runs the helper for every existing file"
+  pass "fm-brief.sh: ship brief renders corrections-only project memory policy"
 }
 
 test_herdr_lab_contract_is_explicit_and_complete() {

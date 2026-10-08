@@ -7,6 +7,9 @@
 # file present (unless it is already the canonical pointer), converts a correct
 # CLAUDE.md -> AGENTS.md symlink into the pointer file, and refuses to clobber
 # distinct real files or wrong symlinks.
+# Use this helper for guarded manual initialization or explicitly authorized
+# additions that need setup behavior, not for routine factual corrections: it
+# may create files or insert governance guidance when project guidance is absent.
 # Owns the canonical "## Maintaining this file" self-governance wording for
 # project AGENTS.md files, injecting it idempotently into created skeletons,
 # promoted CLAUDE.md files, and existing AGENTS.md files lacking both the exact
@@ -31,6 +34,10 @@ set -eu
 usage() {
   echo "usage: fm-ensure-agents-md.sh [repo-or-worktree-dir]" >&2
   cat >&2 <<'EOF'
+
+Use for guarded manual initialization or explicitly authorized additions that
+need setup behavior. Do not run for a routine factual correction: the helper
+may create files or insert governance guidance when project guidance is absent.
 
 To retain equivalent project-owned maintenance guidance without adding the
 canonical section, use this exact first line of AGENTS.md (LF or CRLF):
@@ -107,9 +114,9 @@ write_skeleton() {
   cat > "$AGENTS" <<'EOF'
 # Project agent memory
 
-This file is the project's committed home for project-intrinsic agent knowledge: build, test, release, architecture, and sharp-edge notes that should travel with the code.
+This file holds project agent guidance maintained by humans or explicitly authorized tasks.
+Routine workers correct existing text only when evidence shows it is factually wrong; missing guidance is not an error to correct.
 
-- Add durable project-specific notes here as they are discovered through real work.
 EOF
   ensure_maintenance_section
 }
