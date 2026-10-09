@@ -1190,7 +1190,7 @@ def summary_command(home: Path, argv: list[str]) -> int:
             print(json.dumps({"status": "pending", "requests": attached, "deduplicated": True, "supervisor_availability": availability}))
             return 0
         ident = f"{now}-{secrets.token_hex(6)}"
-        routes = project_routes(home, selected)
+        routes = summary_route_candidates(home, selected)
         initial_results = {name: ("unavailable" if routes[name].get("state") == "unavailable" else "pending")
                            for name in selected}
         initial_reasons = {name: routes[name].get("reason") for name in selected
@@ -1259,7 +1259,7 @@ def summary_command(home: Path, argv: list[str]) -> int:
             return 1
         selected = [name for name in record.get("projects", [])
                     if record.get("results", {}).get(name) == "pending"]
-        routes = project_routes(home, selected)
+        routes = summary_route_candidates(home, selected)
         for name in selected:
             route = routes.get(name, {})
             if route.get("route") == "main-home":
