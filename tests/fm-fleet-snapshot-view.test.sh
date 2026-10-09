@@ -10,6 +10,12 @@ SNAPSHOT="$ROOT/bin/fm-fleet-snapshot.sh"
 VIEW="$ROOT/bin/fm-fleet-view.sh"
 TMP_ROOT=$(fm_test_tmproot fm-fleet-snapshot)
 
+decision_json() {  # <question>
+  local path="$TMP_ROOT/decision-payload.json"
+  fm_test_captain_decision "$path" "$1"
+  jq -cS . "$path"
+}
+
 command -v jq >/dev/null 2>&1 || { echo "skip: jq not found"; exit 0; }
 
 make_fakebin() {  # <dir>
@@ -94,7 +100,9 @@ EOF
     "issue=https://github.com/kunchenguid/firstmate/issues/34" \
     "decision_keys=hold-a,hold-b" \
     "pr=https://github.com/kunchenguid/firstmate/pull/9"
-  printf 'needs-decision: choose an API shape\n' > "$home/state/ship-task.status"
+  local decision_file="$home/ship-task-decision.json"
+  fm_test_captain_decision "$decision_file" 'Choose an API shape'
+  printf 'needs-decision: %s\n' "$(jq -cS . "$decision_file")" > "$home/state/ship-task.status"
   # A working ship task proves it through its own semantic busy-state record
   # (bin/fm-busy-lib.sh), which is what the snapshot's current-state read
   # consults; rendered pane text is no longer a state source.
@@ -413,7 +421,7 @@ EOF
 }
 
 test_event_hints_follow_reconciled_current_state() {
-  local home fakebin out hint_gen
+  local home fakebin out hint_gen decision_file decision_json
   home=$(make_home event-hints)
   mkdir -p \
     "$home/projects/active-decision" \
@@ -428,7 +436,10 @@ test_event_hints_follow_reconciled_current_state() {
     "kind=ship" \
     "mode=ship"
   record_claude_idle "$home/state" active-decision
-  printf 'needs-decision: choose an API shape\n' > "$home/state/active-decision.status"
+  decision_file="$home/active-decision.json"
+  fm_test_captain_decision "$decision_file" 'Choose an API shape'
+  decision_json=$(jq -cS . "$decision_file")
+  printf 'needs-decision: %s\n' "$decision_json" > "$home/state/active-decision.status"
   fm_write_meta "$home/state/active-blocked.meta" \
     "window=firstmate:fm-active-blocked" \
     "worktree=$home/projects/active-blocked" \
@@ -448,7 +459,9 @@ test_event_hints_follow_reconciled_current_state() {
   hint_gen=$("$ROOT/bin/fm-busy-event.sh" arm "$home/state" stale-decision)
   "$ROOT/bin/fm-busy-event.sh" apply "$home/state" stale-decision busy --gen "$hint_gen" \
     --source claude-hook --event user-prompt-submit
-  printf 'needs-decision: already answered\n' > "$home/state/stale-decision.status"
+  decision_file="$home/stale-decision.json"
+  fm_test_captain_decision "$decision_file" 'Choose an API shape'
+  printf 'needs-decision: %s\n' "$(jq -cS . "$decision_file")" > "$home/state/stale-decision.status"
   fm_write_meta "$home/state/stale-blocked.meta" \
     "window=firstmate:fm-stale-blocked-ship-task" \
     "worktree=$home/projects/stale-blocked" \
@@ -791,7 +804,7 @@ test_open_decision_survives_later_unrelated_event() {
     "home=$home/secondmate-home" \
     "projects=alpha"
   # needs-decision opened, then two LATER unrelated events (no resolution).
-  printf 'needs-decision [key=race]: fix the reconcile-before-subscribe race\n' > "$home/state/masked-decision.status"
+  printf 'needs-decision [key=race]: %s\n' "$(decision_json 'Fix the reconcile-before-subscribe race')" > "$home/state/masked-decision.status"
   printf 'working: implementing an unrelated subsystem\n' >> "$home/state/masked-decision.status"
   printf 'done: an unrelated subtask finished\n' >> "$home/state/masked-decision.status"
   fakebin=$(make_fakebin "$home")
@@ -819,7 +832,7 @@ test_secondmate_open_decision_survives_live_endpoint() {
     "mode=secondmate" \
     "home=$home/secondmate-home" \
     "projects=alpha"
-  printf 'needs-decision [key=race]: choose ordering\n' > "$home/state/active-secondmate.status"
+  printf 'needs-decision [key=race]: %s\n' "$(decision_json 'Choose ordering')" > "$home/state/active-secondmate.status"
   fakebin=$(make_fakebin "$home")
   out=$(PATH="$fakebin:$PATH" FM_HOME="$home" "$SNAPSHOT" --json)
   printf '%s' "$out" | jq -e '
@@ -846,7 +859,7 @@ test_open_decision_transfers_to_captain_hold() {
     "mode=secondmate" \
     "home=$home/secondmate-home" \
     "projects=sample"
-  printf 'needs-decision [key=route]: choose a sample route\n' > "$home/state/transferred-decision.status"
+  printf 'needs-decision [key=route]: %s\n' "$(decision_json 'Choose a sample route')" > "$home/state/transferred-decision.status"
   printf 'captain-held [key=route]: tracked by transferred-decision-route\n' >> "$home/state/transferred-decision.status"
   fakebin=$(make_fakebin "$home")
   out=$(PATH="$fakebin:$PATH" FM_HOME="$home" "$SNAPSHOT" --json)
@@ -871,7 +884,7 @@ test_open_decision_clears_on_keyed_resolution() {
     "mode=secondmate" \
     "home=$home/secondmate-home" \
     "projects=alpha"
-  printf 'needs-decision [key=race]: fix the reconcile-before-subscribe race\n' > "$home/state/resolved-decision.status"
+  printf 'needs-decision [key=race]: %s\n' "$(decision_json 'Fix the reconcile-before-subscribe race')" > "$home/state/resolved-decision.status"
   printf 'done: an unrelated subtask finished\n' >> "$home/state/resolved-decision.status"
   printf 'resolved [key=race]: captain chose subscribe-then-reconcile\n' >> "$home/state/resolved-decision.status"
   fakebin=$(make_fakebin "$home")
@@ -893,7 +906,7 @@ test_open_decision_clears_on_keyed_resolution() {
 # must not linger as pending. Decisions come purely from the keyed fold reconciled
 # against the crew lifecycle; report prose never opens or reopens a decision.
 test_completed_scout_report_is_pointer_not_pending() {
-  local home fakebin out kind terminal id phase single mate single_state mate_state
+  local home fakebin out kind terminal id phase single mate single_state mate_state choice_payload reopen_payload
   home=$(make_home completed-scout)
   mkdir -p "$home/projects/scout-wt" "$home/data/lavish-103"
   fm_write_meta "$home/state/lavish-103.meta" \
@@ -905,7 +918,7 @@ test_completed_scout_report_is_pointer_not_pending() {
     "mode=scout"
   record_claude_idle "$home/state" lavish-103
   # Stale needs-decision, then the scout finished (done). No keyed resolution.
-  printf 'needs-decision: adopt approach A or B for Lavish issue 103\n' > "$home/state/lavish-103.status"
+  printf 'needs-decision: %s\n' "$(decision_json 'Adopt approach A or B for Lavish issue 103')" > "$home/state/lavish-103.status"
   printf 'done: report ready at data/lavish-103/report.md\n' >> "$home/state/lavish-103.status"
   # Completed report whose PROSE reads like the decision.
   printf '# Lavish 103\nThe open question is whether to adopt approach A or B.\nThis needs a captain decision. Recommendation: A.\n' > "$home/data/lavish-103/report.md"
@@ -924,6 +937,8 @@ test_completed_scout_report_is_pointer_not_pending() {
   home=$(make_home terminal-cleanup)
   mkdir -p "$home/projects/task"
   fakebin=$(make_fakebin "$home")
+  choice_payload=$(decision_json 'Choose a route')
+  reopen_payload=$(decision_json 'Choose a new route')
   for kind in ship scout secondmate; do
     for terminal in 'done' failed; do
       id="$kind-$terminal"
@@ -931,8 +946,8 @@ test_completed_scout_report_is_pointer_not_pending() {
         "window=firstmate:fm-$id" "worktree=$home/projects/task" \
         "kind=$kind" "harness=claude"
       record_claude_idle "$home/state" "$id"
-      printf 'blocked [key=access]: waiting\nneeds-decision [key=choice]: choose a route\n%s: final outcome\nnote: cleanup complete\n' \
-        "$terminal" > "$home/state/$id.status"
+      printf 'blocked [key=access]: waiting\nneeds-decision [key=choice]: %s\n%s: final outcome\nnote: cleanup complete\n' \
+        "$choice_payload" "$terminal" > "$home/state/$id.status"
     done
   done
   for phase in terminal reopened resolved; do
@@ -945,7 +960,7 @@ test_completed_scout_report_is_pointer_not_pending() {
       for terminal in 'done' failed; do
         id="$kind-$terminal"
         case "$phase" in
-          reopened) printf 'blocked [key=access]: reopened access\nneeds-decision [key=new-choice]: a new choice\nnote: more cleanup\n' >> "$home/state/$id.status" ;;
+          reopened) printf 'blocked [key=access]: reopened access\nneeds-decision [key=new-choice]: %s\nnote: more cleanup\n' "$reopen_payload" >> "$home/state/$id.status" ;;
           resolved) printf 'resolved [key=access]: access granted\nresolved [key=new-choice]: answered\nnote: final cleanup\n' >> "$home/state/$id.status" ;;
         esac
       done
@@ -985,7 +1000,7 @@ test_parked_scout_decision_stays_pending() {
     "kind=scout" \
     "mode=scout"
   record_claude_idle "$home/state" parked-scout
-  printf 'needs-decision [key=q1]: adopt approach A or B\n' > "$home/state/parked-scout.status"
+  printf 'needs-decision [key=q1]: %s\n' "$(decision_json 'Adopt approach A or B')" > "$home/state/parked-scout.status"
   fakebin=$(make_fakebin "$home")
   out=$(PATH="$fakebin:$PATH" FM_HOME="$home" "$SNAPSHOT" --json)
   printf '%s' "$out" | jq -e '
@@ -1001,7 +1016,7 @@ test_parked_scout_decision_stays_pending() {
 # in-flight children. They have no backlog rows, so they must not produce
 # unowned_current or terminal_in_flight. Ordinary crew/ship metas still do.
 test_home_summary_excludes_secondmate_from_child_inventory() {
-  local home fakebin out
+  local home fakebin out decision_file decision_json
   home=$(make_home summary-secondmate-only)
   mkdir -p "$home/secondmate-home" "$home/projects/unowned" "$home/projects/terminal"
   cat > "$home/data/backlog.md" <<'EOF'
@@ -1057,7 +1072,11 @@ EOF
     "kind=ship" \
     "mode=direct-PR"
   record_claude_idle "$home/state" unowned-ship
-  printf 'needs-decision [key=unowned-ship]: choose a route\n' > "$home/state/unowned-ship.status"
+  decision_file="$home/captain-decision.json"
+  fm_test_captain_decision "$decision_file" 'Which route should users take?'
+  decision_json=$(jq -cS . "$decision_file")
+  printf 'needs-decision [key=unowned-ship]: %s\n' "$decision_json" \
+    > "$home/state/unowned-ship.status"
   out=$(PATH="$fakebin:$PATH" FM_HOME="$home" "$SNAPSHOT" --secondmate-home-summary)
   printf '%s' "$out" | jq -e '
     .valid == false
@@ -1065,6 +1084,16 @@ EOF
       and (.reason | contains("unowned-ship=parked"))
       and (.reason | contains("mate=") | not)
   ' >/dev/null || fail "ordinary unowned ship must still produce unowned_current without listing the secondmate: $out"
+
+  printf 'needs-decision [key=unowned-ship]: incomplete route choice\n' \
+    > "$home/state/unowned-ship.status"
+  out=$(PATH="$fakebin:$PATH" FM_HOME="$home" "$SNAPSHOT" --json)
+  printf '%s' "$out" | jq -e '
+    .tasks[] | select(.id == "unowned-ship")
+    | .current_state.state == "blocked"
+      and .hints.blocked_event == true
+      and any(.hints.open_decisions[]; .verb == "decision-repair")
+  ' >/dev/null || fail "malformed captain decision did not remain a blocked repair diagnostic: $out"
 
   rm -f "$home/state/unowned-ship.meta" "$home/state/unowned-ship.status"
   cat > "$home/data/backlog.md" <<'EOF'
