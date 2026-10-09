@@ -753,6 +753,35 @@ EOF
   pass "context digest distinguishes ABSENT, empty-but-present, and populated files"
 }
 
+test_project_firstmate_digest_shows_ship_contract_on_start_and_reemit() {
+  local rec root home fakebin repo authority out reemit
+  rec=$(new_world project-ship-contract)
+  IFS='|' read -r root home fakebin <<EOF
+$rec
+EOF
+  make_fake_toolchain "$fakebin"
+  make_fake_ps_claude "$fakebin"
+  repo="$home/projects/alpha"
+  mkdir -p "$repo/ADRs"
+  : > "$repo/AGENTS.md"
+  : > "$repo/CLAUDE.md"
+  authority="sha256:$(printf '%s' "$home"$'\n''alpha'$'\n''sha256:'"$(printf '%064d' 0)" | shasum -a 256 | awk '{print $1}')"
+  printf 'schema=fm-project-firstmate.v1\nproject=alpha\nrepo_identity=sha256:%064d\nauthority_id=%s\nrepo_path=%s\n' \
+    0 "$authority" "$repo" > "$home/.fm-project-firstmate"
+
+  out=$(run_named_harness_session_start codex "$home" "$root" "$fakebin:$BASE_PATH")
+  assert_contains "$out" "PROJECT SHIP CONTRACT" "project Firstmate startup omitted the ship-contract section"
+  assert_contains "$out" "$repo/AGENTS.md" "project Firstmate startup omitted AGENTS.md pointer"
+  assert_contains "$out" "$repo/CLAUDE.md" "project Firstmate startup omitted CLAUDE.md pointer"
+  assert_contains "$out" "$repo/ADRs/" "project Firstmate startup omitted ADR directory pointer"
+
+  reemit=$(FM_HOME="$home" FM_ROOT_OVERRIDE="$root" FM_FAKE_HARNESS_PID=$$ PATH="$fakebin:$BASE_PATH" \
+    env -u CLAUDECODE -u PI_CODING_AGENT -u FM_PI_HARNESS -u GROK_AGENT "$SESSION_START" --reemit)
+  assert_contains "$reemit" "$repo/AGENTS.md" "project Firstmate re-emit omitted AGENTS.md pointer"
+  assert_contains "$reemit" "$repo/ADRs/" "project Firstmate re-emit omitted ADR pointer"
+  pass "project Firstmate ship-contract pointers appear for Codex startup and re-emit"
+}
+
 # --- lock refusal: read-only path --------------------------------------------
 
 test_lock_refusal_read_only_path() {
@@ -2649,6 +2678,7 @@ EOF
 }
 
 test_context_digest_absent_empty_present
+test_project_firstmate_digest_shows_ship_contract_on_start_and_reemit
 test_lock_refusal_read_only_path
 test_lock_write_failure_read_only_path
 test_trace_context_effective_state_is_frozen_after_lock

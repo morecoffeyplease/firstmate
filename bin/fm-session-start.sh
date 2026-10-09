@@ -949,6 +949,27 @@ print_file_or_absent "$DATA/captain.md" "data/captain.md"
 print_file_or_absent "$DATA/captain-shared.md" "data/captain-shared.md (shared, main-authoritative, read-only in secondmate homes)"
 print_file_or_absent "$DATA/learnings.md" "data/learnings.md"
 
+if [ -e "$FM_HOME/.fm-project-firstmate" ] || [ -L "$FM_HOME/.fm-project-firstmate" ]; then
+  # shellcheck source=bin/fm-repo-concurrency-lib.sh
+  . "$SCRIPT_DIR/fm-repo-concurrency-lib.sh"
+  if fm_repo_scope_marker_parse "$FM_HOME"; then
+    PROJECT_REPO="$FM_HOME/projects/$FM_REPO_SCOPE_PROJECT"
+    printf '\nPROJECT SHIP CONTRACT\n'
+    printf 'Registered repository: %s\n' "$PROJECT_REPO"
+    printf 'Before project work, read the repository shipping guidance below; re-read it after every context rebuild.\n'
+    for contract_file in AGENTS.md CLAUDE.md; do
+      if [ -f "$PROJECT_REPO/$contract_file" ]; then
+        printf '  %s\n' "$PROJECT_REPO/$contract_file"
+      fi
+    done
+    for contract_dir in ADRs ADR docs/ADRs docs/adr; do
+      if [ -d "$PROJECT_REPO/$contract_dir" ]; then
+        printf '  %s/\n' "$PROJECT_REPO/$contract_dir"
+      fi
+    done
+  fi
+fi
+
 # --- 9. closing reminder -----------------------------------------------
 stage next-step
 section "NEXT STEP"
