@@ -499,7 +499,7 @@ case "$JOBS" in
 esac
 
 SHARD_INDEX=
-if [ -n "$SHARD_SPEC" ]; then
+if [ "$SHARD_OPTION" -eq 1 ]; then
   case "$SHARD_SPEC" in
     1/4) SHARD_INDEX=0 ;;
     2/4) SHARD_INDEX=1 ;;

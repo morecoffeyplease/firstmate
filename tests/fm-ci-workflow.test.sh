@@ -135,6 +135,7 @@ CAPS
 
 test_lint_matrix_has_a_required_complete_gate() {
   ruby -ryaml -e '
+require "open3"
 jobs = YAML.load_file(ARGV[0]).fetch("jobs")
 shards = jobs.fetch("lint-shards")
 matrix = shards.fetch("strategy").fetch("matrix").fetch("shard")
@@ -144,8 +145,17 @@ gate = jobs.fetch("lint")
 raise "Lint gate must wait for every shard" unless gate.fetch("needs") == "lint-shards"
 raise "Lint gate must evaluate after shard failure" unless gate.fetch("if") == "always()"
 step = gate.fetch("steps").find { |item| item["name"] == "Require all four lint shards" }
-raise "Lint gate must reject every non-success matrix result" unless step && step.fetch("run").include?("SHARDS_RESULT\" != success")
+raise "Lint gate step is missing" unless step
 raise "Lint gate must consume the matrix result" unless step.fetch("env").fetch("SHARDS_RESULT").include?("needs.lint-shards.result")
+
+%w[success failure cancelled skipped].push("").each do |result|
+  _, _, status = Open3.capture3(
+    { "SHARDS_RESULT" => result },
+    "/bin/bash", "--noprofile", "--norc", "-e", "-o", "pipefail", "-c", step.fetch("run")
+  )
+  expected = result == "success" ? 0 : 1
+  raise "Lint gate returned #{status.exitstatus} for #{result.inspect}, expected #{expected}" unless status.exitstatus == expected
+end
 ' "$CI_WORKFLOW" || fail "lint matrix or aggregate completion contract changed"
   pass "the four lint shards report independently and the required Lint gate rejects incomplete results"
 }

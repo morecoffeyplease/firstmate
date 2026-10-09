@@ -347,6 +347,18 @@ SH
     [ "$rc" -eq 2 ] || fail "invalid shard CLI was accepted: $args (exit $rc)"
   done
 
+  for empty_option in equals separate; do
+    rc=0
+    if [ "$empty_option" = equals ]; then
+      (cd "$fixture" && PATH="$fakebin:$PATH" CI=true GITHUB_ACTIONS=true \
+        /bin/bash bin/fm-lint.sh --shard= >/dev/null 2>&1) || rc=$?
+    else
+      (cd "$fixture" && PATH="$fakebin:$PATH" CI=true GITHUB_ACTIONS=true \
+        /bin/bash bin/fm-lint.sh --shard "" >/dev/null 2>&1) || rc=$?
+    fi
+    [ "$rc" -eq 2 ] || fail "empty shard option was accepted via --shard $empty_option (exit $rc)"
+  done
+
   tiny="$tmp/tiny"
   mkdir -p "$tiny/bin" "$tiny/tests"
   cp "$LINT" "$tiny/bin/fm-lint.sh"

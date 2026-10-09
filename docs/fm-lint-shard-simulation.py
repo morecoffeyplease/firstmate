@@ -9,8 +9,8 @@ from dataclasses import dataclass
 from pathlib import Path
 
 ANALYZED_MERGE_SHA = "e8ab41d0a632bad4ce92967ccce9f26059d5ca28"
-EXPECTED_ROOTS = 415
-EXPECTED_BYTES = 13_375_129
+EXPECTED_ROOTS = 413
+EXPECTED_BYTES = 13_363_083
 
 
 @dataclass(frozen=True)
@@ -55,7 +55,7 @@ def read_profile(path: Path) -> list[Root]:
     if len({row[0] for row in rows}) != len(rows):
         raise ValueError("profile contains duplicate roots")
     if sum(row[1] for row in rows) != EXPECTED_BYTES:
-        raise ValueError("profile byte total does not match the analyzed Git tree")
+        raise ValueError("profile byte total does not match the retained replay inventory")
 
     ordered = sorted(rows, key=lambda row: canonical_key(row[0]))
     return [Root(*row, index) for index, row in enumerate(ordered)]

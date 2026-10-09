@@ -25,14 +25,15 @@ Both Codex and Claude use the same `bin/fm-lint.sh` owner and workflow invocatio
 
 ## Reproduce the prior profile estimate
 
-The measurement fixture `fm-lint-shard-measurements.tsv` contains one row for each of the 415 canonical roots at analyzed merge SHA `e8ab41d0a632bad4ce92967ccce9f26059d5ca28`.
-It records each root's Git blob byte size and observed wall time and maximum RSS from successful full-analysis run [37985969114](https://github.com/morecoffeyplease/firstmate/actions/runs/37985969114).
+The measurement fixture `fm-lint-shard-measurements.tsv` retains the 413 canonical roots present in this PR from the 415-root analysis at merge SHA `e8ab41d0a632bad4ce92967ccce9f26059d5ca28`.
+It records each retained root's Git blob byte size and observed wall time and maximum RSS from successful full-analysis run [37985969114](https://github.com/morecoffeyplease/firstmate/actions/runs/37985969114).
+The two historical rows for `bin/fm-stuck-board.sh` and `bin/fm-task-heartbeat.sh` were removed because those unrelated worker-monitoring files are not part of this PR's lint inventory.
 Run `python3 docs/fm-lint-shard-simulation.py` to reproduce the deterministic largest-byte-first, lowest-current-byte-load assignment used by the owner.
-The script rejects a mismatched merge SHA, duplicate root, wrong inventory size, or byte total that differs from the analyzed tree.
+The script rejects a mismatched source merge SHA, duplicate root, wrong retained inventory size, or unexpected retained byte total.
 
-The measured root-time simulation predicts shard durations of 8m44s, 10m46s, 8m29s, and 6m48s.
-These are estimates from roots measured under two-worker contention, not promises for one-worker hosted runs.
-The summed root work is 34m48s, approximately 1.82 times the 19m07s occupied time of the two-worker profile before repeated checkout, installs, auxiliary checks, queueing, and runner rounding.
+The measured root-time simulation predicts shard durations of 8m57s, 10m54s, 8m16s, and 6m35s, with 34m43s of summed root work.
+These estimates use wall times measured under two-worker contention and are not promises for one-worker hosted runs.
+The replay excludes the two unrelated roots while preserving each included root's original measured size, wall time, and RSS.
 The four-runner design consumes three additional concurrent job slots, and its actual dollar cost depends on the repository's Actions entitlement.
 
 ## Hosted validation evidence

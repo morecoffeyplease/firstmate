@@ -2,7 +2,7 @@
 # source_job=114008124443
 # measured_head=7de8fcb9405c4b7b3b177535dddbd882c96656dc
 # analyzed_merge_sha=e8ab41d0a632bad4ce92967ccce9f26059d5ca28
-# shellcheck=0.11.0; analysis=full; workers=2; roots=415
+# shellcheck=0.11.0; analysis=full; workers=2; roots=413
 path	blob_bytes	wall_seconds	max_rss_kib
 bin/backends/cmux.sh	34398	1.52	202472
 bin/backends/herdr.sh	196172	10.54	1042092
@@ -154,14 +154,12 @@ bin/fm-startup-memory-budget-lib.sh	7666	0.12	29256
 bin/fm-startup-memory-budget.sh	2931	0.18	35616
 bin/fm-startup-network.sh	29382	6.11	601772
 bin/fm-stow-cascade.sh	10013	6.40	670620
-bin/fm-stuck-board.sh	10968	3.13	400160
 bin/fm-subagent-pretool-check.sh	9857	0.11	28704
 bin/fm-supervise-daemon.sh	86411	18.20	1988332
 bin/fm-supervision-instructions.sh	8836	0.11	29892
 bin/fm-supervision-lib.sh	4670	0.05	23628
 bin/fm-supervisor-target-lib.sh	3654	0.03	17312
 bin/fm-tangle-lib.sh	2459	0.02	18384
-bin/fm-task-heartbeat.sh	1078	1.86	252744
 bin/fm-task-inbox-lib.sh	18857	0.28	50016
 bin/fm-tasks-axi-lib.sh	7759	0.10	28732
 bin/fm-tasks-axi.sh	4688	1.45	186144
