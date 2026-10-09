@@ -53,6 +53,115 @@ OBSERVER = br"""  fm_observer_receipt() {
   tmux -L "$TMUX_SOCKET" capture-pane -p -t "$TMUX_SESSION" -S -600 > "$FM_EVIDENCE_DIR/default-active-recapture.txt" 2> "$FM_EVIDENCE_DIR/default-active-recapture.stderr" || { rc=$?; fm_observer_receipt "$FM_EVIDENCE_DIR/default-active-recapture.exit" default-recapture-exit "$rc" || true; fail "active pane recapture unavailable"; }
   if tmux -L "$TMUX_SOCKET" capture-pane -a -p -t "$TMUX_SESSION" -S -600 > "$FM_EVIDENCE_DIR/default-alternate.txt" 2> "$FM_EVIDENCE_DIR/default-alternate.stderr"; then rc=0; else rc=$?; fi
   fm_observer_receipt "$FM_EVIDENCE_DIR/default-alternate.exit" default-alternate-exit "$rc" || fail "observer could not retain alternate capture exit"
+  if ! grep -Fq -- "CALM_E2E_OUTPUT" "$default_snapshot"; then
+    fm_viewport_polls=0
+    fm_viewport_index=0
+    fm_viewport_page_count=0
+    fm_viewport_top=unknown
+    fm_viewport_bottom=unknown
+    fm_viewport_marker=absent
+    fm_viewport_outcome=UNKNOWN
+    fm_viewport_candidate="$FM_EVIDENCE_DIR/viewport-poll.txt"
+    fm_viewport_stable="$FM_EVIDENCE_DIR/viewport-stable.txt"
+    fm_observer_receipt "$FM_EVIDENCE_DIR/viewport-diagnostic.started" viewport-diagnostic-started started || true
+    fm_viewport_wait() {
+      local previous=$1 destination=$2 allow_unchanged=$3 poll_limit=$4 polls=0 stable=0 changed=0 rc
+      while (( fm_viewport_polls < poll_limit )); do
+        ((fm_viewport_polls += 1))
+        ((polls += 1))
+        if timeout --signal=TERM --kill-after=1s 2s tmux -L "$TMUX_SOCKET" capture-pane -p -t "$TMUX_SESSION" > "$fm_viewport_candidate" 2> "$destination.stderr"; then
+          rc=0
+        else
+          rc=$?
+          fm_observer_receipt "$destination.capture.exit" viewport-capture-exit "$rc" || true
+          return 1
+        fi
+        if ! cmp -s -- "$fm_viewport_candidate" "$previous"; then changed=1; fi
+        if (( changed == 1 || allow_unchanged == 1 )); then
+          if [[ -f "$fm_viewport_stable" ]] && cmp -s -- "$fm_viewport_candidate" "$fm_viewport_stable"; then
+            ((stable += 1))
+          else
+            if ! cp -- "$fm_viewport_candidate" "$fm_viewport_stable"; then return 1; fi
+            stable=1
+          fi
+          if (( stable >= 2 )); then
+            if ! cp -- "$fm_viewport_candidate" "$destination"; then return 1; fi
+            fm_observer_receipt "$destination.capture.exit" viewport-capture-exit 0 || return 1
+            fm_observer_receipt "$destination.stable-polls" viewport-stable-polls "$polls" || return 1
+            return 0
+          fi
+        fi
+        sleep 0.05
+      done
+      fm_observer_receipt "$destination.capture.exit" viewport-capture-exit poll-budget-exhausted || true
+      return 1
+    }
+    if tmux -L "$TMUX_SOCKET" send-keys -t "$TMUX_SESSION" C-Home 2> "$FM_EVIDENCE_DIR/viewport-ctrl-home.stderr"; then
+      fm_observer_receipt "$FM_EVIDENCE_DIR/viewport-ctrl-home.exit" viewport-ctrl-home-exit 0 || true
+      if fm_viewport_wait "$default_snapshot" "$FM_EVIDENCE_DIR/viewport-frame-00-top.txt" 0 112; then
+        fm_viewport_index=1
+        if grep -Fq -- "Show a deterministic tool example." "$FM_EVIDENCE_DIR/viewport-frame-00-top.txt"; then
+          fm_viewport_top=visible
+        fi
+        if grep -Fq -- "CALM_E2E_OUTPUT" "$FM_EVIDENCE_DIR/viewport-frame-00-top.txt"; then
+          fm_viewport_marker=viewport-frame-00-top.txt
+        fi
+        while (( fm_viewport_index <= 16 && fm_viewport_polls < 112 )) && [[ "$fm_viewport_top" == visible && "$fm_viewport_bottom" != visible ]]; do
+          local_frame=$(printf '%02d' "$fm_viewport_index")
+          previous_frame=$(printf '%02d' "$((fm_viewport_index - 1))")
+          if grep -Fq -- "The deterministic tool example is complete." "$FM_EVIDENCE_DIR/viewport-frame-${previous_frame}-"*.txt 2>/dev/null; then
+            fm_viewport_bottom=visible
+            break
+          fi
+          if tmux -L "$TMUX_SOCKET" send-keys -t "$TMUX_SESSION" NPage 2> "$FM_EVIDENCE_DIR/viewport-npage-${local_frame}.stderr"; then
+            fm_observer_receipt "$FM_EVIDENCE_DIR/viewport-npage-${local_frame}.exit" viewport-npage-exit 0 || true
+          else
+            rc=$?
+            fm_observer_receipt "$FM_EVIDENCE_DIR/viewport-npage-${local_frame}.exit" viewport-npage-exit "$rc" || true
+            break
+          fi
+          previous_path="$FM_EVIDENCE_DIR/viewport-frame-${previous_frame}-$( [[ "$previous_frame" == 00 ]] && printf top || printf page ).txt"
+          current_path="$FM_EVIDENCE_DIR/viewport-frame-${local_frame}-page.txt"
+          if ! fm_viewport_wait "$previous_path" "$current_path" 0 112; then break; fi
+          fm_viewport_page_count=$((fm_viewport_page_count + 1))
+          fm_viewport_index=$((fm_viewport_index + 1))
+          if grep -Fq -- "CALM_E2E_OUTPUT" "$current_path" && [[ "$fm_viewport_marker" == absent ]]; then
+            fm_viewport_marker="$(basename "$current_path")"
+          fi
+          if grep -Fq -- "The deterministic tool example is complete." "$current_path"; then
+            fm_viewport_bottom=visible
+          fi
+        done
+      fi
+    else
+      rc=$?
+      fm_observer_receipt "$FM_EVIDENCE_DIR/viewport-ctrl-home.exit" viewport-ctrl-home-exit "$rc" || true
+    fi
+    if [[ "$fm_viewport_top" == visible && "$fm_viewport_bottom" == visible ]]; then
+      if [[ "$fm_viewport_marker" == absent ]]; then
+        fm_viewport_outcome=complete-traversal-marker-absent
+      else
+        fm_viewport_outcome=complete-traversal-marker-visible
+      fi
+    fi
+    fm_observer_receipt "$FM_EVIDENCE_DIR/viewport-traversal.status" viewport-traversal-status "outcome=$fm_viewport_outcome top=$fm_viewport_top bottom=$fm_viewport_bottom marker=$fm_viewport_marker pages=$fm_viewport_page_count polls=$fm_viewport_polls" || true
+    if tmux -L "$TMUX_SOCKET" send-keys -t "$TMUX_SESSION" C-End 2> "$FM_EVIDENCE_DIR/viewport-ctrl-end.stderr"; then
+      fm_observer_receipt "$FM_EVIDENCE_DIR/viewport-ctrl-end.exit" viewport-ctrl-end-exit 0 || true
+      if fm_viewport_wait "$default_snapshot" "$FM_EVIDENCE_DIR/viewport-restored-tail.txt" 1 120 && cmp -s -- "$default_snapshot" "$FM_EVIDENCE_DIR/viewport-restored-tail.txt"; then
+        fm_observer_receipt "$FM_EVIDENCE_DIR/viewport-restored-tail.status" viewport-restored-tail-status byte-identical-to-original-default-snapshot || true
+      else
+        fm_observer_receipt "$FM_EVIDENCE_DIR/viewport-restored-tail.status" viewport-restored-tail-status UNKNOWN || true
+        fm_viewport_outcome=UNKNOWN
+      fi
+    else
+      rc=$?
+      fm_observer_receipt "$FM_EVIDENCE_DIR/viewport-ctrl-end.exit" viewport-ctrl-end-exit "$rc" || true
+      fm_observer_receipt "$FM_EVIDENCE_DIR/viewport-restored-tail.status" viewport-restored-tail-status UNKNOWN || true
+      fm_viewport_outcome=UNKNOWN
+    fi
+    fm_observer_receipt "$FM_EVIDENCE_DIR/viewport-diagnostic.status" viewport-diagnostic-status "outcome=$fm_viewport_outcome top=$fm_viewport_top bottom=$fm_viewport_bottom marker=$fm_viewport_marker pages=$fm_viewport_page_count polls=$fm_viewport_polls" || true
+    rm -f -- "$fm_viewport_candidate" "$fm_viewport_stable"
+  fi
   fm_observer_receipt "$FM_EVIDENCE_DIR/default-checkpoint.reached" default-checkpoint-reached reached || fail "observer could not retain checkpoint completion"
 """
 OBSERVER_CLEANUP = br"""  fm_calm_capture_before_cleanup() {
