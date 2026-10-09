@@ -812,7 +812,7 @@ task_json_lines() {
         | (capture("^(?<key>[^\t]*)\t(?<verb>[^\t]*)\t(?<summary>.*)$")?)
         | select(. != null) ]')
     pending_decision=$(printf '%s' "$open_decisions_json" | jq 'if any(.[]; .verb == "needs-decision") then 1 else 0 end')
-    blocked_event=$(printf '%s' "$open_decisions_json" | jq 'if any(.[]; .verb == "blocked") then 1 else 0 end')
+    blocked_event=$(printf '%s' "$open_decisions_json" | jq 'if any(.[]; .verb == "blocked" or .verb == "decision-repair") then 1 else 0 end')
 
     endpoint_exists=null
     agent_alive=not_checked
@@ -1098,6 +1098,7 @@ secondmate_home_summary_json() {  # <backlog-json-file> <tasks-json-file> <produ
                    | index($invalidity.kind) | not))
        then "unknown"
        elif any($decisions_all[]; .verb == "needs-decision" or .verb == "captain-hold") then "captain_decision"
+       elif any($decisions_all[]; .verb == "decision-repair") then "decision_repair"
        elif ($active_all | length) > 0 then "active_child_work"
        elif ($holds_all | length) > 0 then "externally_held"
        else "no_active_work" end) as $state
@@ -1706,9 +1707,9 @@ parent_evidence_reconciliation_json() {  # <summary-json-file> <activities-json>
            $e + {verdict:"inconclusive",compared_to:null,matched:null}
          end ]) as $activity_results
     | ([ $decisions[] as $e
-         | if $e.verb == "needs-decision" then
+         | if $e.verb == "needs-decision" or $e.verb == "decision-repair" then
              ([ $summary.decisions_open[]
-                | select(.verb == "needs-decision")
+                | select(.verb == $e.verb)
                 | select(if ($e.key | keyed) then .key == $e.key else true end)
                 | {surface:"decisions_open",id,key,verb}]) as $matches
              | result($e; $matches;

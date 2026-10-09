@@ -917,19 +917,19 @@ command_hold() {
       existing_title=$(show_field_value "$show" title)
       [ "$existing_title" = "$title" ] || fail "existing task $id has a different title"
     fi
-    if [ -z "$decision" ] && [ -n "$until" ]; then
-      [ "$existing_hold_kind" = captain ] && [ "$existing_held" = yes ] \
-        || fail 'a deferred captain hold must preserve an existing structured captain decision'
+    if [ -z "$decision" ]; then
+      [ "$existing_hold_kind" = captain ] \
+        || fail 'a captain hold on existing work requires --decision-file unless an existing structured captain hold can be preserved'
       existing_decision=$(decode_shown_value "$(show_field "$show" body)") \
         || fail "could not decode the existing body for $id"
       existing_decision=$(printf '%s\n' "$existing_decision" | sed -n 's/^Captain decision record v1: //p' | head -1)
       [ -n "$existing_decision" ] \
-        || fail 'a deferred captain hold must preserve an existing structured captain decision'
+        || fail 'a captain hold without --decision-file must preserve an existing structured captain decision'
       decision_tmp=$(umask 077; mktemp "${TMPDIR:-/tmp}/fm-captain-decision.XXXXXX") \
         || fail 'cannot stage the existing captain decision record'
       if ! printf '%s\n' "$existing_decision" > "$decision_tmp" || ! fm_decision_validate "$decision_tmp"; then
         rm -f -- "$decision_tmp"
-        fail 'a deferred captain hold must preserve a valid structured captain decision'
+        fail 'a captain hold without --decision-file must preserve a valid structured captain decision'
       fi
       decision=$(fm_decision_compact "$decision_tmp") || { rm -f -- "$decision_tmp"; fail 'cannot serialize the existing captain decision'; }
       rm -f -- "$decision_tmp"

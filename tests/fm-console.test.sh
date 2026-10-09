@@ -21,6 +21,7 @@ python3 - "$ROOT" "$TMP" <<'PY'
 import json
 import datetime
 import ast
+import importlib.util
 import os
 import pathlib
 import re
@@ -32,6 +33,9 @@ import urllib.request
 
 repo = pathlib.Path(sys.argv[1])
 tmp = pathlib.Path(sys.argv[2])
+console_spec = importlib.util.spec_from_file_location("fm_console", repo / "bin" / "fm-console.py")
+console_module = importlib.util.module_from_spec(console_spec)
+console_spec.loader.exec_module(console_module)
 console_tree = ast.parse((repo / "bin" / "fm-console.py").read_text())
 query_assignment = next(node for node in console_tree.body if isinstance(node, ast.Assign) and any(isinstance(target, ast.Name) and target.id == "PR_QUERY" for target in node.targets))
 pr_query = ast.literal_eval(query_assignment.value)
@@ -65,6 +69,18 @@ decision = {"schema": "fm-captain-decision.v1", "question": "Which route should 
                         {"label": "B", "title": "Use the lighter route", "pros": ["Loads faster for guests."], "cons": ["Needs a short migration."]}],
             "recommended_option": "B", "recommendation": "Choose B because faster loading helps more guests join."}
 decision_line = "Captain decision record v1: " + json.dumps(decision, separators=(",", ":"), sort_keys=True)
+parity_cases = [decision]
+long_question = json.loads(json.dumps(decision))
+long_question["question"] = "q" * 1201
+parity_cases.append(long_question)
+long_pro = json.loads(json.dumps(decision))
+long_pro["options"][0]["pros"][0] = "p" * 1001
+parity_cases.append(long_pro)
+for candidate in parity_cases:
+    shell_valid = subprocess.run(["/bin/bash", "-c", '. "$1/fm-decision-lib.sh"; fm_decision_json_is_valid "$2"',
+                                  "fm-decision-parity", str(repo / "bin"), json.dumps(candidate)],
+                                 capture_output=True).returncode == 0
+    assert shell_valid == (console_module.parse_decision(candidate) is not None), candidate
 decision_input = tmp / "decision-input.json"
 decision_input.write_text(json.dumps(decision))
 event_env = {**os.environ, "FM_ROOT_OVERRIDE": str(repo), "FM_HOME": str(home), "FM_STATE_OVERRIDE": str(home / "state")}
@@ -72,6 +88,16 @@ event = subprocess.run([str(repo / "bin" / "fm-captain-hold.sh"), "decision-even
 assert event.returncode == 0, event.stderr
 event_line = (home / "state" / "worker.status").read_text().strip()
 assert event_line.startswith("needs-decision [key=route]: ") and json.loads(event_line.split(": ", 1)[1]) == decision
+fold = subprocess.run(["/bin/bash", "-c", '. "$1/fm-classify-lib.sh"; scan_open_decisions "$2"',
+                       "fm-decision-consumer", str(repo / "bin"), str(home / "state")],
+                      capture_output=True, text=True)
+assert fold.returncode == 0 and fold.stdout.strip() == "worker\troute\tneeds-decision\t" + json.dumps(decision, separators=(",", ":"), sort_keys=True), fold.stderr
+with (home / "state" / "worker.status").open("a") as status_log:
+    status_log.write("needs-decision [key=malformed]: Pick one\n")
+fold = subprocess.run(["/bin/bash", "-c", '. "$1/fm-classify-lib.sh"; scan_open_decisions "$2"',
+                       "fm-decision-consumer", str(repo / "bin"), str(home / "state")],
+                      capture_output=True, text=True)
+assert "worker\tmalformed\tdecision-repair\tPick one" in fold.stdout, fold.stdout
 invalid_input = tmp / "invalid-decision.json"
 invalid_input.write_text(json.dumps({"schema": "fm-captain-decision.v1", "question": "Pick one"}))
 refused = subprocess.run([str(repo / "bin" / "fm-captain-hold.sh"), "decision-event", "worker", "--key", "invalid", "--input-file", str(invalid_input)], env=event_env, capture_output=True, text=True)
@@ -148,7 +174,32 @@ snapshot_path.write_text(json.dumps(snapshot))
 mate_home = home / "projects" / "mate-home"
 mate_home.mkdir(parents=True)
 (mate_home / "state").mkdir()
+(mate_home / "data").mkdir()
+(mate_home / "bin").mkdir()
+(mate_home / "AGENTS.md").write_text("# Firstmate test secondmate\n")
 (mate_home / ".fm-secondmate-home").write_text("mate\n")
+mate_event_env = {**os.environ, "FM_ROOT_OVERRIDE": str(repo), "FM_HOME": str(mate_home),
+                  "FM_STATE_OVERRIDE": str(mate_home / "state")}
+mate_event = subprocess.run([str(repo / "bin" / "fm-captain-hold.sh"), "decision-event", "mate-child",
+                             "--key", "mate-route", "--input-file", str(decision_input)],
+                            env=mate_event_env, capture_output=True, text=True)
+assert mate_event.returncode == 0, mate_event.stderr
+mate_fold = subprocess.run(["/bin/bash", "-c", '. "$1/fm-classify-lib.sh"; scan_open_decisions "$2"',
+                            "fm-secondmate-decision-consumer", str(repo / "bin"), str(mate_home / "state")],
+                           capture_output=True, text=True)
+assert mate_fold.returncode == 0, mate_fold.stderr
+mate_task, mate_key, mate_verb, mate_summary = mate_fold.stdout.strip().split("\t", 3)
+assert (mate_task, mate_key, mate_verb, json.loads(mate_summary)) == ("mate-child", "mate-route", "needs-decision", decision)
+producer_value = {"tasks": [], "backlog": {"records": []}, "secondmate_current": {"records": [
+    {"id": "mate", "home": str(mate_home), "remote": False, "registered": True,
+     "active_children": [{"id": "mate-child", "name": "Guest route follow-up", "repo": "alpha"}],
+     "decisions_open": [{"id": mate_task, "key": mate_key, "verb": mate_verb,
+                         "summary": mate_summary, "target_task_id": mate_task}],
+     "queued": []}]}}
+producer_decisions = console_module.decisions(home, repo, producer_value)
+owned_decision = next(item for item in producer_decisions if item["owner"] == "mate")
+assert (owned_decision["task"], owned_decision["key"], owned_decision["answerable"]) == (
+    "mate-child", "mate-route", True), producer_decisions
 fake_gh = tmp / "fake-bin" / "gh"
 fake_gh.write_text(r'''#!/usr/bin/env python3
 import json, sys
@@ -203,7 +254,7 @@ print(json.dumps(out))
 fake_gh.chmod(0o755)
 capture = tmp / "send.txt"
 decisions_path = tmp / "decisions.tsv"
-decisions_path.write_text("worker\tdecision-a\tneeds-decision\t" + json.dumps(decision, separators=(",", ":")) + "\nworker\tlegacy\tneeds-decision\tChoose one\nmate\tcaptain-hold-mate-child-1\tneeds-decision\t" + json.dumps(decision, separators=(",", ":")) + "\n")
+decisions_path.write_text("worker\tdecision-a\tneeds-decision\t" + json.dumps(decision, separators=(",", ":")) + "\nworker\tlegacy\tdecision-repair\tChoose one\nmate\tcaptain-hold-mate-child-1\tneeds-decision\t" + json.dumps(decision, separators=(",", ":")) + "\n")
 hold_capture = tmp / "hold-capture.txt"
 env = {**os.environ, "PATH": f"{tmp / 'fake-bin'}:{os.environ['PATH']}", "FM_CONSOLE_FIXTURE": str(snapshot_path), "FM_CONSOLE_SEND_CAPTURE": str(capture), "FM_CONSOLE_HOLD_CAPTURE": str(hold_capture), "FM_CONSOLE_DECISIONS_FILE": str(decisions_path), "BROWSER": "/usr/bin/true"}
 snapshot_count = tmp / "snapshot-count"
@@ -232,7 +283,7 @@ try:
     decisions = data["decisions"]
     assert {(item["owner"], item["task"], item["key"], item["verb"]) for item in decisions} == {
         ("main", "worker", "decision-a", "needs-decision"),
-        ("main", "worker", "legacy", "needs-decision"),
+        ("main", "worker", "legacy", "decision-repair"),
         ("main", "worker", "held-call", "captain-hold"),
         ("mate", "mate-child", "mate-choice", "needs-decision"),
         ("mate", "mate-child", "mate-held", "captain-hold"),
@@ -247,6 +298,7 @@ try:
     assert {(work["kind"], work["url"]) for work in structured["work_links"]} == {
         ("issue", issue_url), ("pull request", pr_url)}
     assert legacy["answerable"] is False and legacy["decision"] is None
+    assert "this incoming event is retained for supervision" in page
     mate_decision = next(item for item in decisions if item["key"] == "mate-choice")
     assert mate_decision["project"] == "alpha" and mate_decision["task_title"] == "Guest route follow-up", mate_decision
     assert mate_decision["branch"] == "Unavailable", mate_decision

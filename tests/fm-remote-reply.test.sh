@@ -215,7 +215,8 @@ fm_pending_reply_mark_delivered "$PARENT/state" "$PENDING_CORR" \
   || fail "could not mark the pending-reply request delivered"
 {
   printf 'working [key=version-audit]: family --version audit complete (data/reply/prose-only.md)\n'
-  printf 'needs-decision [key=rough-cut-version]: implement --version or retire the tool\n'
+  printf 'needs-decision [key=rough-cut-version]: %s\n' \
+    '{"schema":"fm-captain-decision.v1","question":"Implement --version or retire the tool?","context":"The command has no version output today.","user_impact":"Users need to know which version they are running.","options":[{"label":"A","title":"Implement --version","pros":["Users can verify the installed version."],"cons":["The command gains a small maintenance surface."]},{"label":"B","title":"Retire the tool","pros":["There is no version behavior to maintain."],"cons":["Users lose this command."]}],"recommended_option":"A","recommendation":"Choose A because users need a reliable way to identify the installed command."}'
   printf 'done [corr=%s]: release chain audited\n' "$PENDING_CORR"
 } >> "$REMOTE/state/parent-replies.status"
 remote_env "$ROOT/bin/fm-procevent.sh" start "$SID" >/dev/null \

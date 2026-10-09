@@ -270,7 +270,7 @@ test_evidence_publication_failure_preserves_wake_for_redrain() {
     "$dir/bin/fm-afk-return.sh" begin 3< "$dir/read-only-output" >&3 2> "$dir/failed.err"
   rc=$?
   set -e
-  [ "$rc" -eq 3 ] || fail "evidence publication failure should retain catch-up (rc=$rc)"
+  [ "$rc" -eq 3 ] || fail "evidence publication failure should retain catch-up (rc=$rc): $(cat "$dir/failed.err")"
   [ -s "$dir/home/state/.fake-drain" ] || fail "publication failure removed the unhandled durable wake"
   [ ! -e "$dir/home/state/.fake-drain-acks" ] || fail "publication failure acknowledged the wake before delivery"
   [ -s "$gate" ] || fail "publication failure did not retain the catch-up gate"

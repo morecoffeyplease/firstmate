@@ -64,6 +64,10 @@ case $- in *u*) _fm_classify_nounset=on ;; *) _fm_classify_nounset=off ;; esac
 [ "$_fm_classify_nounset" = on ] || set +u
 unset _fm_classify_nounset
 
+# shellcheck source=bin/fm-decision-lib.sh
+# shellcheck disable=SC1091
+. "$_FM_CLASSIFY_LIB_DIR/fm-decision-lib.sh"
+
 # Captain-relevant status verbs. A status line carrying any of these is work
 # firstmate must see. Lines without these verbs are no-verb signals: the watcher
 # absorbs them only with positive provably-working evidence, while the daemon uses
@@ -195,7 +199,7 @@ status_is_terminal_verb() {
   [ -n "$line" ] || return 1
   verb=$(status_line_verb "$line")
   case "$verb" in
-    done|needs-decision|blocked|failed) return 0 ;;
+    done|needs-decision|decision-repair|blocked|failed) return 0 ;;
     *) return 1 ;;
   esac
 }
@@ -219,6 +223,11 @@ status_is_captain_relevant() {
       return 1
       ;;
   esac
+  if [ "$verb" = needs-decision ] \
+    && ! fm_decision_json_is_valid "$(status_line_note "$line")"; then
+    return 0
+  fi
+  [ "$verb" != decision-repair ] || return 0
   if [ -z "${FM_CAPTAIN_RE+x}" ]; then
     case "$verb" in
       done|needs-decision|blocked|failed) return 0 ;;
@@ -540,7 +549,7 @@ _fm_status_kind() {
 }
 
 _fm_decision_fold_line() {  # <open-set> <status-line> <resolve-verb> <held-verb> <kind>
-  local open=$1 line=$2 resolve=$3 held=$4 kind=$5 verb key note
+  local open=$1 line=$2 resolve=$3 held=$4 kind=$5 verb key note=''
   # Declaration guard. A transition's verb ends at a colon, or - in the colonless
   # form _fm_decision_key still accepts below - at a complete "[key=...]" token.
   # A line holding neither is continuation prose, a bare word, or blank, and can
@@ -556,16 +565,22 @@ _fm_decision_fold_line() {  # <open-set> <status-line> <resolve-verb> <held-verb
   case "$line" in
     *:*) case "$verb:$kind" in done:ship|done:scout|failed:ship|failed:scout) return 0 ;; esac ;;
   esac
+  if [ "$verb" = needs-decision ]; then
+    note=$(status_line_note "$line")
+    if ! fm_decision_json_is_valid "$note"; then
+      verb=decision-repair
+    fi
+  fi
   case "$verb" in
-    needs-decision|blocked|"$resolve"|"$held") ;;
+    needs-decision|decision-repair|blocked|"$resolve"|"$held") ;;
     *) printf '%s' "$open"; return 0 ;;
   esac
   key=$(_fm_decision_key "$line") || { printf '%s' "$open"; return 0; }
   _fm_decision_key_transition_allowed "$key" "$(status_line_note "$line")" \
     || { printf '%s' "$open"; return 0; }
   case "$verb" in
-    needs-decision|blocked)
-      note=$(status_line_note "$line")
+    needs-decision|decision-repair|blocked)
+      [ -n "$note" ] || note=$(status_line_note "$line")
       open=$(_fm_decision_drop "$open" "$key")
       [ -n "$open" ] && open="${open}"$'\n'
       open="${open}${key}"$'\t'"${verb}"$'\t'"${note}"$'\n'
@@ -601,7 +616,7 @@ status_open_decisions() {  # <status-file> [<kind>]
   while IFS= read -r line || [ -n "$line" ]; do
     status_line_verb "$line" verb
     case "$verb" in
-      needs-decision|blocked|done|failed|"$resolve"|"$held")
+      needs-decision|decision-repair|blocked|done|failed|"$resolve"|"$held")
         open=$(_fm_decision_fold_line "$open" "$line" "$resolve" "$held" "$kind")
         ;;
     esac
@@ -816,7 +831,7 @@ _fm_open_decisions_cursor_path() {  # <status-file>
 # Version 4 was already spent on the bracketed-tag parser change above, and a
 # cursor persisted under that reading predates this one, so it must still be
 # discarded and rebuilt from byte 0 under the new reading.
-FM_OPEN_DECISIONS_FOLD_VERSION=8
+FM_OPEN_DECISIONS_FOLD_VERSION=9
 
 # Portable device:inode identity for the rotation/recreation check below.
 _fm_open_decisions_file_ident() {  # <file> -> strongest available identity
@@ -1772,7 +1787,7 @@ EOF
 }
 
 _fm_status_open_decision_origins() {  # <status-file> [<kind>]
-  local f=$1 line open='' after key verb note number=0 origins=''
+  local f=$1 line open='' after key verb note open_verb number=0 origins=''
   local resolve held kind
   kind=$(_fm_status_kind "$f" "${2:-}")
   resolve=${FM_CLASSIFY_RESOLVE_VERB:-$FM_CLASSIFY_RESOLVE_VERB_DEFAULT}
@@ -1784,12 +1799,16 @@ _fm_status_open_decision_origins() {  # <status-file> [<kind>]
     key=$(_fm_decision_key "$line") || { open=$after; continue; }
     verb=$(status_line_verb "$line")
     note=$(status_line_note "$line")
+    open_verb=$verb
+    if [ "$verb" = needs-decision ] && ! fm_decision_json_is_valid "$note"; then
+      open_verb=decision-repair
+    fi
     case "$verb" in
-      needs-decision|blocked)
+      needs-decision|decision-repair|blocked)
         if _fm_open_set_has "$after" "$key" \
-          && [ "$(_fm_open_set_verb "$after" "$key")" = "$verb" ]; then
+          && [ "$(_fm_open_set_verb "$after" "$key")" = "$open_verb" ]; then
           case "$after" in
-            "$key"$'\t'"$verb"$'\t'"$note"|*$'\n'"$key"$'\t'"$verb"$'\t'"$note")
+            "$key"$'\t'"$open_verb"$'\t'"$note"|*$'\n'"$key"$'\t'"$open_verb"$'\t'"$note")
               origins=$(_fm_decision_origin_drop "$origins" "$key")
               [ -n "$origins" ] && origins="${origins}"$'\n'
               origins="${origins}${key}"$'\t'"${number}"
@@ -1848,7 +1867,7 @@ status_span_first_actionable_record() {  # <status-file> <start-offset> [record-
     status_is_captain_relevant "$line" || continue
     verb=$(status_line_verb "$line")
     case "$verb" in
-      needs-decision|blocked)
+      needs-decision|decision-repair|blocked)
         key=$(_fm_decision_key "$line") || {
           [ -n "$events" ] && events="${events} ; "
           events="${events}${line}"
@@ -1881,9 +1900,14 @@ $origins
 EOF
 )
         [ -n "$live_line" ] && [ "$((prefix_lines + line_number))" -eq "$live_line" ] || continue
-        [ -n "$events" ] && events="${events} ; "
-        events="${events}${line}"
-        if [ "$verb" = needs-decision ] || { [ "$verb" = blocked ] &&
+        if [ "$verb" = needs-decision ] && ! fm_decision_json_is_valid "$(status_line_note "$line")"; then
+          [ -n "$events" ] && events="${events} ; "
+          events="${events}decision-repair [key=$key]: malformed captain decision event requires repair"
+        else
+          [ -n "$events" ] && events="${events} ; "
+          events="${events}${line}"
+        fi
+        if { [ "$verb" = needs-decision ] && fm_decision_json_is_valid "$(status_line_note "$line")"; } || { [ "$verb" = blocked ] &&
           _fm_is_pending_reply_escalation "$key" "$(status_line_note "$line")"; }; then
           _fm_span_needs_decision=1
         fi

@@ -103,6 +103,14 @@ run_captain() {  # <home> <command args...>
     FM_CONFIG_OVERRIDE="$home/config" "$ROOT/bin/fm-captain-hold.sh" "$@"
 }
 
+run_captain_raw() {  # <home> <command args...>; never supplies fixture decision JSON
+  local home=$1
+  shift
+  PATH="$home/fakebin:$PATH" REAL_TASKS_AXI="$TASKS_AXI_BIN" \
+    FM_HOME="$home" FM_STATE_OVERRIDE="$home/state" FM_DATA_OVERRIDE="$home/data" \
+    FM_CONFIG_OVERRIDE="$home/config" "$ROOT/bin/fm-captain-hold.sh" "$@"
+}
+
 request_reconciles() {  # <home> <source-id> <task-id>...
   local home=$1 source_id=$2 id
   shift 2
@@ -1146,13 +1154,40 @@ EOF
 }
 
 test_new_deferred_holds_require_decisions_and_existing_holds_preserve_them() {
-  local home until id show existing_record
+  local home until id show existing_record before after
   home=$(make_home structured-deferrals)
+  tasks_in "$home" add queued-work "Existing queued work" --kind ship --repo sample >/dev/null \
+    || fail "could not add the existing queued task"
+  tasks_in "$home" add in-flight-work "Existing in-flight work" --kind ship --repo sample --start >/dev/null \
+    || fail "could not add the existing in-flight task"
+  for id in queued-work in-flight-work; do
+    before=$(cat "$home/data/backlog.md")
+    if run_captain_raw "$home" hold "$id" --reason "Choose a route" >"$home/$id.out" 2>"$home/$id.err"; then
+      fail "existing unstructured task $id was accepted as a captain hold"
+    fi
+    assert_grep 'requires --decision-file' "$home/$id.err" \
+      "existing task $id refusal did not explain the structured-decision requirement"
+    after=$(cat "$home/data/backlog.md")
+    [ "$after" = "$before" ] || fail "refused hold changed backlog bytes for $id"
+    show=$(tasks_in "$home" show "$id" --full)
+    assert_contains "$show" 'held: no' "refused hold changed existing task $id hold state"
+  done
   for until in 2000-01-01 "$(date -u +%Y-%m-%d)" 2999-12-31; do
+    id="existing-deferred-${until//-/}"
+    tasks_in "$home" add "$id" "Existing deferred work $until" --kind ship --repo sample >/dev/null \
+      || fail "could not add existing task $id for deferral validation"
+    before=$(cat "$home/data/backlog.md")
+    if run_captain_raw "$home" hold "$id" --reason "Captain needs to choose a route" \
+      --until "$until" >"$home/$id.out" 2>"$home/$id.err"; then
+      fail "existing unstructured task $id was accepted for deferral"
+    fi
+    assert_grep 'requires --decision-file' "$home/$id.err" \
+      "existing deferred task $id refusal did not explain the structured-decision requirement"
+    after=$(cat "$home/data/backlog.md")
+    [ "$after" = "$before" ] || fail "refused deferred hold changed backlog bytes for $id"
+
     id="unstructured-${until//-/}"
-    if PATH="$home/fakebin:$PATH" REAL_TASKS_AXI="$TASKS_AXI_BIN" FM_HOME="$home" \
-      FM_STATE_OVERRIDE="$home/state" FM_DATA_OVERRIDE="$home/data" FM_CONFIG_OVERRIDE="$home/config" \
-      "$ROOT/bin/fm-captain-hold.sh" hold "$id" --title "Choose a user route" \
+    if run_captain_raw "$home" hold "$id" --title "Choose a user route" \
       --reason "Captain needs to choose a route" --until "$until" >"$home/$id.out" 2>"$home/$id.err"; then
       fail "new unstructured captain hold with --until $until was accepted"
     fi
@@ -1162,17 +1197,39 @@ test_new_deferred_holds_require_decisions_and_existing_holds_preserve_them() {
     fi
   done
 
-  run_captain "$home" hold existing-structured --title "Choose the account route" \
-    --reason "Captain needs to choose the account route" --repo sample >/dev/null \
+  tasks_in "$home" add existing-unstructured-hold "Legacy captain hold" --kind captain --repo sample >/dev/null \
+    || fail "could not add existing unstructured captain task"
+  tasks_in "$home" hold existing-unstructured-hold --reason "Old captain call" --kind captain >/dev/null \
+    || fail "could not create the legacy unstructured captain hold fixture"
+  before=$(cat "$home/data/backlog.md")
+  if run_captain_raw "$home" hold existing-unstructured-hold --reason "Revisit legacy call" \
+    >"$home/existing-unstructured-hold.out" 2>"$home/existing-unstructured-hold.err"; then
+    fail "an existing unstructured captain hold was accepted without a replacement decision"
+  fi
+  assert_grep 'must preserve' "$home/existing-unstructured-hold.err" \
+    "existing unstructured captain hold refusal did not identify the invalid preservation record"
+  after=$(cat "$home/data/backlog.md")
+  [ "$after" = "$before" ] || fail "refused unstructured re-hold changed backlog bytes"
+
+  tasks_in "$home" add existing-structured "Choose the account route" --kind captain --repo sample >/dev/null \
+    || fail "could not add the existing structured captain task"
+  run_captain_raw "$home" hold existing-structured --reason "Captain needs to choose the account route" \
+    --decision-file "$DECISION_FILE" >/dev/null \
     || fail "could not create the existing structured captain hold"
   show=$(tasks_in "$home" show existing-structured --full)
   existing_record=$(printf '%s\n' "$show" | sed -n 's/^  body: .*Captain decision record v1: //p' | head -1)
   [ -n "$existing_record" ] || fail 'the initial captain hold did not retain its structured decision'
-  run_captain "$home" hold existing-structured --reason "Captain needs to revisit the account route" \
-    --until 2999-12-31 >/dev/null || fail 'an existing structured hold could not be deferred'
-  show=$(tasks_in "$home" show existing-structured --full)
-  printf '%s\n' "$show" | grep -F 'Captain decision record v1:' >/dev/null \
-    || fail 'deferring an existing structured hold removed its decision'
+  run_captain_raw "$home" hold existing-structured --reason "Captain needs to revisit the account route" \
+    >/dev/null || fail 'an existing structured hold could not be re-held without replacement JSON'
+  for until in 2000-01-01 "$(date -u +%Y-%m-%d)" 2999-12-31; do
+    run_captain_raw "$home" hold existing-structured --reason "Captain needs to revisit the account route" \
+      --until "$until" >/dev/null || fail "an existing structured hold could not be deferred to $until without replacement JSON"
+    show=$(tasks_in "$home" show existing-structured --full)
+    printf '%s\n' "$show" | grep -F 'Captain decision record v1:' >/dev/null \
+      || fail "deferring an existing structured hold to $until removed its decision"
+    after=$(printf '%s\n' "$show" | sed -n 's/^  body: .*Captain decision record v1: //p' | head -1)
+    [ "$after" = "$existing_record" ] || fail "deferring an existing structured hold to $until changed its decision record"
+  done
   pass 'new deferred holds require structured decisions for past, due, and future dates, and existing holds keep theirs'
 }
 

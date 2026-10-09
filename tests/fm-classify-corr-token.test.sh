@@ -28,6 +28,8 @@ DRAIN="$ROOT/bin/fm-wake-drain.sh"
 REPORT="$ROOT/bin/fm-secondmate-report.sh"
 
 TMP_ROOT=$(fm_test_tmproot fm-classify-corr-token-tests)
+DECISION_FILE="$TMP_ROOT/correlated-decision.json"
+fm_test_captain_decision "$DECISION_FILE" 'Which user outcome should continue?'
 
 # A syntactically valid correlation token payload: 16 hex characters.
 CORR=c44897ee2db4326b
@@ -109,7 +111,7 @@ test_token_is_read_through_in_every_position_it_is_written_in() {
   # The drain prints the default key as a bare verb, with no [key=...] segment.
   case "$view" in *'t3 blocked:'*) ;; *) fail "token with no key did not open the default key: $view" ;; esac
   case "$view" in *'t4'*'[key=twice]'*) ;; *) fail "two tokens on one line did not open: $view" ;; esac
-  case "$view" in *'t5 needs-decision:'*) ;; *) fail "the bracketed helper token did not open: $view" ;; esac
+  case "$view" in *'t5 decision-repair:'*) ;; *) fail "the malformed helper event was not retained as a repair diagnostic: $view" ;; esac
 
   # ...and each closes from the same position.
   printf 'resolved corr=%s [key=before]: closed\n' "$CORR" >> "$state/t1.status"
@@ -195,7 +197,7 @@ test_prose_and_malformed_tokens_never_become_transitions() {
   i=0
   for line in "${impostors[@]}"; do
     case "$view" in
-      *"close-$i [key=victim] needs-decision: a real captain decision"*) : ;;
+      *"close-$i [key=victim] decision-repair: a real captain decision"*) : ;;
       *) fail "an impostor closed a real decision: '$line' -> $view" ;;
     esac
     case "$view" in
@@ -530,8 +532,14 @@ EOF
   status_is_terminal_verb "$helper_line" \
     || fail "the helper's own line is not seen as a terminal captain verb"
 
-  FM_HOME="$mate" "$REPORT" --doc needs-decision "$corr" data/x/report.md "see the report" \
-    || fail "$REPORT failed writing a correlated doc-pointer report"
+  if FM_HOME="$mate" "$REPORT" --doc needs-decision "$corr" data/x/report.md "see the report" \
+    >"$TMP_ROOT/invalid-report.out" 2>"$TMP_ROOT/invalid-report.err"; then
+    fail "$REPORT accepted an unstructured correlated decision"
+  fi
+  assert_grep 'fm-decision: input must be a regular non-symlinked file' "$TMP_ROOT/invalid-report.err" \
+    "$REPORT did not identify the missing structured decision file"
+  FM_HOME="$mate" "$REPORT" --doc needs-decision "$corr" "$DECISION_FILE" \
+    || fail "$REPORT failed writing a correlated structured decision"
   helper_line=$(tail -1 "$state/pinned.status")
   verb=$(status_line_verb "$helper_line")
   [ "$verb" = needs-decision ] \

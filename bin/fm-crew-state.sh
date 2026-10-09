@@ -82,6 +82,7 @@ map_log_state() {  # <line>
   case "$(status_line_verb "$1")" in
     working)        echo working ;;
     needs-decision) echo parked ;;
+    decision-repair) echo blocked ;;
     blocked)        echo blocked ;;
     done)           echo "done" ;;
     failed)         echo failed ;;

@@ -508,7 +508,7 @@ collect_status_outcome_backstop_section() {  # <task-and-endpoint-snapshot>
     status_is_captain_relevant "$event" || continue
     verb=$(status_line_verb "$event")
     case "$verb" in
-      needs-decision|blocked)
+      needs-decision|decision-repair|blocked)
         key=$(_fm_decision_key "$event") || key=
         # Parseable decisions belong exclusively to the durable fold. That
         # includes reserved-key transitions the fold rejects; resurfacing one
@@ -537,7 +537,7 @@ collect_status_outcome_backstop_section() {  # <task-and-endpoint-snapshot>
     # this fix (issue #19 shape review point 1).
     lineno=
     case "$verb" in
-      needs-decision|blocked)
+      needs-decision|decision-repair|blocked)
         BACKSTOP_TOTAL_DECISIONS=$((BACKSTOP_TOTAL_DECISIONS + 1))
         _fm_drain_attach_append "[backstop-event] task $task $verb: $event"
         lineno=$_FM_DRAIN_ATTACH_LAST_LINE

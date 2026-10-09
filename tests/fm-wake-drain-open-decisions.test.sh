@@ -170,12 +170,12 @@ test_status_symlink_is_not_followed() {
 
   FM_STATE_OVERRIDE="$state" "$DRAIN" > "$out" || fail "drain failed with a symlinked status file"
 
-  grep -F 'local [key=local] needs-decision: keep this visible' "$out" >/dev/null \
-    || fail "the valid local decision did not surface alongside a rejected status symlink"
+  grep -F 'local [key=local] decision-repair: keep this visible' "$out" >/dev/null \
+    || fail "the malformed local event did not surface for repair alongside a rejected status symlink"
   if grep -F 'do not expose this' "$out" >/dev/null; then
     fail "the fleet scan followed a status symlink outside the state directory"
   fi
-  pass "the fleet-wide decision scan does not follow status symlinks"
+  pass "malformed events surface for repair and the fleet-wide decision scan does not follow status symlinks"
 }
 
 # Issue #19 shape review, Verdict B (data/rev25-astra/report.md): the routine
@@ -215,12 +215,12 @@ test_over_long_decision_note_is_capped_with_an_attachment_pointer() {
     || fail "no readable attachment path was printed for the over-long decision: $(cat "$out")"
   attach_line=${line##*'(full: L'}
   attach_line=${attach_line%')'}
-  [ "$(sed -n "${attach_line}p" "$attach_path")" = "[open-decision] task task-long [key=api-shape] needs-decision: $note" ] \
+  [ "$(sed -n "${attach_line}p" "$attach_path")" = "[open-decision] task task-long [key=api-shape] decision-repair: $note" ] \
     || fail "the attachment's referenced line did not hold the complete, byte-for-byte decision"
 
   printf 'needs-decision [key=short]: brief enough to keep whole\n' > "$state/task-short.status"
   FM_STATE_OVERRIDE="$state" "$DRAIN" > "$out" || fail "drain failed on a short decision note"
-  grep -F 'task-short [key=short] needs-decision: brief enough to keep whole' "$out" >/dev/null \
+  grep -F 'task-short [key=short] decision-repair: brief enough to keep whole' "$out" >/dev/null \
     || fail "a decision note already under the cap was altered"
   if grep -F 'brief enough to keep whole [truncated]' "$out" >/dev/null; then
     fail "a decision note already under the cap was marked truncated"
@@ -258,7 +258,7 @@ test_reopened_key_attachment_holds_the_current_note() {
   attach_path=$(grep -F 'full payloads:' "$out" | awk '{print $NF}' | sed 's/:1$//')
   [ -n "$attach_path" ] && [ -f "$attach_path" ] \
     || fail "no readable attachment path was printed for the reopened key: $(cat "$out")"
-  grep -qF "[open-decision] task multi [key=ambiguous] needs-decision: $note2" "$attach_path" \
+  grep -qF "[open-decision] task multi [key=ambiguous] decision-repair: $note2" "$attach_path" \
     || fail "the attachment did not hold the current (second) note in full"
   if grep -qF 'nnnnnnnnnn' "$attach_path"; then
     fail "the attachment held the superseded first note instead of only the current one"
@@ -292,7 +292,7 @@ test_many_oversized_decisions_stay_within_the_section_budget() {
     || fail "OPEN DECISIONS grew past its 4,000-byte budget with many oversized decisions: $section_bytes bytes"
   grep -F 'OPEN DECISIONS:' "$out" | grep -F 'more not previewed (byte cap)' >/dev/null \
     || fail "an over-budget section of oversized decisions did not report bounded omission: $(cat "$out")"
-  count=$(grep -c '^task-[0-9]* \[key=k\] needs-decision:' "$out")
+  count=$(grep -c '^task-[0-9]* \[key=k\] decision-repair:' "$out")
   [ "$count" -gt 0 ] && [ "$count" -lt 32 ] \
     || fail "unexpected number of individually-printed decisions: $count"
 
@@ -304,7 +304,7 @@ test_many_oversized_decisions_stay_within_the_section_budget() {
     || fail "the attachment did not hold all 32 decisions in full: $attach_lines lines"
   i=1
   while [ "$i" -le 32 ]; do
-    grep -qF "[open-decision] task task-$i [key=k] needs-decision:" "$attach_path" \
+    grep -qF "[open-decision] task task-$i [key=k] decision-repair:" "$attach_path" \
       || fail "task-$i's complete decision is missing from the attachment"
     i=$((i + 1))
   done
@@ -439,7 +439,7 @@ test_one_drain_publishes_one_shared_attachment() {
   [ "$file_count" = 1 ] \
     || fail "the drain left more than one attachment file behind: $file_count"
 
-  grep -qF '[open-decision] task task1 [key=k1] needs-decision: an open decision' "$path_open" \
+  grep -qF '[open-decision] task task1 [key=k1] decision-repair: an open decision' "$path_open" \
     || fail "the shared attachment is missing the open decision's complete payload"
   grep -qF '[backstop-event] task task2 blocked: blocked [key=bad/value]: a malformed-key backstop event' "$path_open" \
     || fail "the shared attachment is missing the backstop event's complete payload"
@@ -475,7 +475,7 @@ test_mixed_drain_each_section_points_at_its_own_first_line() {
 
   [ "$(sed -n "${backstop_lineno}p" "$attach_path")" = '[backstop-event] task task-backstop blocked: blocked [key=bad/value]: a malformed-key backstop event' ] \
     || fail "the backstop pointer's line did not hold the backstop event: $backstop_line"
-  [ "$(sed -n "${open_lineno}p" "$attach_path")" = '[open-decision] task task-open [key=k1] needs-decision: an open decision' ] \
+  [ "$(sed -n "${open_lineno}p" "$attach_path")" = '[open-decision] task task-open [key=k1] decision-repair: an open decision' ] \
     || fail "the OPEN DECISIONS pointer's line did not hold the open decision, not the backstop row: $open_line"
 
   pass "each section points at its own first line in the shared attachment, never the other section's row"

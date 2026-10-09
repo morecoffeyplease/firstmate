@@ -11,6 +11,10 @@ The command addresses the active home's configured data directory, so the existi
 It never reads report bodies, review artifacts, terminal output, or chat.
 
 The `hold` subcommand is the mandatory captain-hold creation path: it uses an existing task or creates one when nothing exists to hold, records its UTC hold-set timestamp as the leading line of the task body, then invokes the underlying tasks-axi hold operation and verifies both records.
+Before any backlog write, it requires a valid `fm-captain-decision.v1` record with a question, context, user impact, at least two lettered options with pros and cons, and a recommendation naming one available option.
+Re-holding an existing structured captain hold may preserve its validated decision, while an ordinary task or a legacy unstructured hold must receive a new valid decision before it can be held.
+The keyed `decision-event` command and correlated `needs-decision` reports enforce the same shape before publishing an event.
+The status fold validates that shape again, so malformed incoming or legacy events remain visible as `decision-repair` diagnostics and never open answerable captain decisions.
 Publishing the stamp first ensures a snapshot cannot observe a newly captain-held task without the timestamp that defines its age.
 Retries of an active hold preserve its hold-set timestamp, while re-holding released work starts a new timestamped lifecycle; a closed task is refused rather than reopened, and `--until` stores the captain's own deferral date through tasks-axi's date gate.
 

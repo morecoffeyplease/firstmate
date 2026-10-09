@@ -411,7 +411,7 @@ EOF
 
 render_return_brief() {  # <evidence-file> <blockers-file> <since-epoch>
   local evidence=$1 blockers=$2 since=$3 now record superseded superseded_at archive_dir stamp
-  local tag task key summary count routine captain live held_err last verb rows status
+  local tag task key summary question count routine captain live held_err last verb rows status
   now=$(date +%s)
   printf '=== Return brief'
   if [ -n "$since" ]; then
@@ -472,7 +472,9 @@ render_return_brief() {  # <evidence-file> <blockers-file> <since-epoch>
     while IFS="$(printf '\t')" read -r key verb summary; do
       [ "$verb" = needs-decision ] || continue
       count=$((count + 1))
-      printf '  - %s [key=%s] needs your decision: %s\n' "$task" "$key" "$(printf '%s' "$summary" | clean_field)"
+      question=$(printf '%s' "$summary" | jq -r 'if .schema == "fm-captain-decision.v1" and (.question | type == "string") then .question else empty end' 2>/dev/null || true)
+      [ -n "$question" ] || question=$summary
+      printf '  - %s [key=%s] needs your decision: %s\n' "$task" "$key" "$(printf '%s' "$question" | clean_field)"
     done <<EOF
 $(status_open_decisions "$status")
 EOF
