@@ -3683,9 +3683,9 @@ test_busy_pane_changing_hash_escalates_past_turn_age_bound() {
   pass "a busy worker whose pane hash changes every poll still escalates once its completed-turn age reaches the bound"
 }
 
-test_ticking_live_worker_with_missing_heartbeat_and_long_child_wakes_stuck_board() {
-  local dir state fakebin out ticks window id statusf sig gen pid queue output before hb_ts hb_note real_ps
-  dir=$(make_case stuck-board-ticking-long-command); state="$dir/state"; fakebin="$dir/fakebin"
+test_ticking_live_worker_with_missing_heartbeat_wakes_stuck_board() {
+  local dir state fakebin out ticks window id statusf sig gen pid queue output before hb_ts hb_note
+  dir=$(make_case stuck-board-ticking-no-heartbeat); state="$dir/state"; fakebin="$dir/fakebin"
   out="$dir/watch.out"; ticks="$dir/ticks"; id=stuck-ticking; window="test:fm-$id"
   statusf="$state/$id.status"
   printf 'window=%s\nkind=ship\nharness=claude\nworktree=%s/worktree\n' "$window" "$dir" \
@@ -3694,41 +3694,28 @@ test_ticking_live_worker_with_missing_heartbeat_and_long_child_wakes_stuck_board
   printf 'working: running the local test suite\n' > "$statusf"
   sig=$(seen_sig "$statusf"); printf '%s' "$sig" > "$state/.seen-${id}_status"
   echo $(( $(date +%s) - 5 )) > "$state/$id.started"
-  cat > "$fakebin/ps" <<'SH'
-#!/usr/bin/env bash
-if [ "$*" = '-axo pid=,ppid=,etime=,comm=,args=' ]; then
-  printf '1000 1 01:00:00 bash bash\n1001 1000 00:59:00 claude claude\n1002 1001 00:50:00 zsh zsh -c test-suite\n'
-else
-  exec "$FM_REAL_PS" "$@"
-fi
-SH
-  chmod +x "$fakebin/ps"
-  real_ps=$(command -v ps)
   gen=$("$ROOT/bin/fm-busy-event.sh" arm "$state" "$id")
   "$ROOT/bin/fm-busy-event.sh" apply "$state" "$id" busy --gen "$gen" \
     --source claude-hook --event turn-start
   touch "$state/.last-stuck-board"
 
   PATH="$fakebin:$PATH" FM_FAKE_TMUX_WINDOW="$window" FM_FAKE_TMUX_TICKS="$ticks" \
-    FM_FAKE_TMUX_PANE_PID=1000 FM_REAL_PS="$real_ps" FM_STATE_OVERRIDE="$state" FM_CHECK_INTERVAL=5 \
-    FM_STUCK_HEARTBEAT_SECS=1 FM_STUCK_PROGRESS_SECS=9999 FM_STUCK_COMMAND_SECS=1 \
-    FM_STUCK_DRAFT_PR_SECS=99999 FM_STUCK_REVIEW_SECS=99999 FM_STUCK_READY_PR_SECS=99999 \
-    FM_CHECK_TIMEOUT=20 FM_POLL=0.2 FM_SIGNAL_GRACE=1 FM_HEARTBEAT=999999 \
-    FM_CREW_STATE_BIN="$fakebin/fm-crew-state.sh" "$WATCH" > "$out" &
+    FM_STATE_OVERRIDE="$state" FM_CHECK_INTERVAL=5 FM_STUCK_HEARTBEAT_SECS=1 \
+    FM_STUCK_PROGRESS_SECS=9999 FM_STUCK_DRAFT_PR_SECS=99999 FM_STUCK_REVIEW_SECS=99999 \
+    FM_STUCK_READY_PR_SECS=99999 FM_CHECK_TIMEOUT=20 FM_POLL=0.2 FM_SIGNAL_GRACE=1 \
+    FM_HEARTBEAT=999999 FM_CREW_STATE_BIN="$fakebin/fm-crew-state.sh" "$WATCH" > "$out" &
   pid=$!
   wait_for_exit "$pid" 100 || {
     reap "$pid"
-    fail "the ticking busy worker with a long child command did not wake the stuck board (watcher=$(cat "$out" 2>/dev/null); state=$(find "$state" -maxdepth 1 -type f -print 2>/dev/null | tr '\n' ' '); triage=$(cat "$state/.watch-triage.log" 2>/dev/null))"
+    fail "the ticking worker with no heartbeat did not wake the stuck board (watcher=$(cat "$out" 2>/dev/null); state=$(find "$state" -maxdepth 1 -type f -print 2>/dev/null | tr '\n' ' '); triage=$(cat "$state/.watch-triage.log" 2>/dev/null))"
   }
   grep -F "stuck: $id heartbeat" "$out" >/dev/null \
     || fail "the missing worker heartbeat breach was not named: $(cat "$out")"
-  grep -F "stuck: $id long-command" "$out" >/dev/null \
-    || fail "the long child command breach was not named: $(cat "$out")"
   [ "$(cat "$ticks" 2>/dev/null || echo 0)" -gt 0 ] \
     || fail "the fake terminal did not change while the worker was busy"
   queue=$(cat "$state/.wake-queue" 2>/dev/null || true)
-  [ "$(printf '%s\n' "$queue" | grep -c 'stuck: stuck-ticking ' || true)" -ge 2 ] \
-    || fail "each stuck rule was not durably queued once: $queue"
+  printf '%s\n' "$queue" | grep -F "stuck: $id heartbeat" >/dev/null \
+    || fail "the heartbeat breach was not durably queued: $queue"
   reap "$pid"
 
   before=$(cat "$statusf")
@@ -3737,82 +3724,34 @@ SH
   IFS=$'\t' read -r hb_ts hb_note < "$state/$id.heartbeat"
   case "$hb_ts" in ''|*[!0-9]*) fail "the heartbeat record has no numeric timestamp" ;; esac
   [ "$hb_note" = "reviewing the test failure" ] || fail "the heartbeat record lost its one-line note"
-  output=$(PATH="$fakebin:$PATH" FM_REAL_PS="$real_ps" FM_FAKE_TMUX_PANE_PID=1000 FM_STATE_OVERRIDE="$state" FM_STUCK_HEARTBEAT_SECS=1 \
-    FM_STUCK_PROGRESS_SECS=9999 FM_STUCK_COMMAND_SECS=1 FM_STUCK_DRAFT_PR_SECS=99999 \
-    FM_STUCK_REVIEW_SECS=99999 FM_STUCK_READY_PR_SECS=99999 \
-    "$ROOT/bin/fm-stuck-board.sh" scan)
+  output=$(FM_STATE_OVERRIDE="$state" FM_STUCK_HEARTBEAT_SECS=1 \
+    FM_STUCK_PROGRESS_SECS=9999 FM_STUCK_DRAFT_PR_SECS=99999 FM_STUCK_REVIEW_SECS=99999 \
+    FM_STUCK_READY_PR_SECS=99999 "$ROOT/bin/fm-stuck-board.sh" scan)
   [ -z "$output" ] || fail "an active breach episode was reported more than once: $output"
-  pass "a watcher process-table fixture with Claude metadata, a ticking terminal, missing heartbeat, and long child command wakes its supervisor once per rule"
-}
-
-write_stuck_fake_ps() {  # <fakebin>
-  local fakebin=$1
-  cat > "$fakebin/ps" <<'SH'
-#!/usr/bin/env bash
-if [ "$*" = '-axo pid=,ppid=,etime=,comm=,args=' ]; then
-  cat "$FM_STUCK_PS_TABLE"
-else
-  exec "${FM_REAL_PS:-/bin/ps}" "$@"
-fi
-SH
-  chmod +x "$fakebin/ps"
+  pass "a changing terminal does not hide a missing heartbeat, and its breach is durably queued once"
 }
 
 stuck_scan() {  # <state> <fakebin> <env assignments...>
-  local state=$1 fakebin=$2 real_ps
+  local state=$1 fakebin=$2
   shift 2
-  real_ps=$(command -v ps)
-  PATH="$fakebin:$PATH" FM_REAL_PS="$real_ps" FM_STATE_OVERRIDE="$state" "$@" \
-    "$ROOT/bin/fm-stuck-board.sh" scan
+  PATH="$fakebin:$PATH" FM_STATE_OVERRIDE="$state" "$@" "$ROOT/bin/fm-stuck-board.sh" scan
 }
 
-test_stuck_board_ignores_idle_mcp_child_and_terminal_lane() {
-  local dir state fakebin id now output repo
+test_stuck_board_ignores_terminal_lanes_and_old_base_commits() {
+  local dir state fakebin id now output repo terminal
   dir=$(make_case stuck-board-negative-attribution); state="$dir/state"; fakebin="$dir/fakebin"
-  id=stuck-idle-mcp; now=$(date +%s)
-  printf 'window=test:fm-%s\nkind=scout\nharness=claude\n' "$id" > "$state/$id.meta"
-  printf '%s\tactive\n' "$now" > "$state/$id.heartbeat"
-  printf '%s\n' "$now" > "$state/$id.started"
-  printf 'working: waiting for MCP\n' > "$state/$id.status"
-  cat > "$dir/processes" <<'PS'
-2000 1 01:00:00 bash bash
-2001 2000 00:59:00 claude claude
-2002 2001 00:58:00 node node /worker/mcp-server.js
-PS
-  write_stuck_fake_ps "$fakebin"
-  cat > "$fakebin/tmux" <<'SH'
-#!/usr/bin/env bash
-case "$*" in
-  *stuck-idle-mcp*) printf '2000\n' ;;
-  *stuck-stopped*) printf '1000\n' ;;
-  *) exit 1 ;;
-esac
-SH
-  chmod +x "$fakebin/tmux"
-  output=$(FM_STUCK_PS_TABLE="$dir/processes" FM_FAKE_TMUX_PANE_PID=1000 \
-    FM_STUCK_HEARTBEAT_SECS=99999 FM_STUCK_PROGRESS_SECS=3600 FM_STUCK_COMMAND_SECS=1 \
-    FM_STUCK_DRAFT_PR_SECS=99999 FM_STUCK_REVIEW_SECS=99999 FM_STUCK_READY_PR_SECS=99999 \
-    stuck_scan "$state" "$fakebin")
-  [ -z "$output" ] || fail "an idle Claude worker's long-lived MCP process caused a breach: $output"
-
+  now=$(date +%s)
   id=stuck-stopped
-  printf 'window=test:fm-%s\nkind=scout\nharness=claude\n' "$id" > "$state/$id.meta"
+  printf 'kind=scout\nharness=claude\n' > "$state/$id.meta"
   printf '%s\n' "$((now - 7200))" > "$state/$id.started"
-  printf 'done: completed\n' > "$state/$id.status"
-  touch -t 202001010000 "$state/$id.status"
-  cat > "$dir/processes" <<'PS'
-1000 1 02:00:00 bash bash
-1001 1000 01:59:00 claude claude
-1002 1001 01:50:00 zsh zsh -c test-suite
-2000 1 01:00:00 bash bash
-2001 2000 00:59:00 claude claude
-2002 2001 00:58:00 node node /worker/mcp-server.js
-PS
-  output=$(FM_STUCK_PS_TABLE="$dir/processes" \
-    FM_STUCK_HEARTBEAT_SECS=1 FM_STUCK_PROGRESS_SECS=3600 FM_STUCK_COMMAND_SECS=1 \
-    FM_STUCK_DRAFT_PR_SECS=99999 FM_STUCK_REVIEW_SECS=99999 FM_STUCK_READY_PR_SECS=99999 \
-    stuck_scan "$state" "$fakebin")
-  [ -z "$output" ] || fail "a completed lane triggered heartbeat, no-progress, or long-command: $output"
+  for terminal in 'done' failed needs-decision blocked paused; do
+    printf '%s: terminal lane\n' "$terminal" > "$state/$id.status"
+    touch -t 202001010000 "$state/$id.status"
+    output=$(FM_STUCK_HEARTBEAT_SECS=1 FM_STUCK_PROGRESS_SECS=3600 \
+      FM_STUCK_DRAFT_PR_SECS=99999 FM_STUCK_REVIEW_SECS=99999 FM_STUCK_READY_PR_SECS=99999 \
+      stuck_scan "$state" "$fakebin")
+    [ -z "$output" ] || fail "a $terminal lane triggered active-worker rules: $output"
+  done
 
   id=stuck-fresh-lane
   repo="$dir/old-base"
@@ -3824,164 +3763,22 @@ PS
   printf 'kind=scout\nharness=codex\nworktree=%s\n' "$repo" > "$state/$id.meta"
   printf '%s\tfresh heartbeat\n' "$now" > "$state/$id.heartbeat"
   printf '%s\n' "$now" > "$state/$id.started"
-  output=$(FM_STUCK_PS_TABLE="$dir/processes" FM_STUCK_HEARTBEAT_SECS=9999 \
-    FM_STUCK_PROGRESS_SECS=3600 FM_STUCK_COMMAND_SECS=9999 FM_STUCK_DRAFT_PR_SECS=99999 \
-    FM_STUCK_REVIEW_SECS=99999 FM_STUCK_READY_PR_SECS=99999 \
+  output=$(FM_STUCK_HEARTBEAT_SECS=9999 FM_STUCK_PROGRESS_SECS=3600 \
+    FM_STUCK_DRAFT_PR_SECS=99999 FM_STUCK_REVIEW_SECS=99999 FM_STUCK_READY_PR_SECS=99999 \
     stuck_scan "$state" "$fakebin")
   [ -z "$output" ] || fail "a fresh lane inherited no-progress from its old base commit: $output"
   printf '%s\tfreshness expired\n' "$((now - 7200))" > "$state/$id.heartbeat"
   printf '%s\n' "$((now - 7200))" > "$state/$id.started"
-  output=$(FM_STUCK_PS_TABLE="$dir/processes" FM_STUCK_HEARTBEAT_SECS=99999 \
-    FM_STUCK_PROGRESS_SECS=3600 FM_STUCK_COMMAND_SECS=9999 FM_STUCK_DRAFT_PR_SECS=99999 \
-    FM_STUCK_REVIEW_SECS=99999 FM_STUCK_READY_PR_SECS=99999 \
+  output=$(FM_STUCK_HEARTBEAT_SECS=99999 FM_STUCK_PROGRESS_SECS=3600 \
+    FM_STUCK_DRAFT_PR_SECS=99999 FM_STUCK_REVIEW_SECS=99999 FM_STUCK_READY_PR_SECS=99999 \
     stuck_scan "$state" "$fakebin")
   printf '%s\n' "$output" | grep -F "stuck: $id no-progress" >/dev/null \
     || fail "an aged lane with an old base commit and heartbeat did not breach no-progress: $output"
-  pass "idle MCP children and completed lanes do not trigger active-worker stuck rules"
-}
-
-test_stuck_board_command_ownership_matrix() {
-  local dir state fakebin now output
-  dir=$(make_case stuck-board-command-ownership); state="$dir/state"; fakebin="$dir/fakebin"
-  now=$(date +%s)
-  # These fixtures match Codex and Claude process shapes captured with ps on 2026-10-09.
-  # They include Codex's shell-free npm-to-node command and long-lived tool helpers.
-  cat > "$dir/processes" <<'PS'
-1000 1 02:00:00 bash bash
-1001 1000 01:59:00 claude claude
-1002 1001 01:50:00 zsh zsh -c npm test
-1003 1002 01:49:00 npm npm test
-2000 1 02:00:00 bash bash
-2001 2000 01:59:00 codex codex
-2002 2001 01:50:00 npm npm exec vitest
-2003 2002 01:49:00 node node /repo/node_modules/.bin/vitest run
-3000 1 02:00:00 bash bash
-3001 3000 01:59:00 claude claude
-3002 3001 01:58:00 node node /worker/mcp-server.js
-3003 3001 01:58:00 node node /app/cua-repl.mjs
-3004 3001 01:58:00 node_repl node_repl
-3005 3001 01:58:00 codex-code-mode-host codex-code-mode-host
-4000 1 02:00:00 bash bash
-4001 4000 01:59:00 codex codex
-4002 4001 01:50:00 node node /repo/node_modules/.bin/vitest run
-5000 1 02:00:00 bash bash
-5001 5000 01:59:00 claude claude
-5002 5001 01:50:00 zsh zsh -c npm test
-5003 5002 01:49:00 npm npm test
-6000 1 02:00:00 bash bash
-6001 6000 01:59:00 codex codex
-6002 6001 01:50:00 node node /repo/node_modules/.bin/vitest run
-7000 1 02:00:00 bash bash
-7001 7000 01:59:00 claude claude
-7002 7001 01:50:00 zsh zsh -c test-suite
-8000 1 02:00:00 bash bash
-8001 8000 01:00:20 codex codex
-8002 8001 01:00:00 node node /repo/node_modules/.bin/vitest run
-PS
-  write_stuck_fake_ps "$fakebin"
-  cat > "$fakebin/tmux" <<'SH'
-#!/usr/bin/env bash
-case "$*" in
-  *claude-shell*) printf '1000\n' ;;
-  *idle-helper*) printf '3000\n' ;;
-  *codex-tmux*) printf '4000\n' ;;
-  *terminal-done*) printf '6000\n' ;;
-  *terminal-paused*) printf '7000\n' ;;
-  *early-command*) printf '8000\n' ;;
-  *) exit 1 ;;
-esac
-SH
-  cat > "$fakebin/herdr" <<'SH'
-#!/usr/bin/env bash
-case "$*" in
-  'pane process-info --pane pane-codex --session session-codex')
-    printf '{"result":{"type":"pane_process_info","process_info":{"pane_id":"pane-codex","shell_pid":2000}}}\n'
-    ;;
-  'pane process-info --pane pane-claude --session session-claude')
-    printf '{"result":{"type":"pane_process_info","process_info":{"pane_id":"pane-claude","shell_pid":5000}}}\n'
-    ;;
-  *) exit 64 ;;
-esac
-SH
-  chmod +x "$fakebin/tmux" "$fakebin/herdr"
-  printf 'window=test:fm-claude-shell\nkind=scout\nharness=claude\n' > "$state/claude-shell.meta"
-  printf 'window=test:fm-codex-herdr\nkind=scout\nharness=codex\nbackend=herdr\nherdr_session=session-codex\nherdr_pane_id=pane-codex\n' > "$state/codex-herdr.meta"
-  printf 'window=test:fm-codex-tmux\nkind=scout\nharness=codex\n' > "$state/codex-tmux.meta"
-  printf 'window=test:fm-claude-herdr\nkind=scout\nharness=claude\nbackend=herdr\nherdr_session=session-claude\nherdr_pane_id=pane-claude\n' > "$state/claude-herdr.meta"
-  printf 'window=test:fm-idle-helper\nkind=scout\nharness=claude\n' > "$state/idle-helper.meta"
-  printf 'window=test:fm-terminal-done\nkind=scout\nharness=codex\n' > "$state/terminal-done.meta"
-  printf 'window=test:fm-terminal-paused\nkind=ship\nharness=claude\n' > "$state/terminal-paused.meta"
-  printf 'window=test:fm-early-command\nkind=scout\nharness=codex\n' > "$state/early-command.meta"
-  for id in claude-shell codex-herdr codex-tmux claude-herdr idle-helper terminal-done terminal-paused early-command; do
-    printf '%s\tactive\n' "$now" > "$state/$id.heartbeat"
-    printf '%s\n' "$now" > "$state/$id.started"
-  done
-  printf 'working: running tests\n' > "$state/claude-shell.status"
-  printf 'working: running tests\n' > "$state/codex-herdr.status"
-  printf 'working: running tests\n' > "$state/codex-tmux.status"
-  printf 'working: running tests\n' > "$state/claude-herdr.status"
-  printf 'working: waiting for MCP\n' > "$state/idle-helper.status"
-  printf 'done: finished\n' > "$state/terminal-done.status"
-  printf 'paused: waiting for input\n' > "$state/terminal-paused.status"
-  printf 'working: running a test command started with the worker\n' > "$state/early-command.status"
-
-  output=$(FM_STUCK_PS_TABLE="$dir/processes" FM_FAKE_TMUX_PANE_PID=1000 \
-    FM_STUCK_HEARTBEAT_SECS=99999 FM_STUCK_PROGRESS_SECS=86400 FM_STUCK_COMMAND_SECS=60 \
-    FM_STUCK_DRAFT_PR_SECS=99999 FM_STUCK_REVIEW_SECS=99999 FM_STUCK_READY_PR_SECS=99999 \
-    FM_BACKEND_HERDR_CLIENT_SESSION=unused-session stuck_scan "$state" "$fakebin")
-  printf '%s\n' "$output" | grep -F 'stuck: claude-shell long-command' >/dev/null \
-    || fail "a retained shell running npm was not attributed to Claude: $output"
-  printf '%s\n' "$output" | grep -F 'stuck: codex-herdr long-command' >/dev/null \
-    || fail "a shell-free npm-to-node command was not attributed through Herdr: $output"
-  printf '%s\n' "$output" | grep -F 'stuck: codex-tmux long-command' >/dev/null \
-    || fail "a shell-free Node command was not attributed through tmux: $output"
-  printf '%s\n' "$output" | grep -F 'stuck: claude-herdr long-command' >/dev/null \
-    || fail "a retained-shell command was not attributed through Herdr: $output"
-  printf '%s\n' "$output" | grep -F 'stuck: early-command long-command' >/dev/null \
-    || fail "a command started within 30 seconds of its worker was not attributed: $output"
-  ! printf '%s\n' "$output" | grep -E 'stuck: (idle-helper|terminal-done|terminal-paused) long-command' >/dev/null \
-    || fail "an idle helper or terminal lane was attributed a command: $output"
-  pass "command ownership covers shell-hosted and shell-free Codex/Claude trees on tmux and Herdr, while excluding MCP helpers and terminal lanes"
-}
-
-test_stuck_board_supports_herdr_process_info() {
-  local dir state fakebin id now output
-  dir=$(make_case stuck-board-herdr-process-info); state="$dir/state"; fakebin="$dir/fakebin"
-  id=stuck-herdr; now=$(date +%s)
-  printf 'kind=scout\nharness=codex\nbackend=herdr\nherdr_session=test-session\nherdr_pane_id=pane-1\n' \
-    > "$state/$id.meta"
-  printf '%s\tbusy\n' "$now" > "$state/$id.heartbeat"
-  printf '%s\n' "$now" > "$state/$id.started"
-  printf 'working: running a long command\n' > "$state/$id.status"
-  cat > "$fakebin/herdr" <<'SH'
-#!/usr/bin/env bash
-printf '%s\n' "$*" >> "$FM_FAKE_HERDR_LOG"
-case "$*" in
-  'pane process-info --pane pane-1 --session test-session')
-    printf '{"result":{"type":"pane_process_info","process_info":{"pane_id":"pane-1","shell_pid":1000}}}\n'
-    ;;
-  *) exit 64 ;;
-esac
-SH
-  chmod +x "$fakebin/herdr"
-  cat > "$dir/processes" <<'PS'
-1000 1 01:00:00 bash bash
-1001 1000 00:59:00 codex codex
-1002 1001 00:50:00 zsh zsh -c long-test
-PS
-  write_stuck_fake_ps "$fakebin"
-  output=$(FM_FAKE_HERDR_LOG="$dir/herdr.log" FM_BACKEND_HERDR_CLIENT_SESSION=unused-session \
-    FM_STUCK_PS_TABLE="$dir/processes" FM_STUCK_HEARTBEAT_SECS=9999 \
-    FM_STUCK_PROGRESS_SECS=9999 FM_STUCK_COMMAND_SECS=1 FM_STUCK_DRAFT_PR_SECS=99999 \
-    FM_STUCK_REVIEW_SECS=99999 FM_STUCK_READY_PR_SECS=99999 \
-    stuck_scan "$state" "$fakebin")
-  [ "$output" = "stuck: $id long-command" ] \
-    || fail "Herdr pane process-info did not attribute its long command: $output (CLI=$(cat "$dir/herdr.log" 2>/dev/null))"
-  pass "Herdr pane process-info supports long-command detection through a read-only protocol fixture"
+  pass "all terminal lanes stay quiet, while no-progress ignores old base commits on fresh lanes"
 }
 
 test_stuck_board_handles_pr_boolean_empty_review_and_failed_reads() {
-  local dir state fakebin id now output review_marker ready_marker original_review original_ready
+  local dir state fakebin id now output review_marker ready_marker original_review original_ready original_progress
   dir=$(make_case stuck-board-pr-snapshot); state="$dir/state"; fakebin="$dir/fakebin"
   id=stuck-pr; now=$(date +%s)
   printf 'kind=ship\nharness=codex\npr=https://github.com/example/project/pull/12\n' \
@@ -4002,7 +3799,7 @@ SH
   printf '{"state":"OPEN","isDraft":false,"reviewDecision":"","headRefOid":"abc123","reviews":[]}\n' \
     > "$dir/pr.json"
   output=$(FM_FAKE_GH_JSON="$dir/pr.json" FM_STUCK_REVIEW_SECS=1 FM_STUCK_READY_PR_SECS=1 \
-    FM_STUCK_HEARTBEAT_SECS=9999 FM_STUCK_PROGRESS_SECS=9999 FM_STUCK_COMMAND_SECS=9999 \
+    FM_STUCK_HEARTBEAT_SECS=9999 FM_STUCK_PROGRESS_SECS=9999 \
     FM_STUCK_DRAFT_PR_SECS=99999 stuck_scan "$state" "$fakebin")
   [ "$output" = "$(printf 'stuck: %s review-wait\nstuck: %s ready-pr-wait' "$id" "$id")" ] \
     || fail "isDraft=false with an empty decision did not trigger the aged PR rules: $output"
@@ -4011,7 +3808,7 @@ SH
   printf 'abc123\t%s\n' "$now" > "$review_marker"
   printf 'abc123\t%s\n' "$now" > "$ready_marker"
   output=$(FM_FAKE_GH_JSON="$dir/pr.json" FM_STUCK_REVIEW_SECS=3600 FM_STUCK_READY_PR_SECS=3600 \
-    FM_STUCK_HEARTBEAT_SECS=9999 FM_STUCK_PROGRESS_SECS=9999 FM_STUCK_COMMAND_SECS=9999 \
+    FM_STUCK_HEARTBEAT_SECS=9999 FM_STUCK_PROGRESS_SECS=9999 \
     FM_STUCK_DRAFT_PR_SECS=99999 stuck_scan "$state" "$fakebin")
   [ -z "$output" ] || fail "PR rules breached before their head timers elapsed: $output"
 
@@ -4019,26 +3816,43 @@ SH
   printf '%s\n' "$original_ready" > "$ready_marker"
   output=$(FM_FAKE_GH_FAIL=1 FM_FAKE_GH_JSON="$dir/pr.json" FM_STUCK_REVIEW_SECS=1 \
     FM_STUCK_READY_PR_SECS=1 FM_STUCK_HEARTBEAT_SECS=9999 FM_STUCK_PROGRESS_SECS=9999 \
-    FM_STUCK_COMMAND_SECS=9999 FM_STUCK_DRAFT_PR_SECS=99999 stuck_scan "$state" "$fakebin")
+    FM_STUCK_DRAFT_PR_SECS=99999 stuck_scan "$state" "$fakebin")
   [ -z "$output" ] || fail "a failed GitHub read produced a false PR breach: $output"
   [ "$(cat "$review_marker")" = "$original_review" ] && [ "$(cat "$ready_marker")" = "$original_ready" ] \
     || fail "a failed GitHub read discarded previously observed PR timer state"
-  pass "PR rules preserve false isDraft, empty review decisions, below-threshold waits, and failed-read timers"
+
+  printf '%s\n' "$((now - 7200))" > "$state/$id.started"
+  printf '%s\tactive\n' "$now" > "$state/$id.heartbeat"
+  touch -t 202001010000 "$state/$id.status"
+  printf 'abc123\t%s\n' "$((now - 7200))" > "$state/.stuck-$id-progress-since"
+  original_progress=$(cat "$state/.stuck-$id-progress-since")
+  output=$(FM_FAKE_GH_FAIL=1 FM_FAKE_GH_JSON="$dir/pr.json" FM_STUCK_REVIEW_SECS=99999 \
+    FM_STUCK_READY_PR_SECS=99999 FM_STUCK_HEARTBEAT_SECS=9999 FM_STUCK_PROGRESS_SECS=3600 \
+    FM_STUCK_DRAFT_PR_SECS=99999 stuck_scan "$state" "$fakebin")
+  [ "$output" = "stuck: $id no-progress" ] \
+    || fail "a failed forge read did not evaluate local progress against last-good evidence: $output"
+  [ "$(cat "$state/.stuck-$id-progress-since")" = "$original_progress" ] \
+    || fail "a failed forge read changed the last successfully observed PR head timestamp"
+  pass "PR rules preserve empty decisions and failed-read timers, and no-progress keeps last-good remote evidence"
 }
 
-test_slow_forge_read_does_not_starve_later_local_stuck_breach() {
-  local dir state fakebin out slow late sig pid queue
+test_slow_forge_reads_do_not_starve_local_no_progress_breaches() {
+  local dir state fakebin out slow late sig pid queue now
   dir=$(make_case stuck-board-slow-forge); state="$dir/state"; fakebin="$dir/fakebin"
   out="$dir/watch.out"; slow=stuck-a-slow-forge; late=stuck-z-local-breach
+  now=$(date +%s)
   printf 'kind=scout\nharness=codex\npr=https://github.com/example/project/pull/13\n' \
     > "$state/$slow.meta"
-  printf '%s\tactive\n' "$(date +%s)" > "$state/$slow.heartbeat"
-  date +%s > "$state/$slow.started"
+  printf '%s\tactive\n' "$now" > "$state/$slow.heartbeat"
+  printf '%s\n' "$((now - 7200))" > "$state/$slow.started"
   printf 'working: polling review\n' > "$state/$slow.status"
+  touch -t 202001010000 "$state/$slow.status"
   sig=$(seen_sig "$state/$slow.status"); printf '%s' "$sig" > "$state/.seen-${slow}_status"
   printf 'kind=scout\nharness=codex\n' > "$state/$late.meta"
-  printf '%s\n' "$(( $(date +%s) - 100 ))" > "$state/$late.started"
+  printf '%s\tactive\n' "$now" > "$state/$late.heartbeat"
+  printf '%s\n' "$((now - 7200))" > "$state/$late.started"
   printf 'working: still active\n' > "$state/$late.status"
+  touch -t 202001010000 "$state/$late.status"
   sig=$(seen_sig "$state/$late.status"); printf '%s' "$sig" > "$state/.seen-${late}_status"
   cat > "$fakebin/gh" <<'SH'
 #!/usr/bin/env bash
@@ -4048,21 +3862,25 @@ SH
   touch -t 202001010000 "$state/.last-stuck-board"
 
   PATH="$fakebin:$PATH" FM_FAKE_TMUX_WINDOW='' FM_STATE_OVERRIDE="$state" \
-    FM_STUCK_HEARTBEAT_SECS=1 FM_STUCK_PROGRESS_SECS=9999 FM_STUCK_COMMAND_SECS=9999 \
+    FM_STUCK_HEARTBEAT_SECS=9999 FM_STUCK_PROGRESS_SECS=1 \
     FM_STUCK_DRAFT_PR_SECS=99999 FM_STUCK_REVIEW_SECS=99999 FM_STUCK_READY_PR_SECS=99999 \
     FM_CHECK_INTERVAL=1 FM_CHECK_TIMEOUT=1 FM_POLL=0.2 FM_SIGNAL_GRACE=1 FM_HEARTBEAT=999999 \
     FM_CREW_STATE_BIN="$fakebin/fm-crew-state.sh" "$WATCH" > "$out" &
   pid=$!
   wait_for_exit "$pid" 100 || { reap "$pid"; fail "the timeout-bounded stuck check did not surface its local breach"; }
-  grep -F "stuck: $late heartbeat" "$out" >/dev/null \
-    || fail "a slow earlier forge read starved a later task's local heartbeat breach: $(cat "$out")"
+  grep -F "stuck: $slow no-progress" "$out" >/dev/null \
+    || fail "a same-lane forge read blocked its local no-progress breach: $(cat "$out")"
+  grep -F "stuck: $late no-progress" "$out" >/dev/null \
+    || fail "an earlier hanging forge read starved a later lane's local no-progress breach: $(cat "$out")"
   grep -F "check: stuck-board:" "$out" >/dev/null \
     || fail "the timed-out network pass was not reported with the local breach: $(cat "$out")"
   queue=$(cat "$state/.wake-queue" 2>/dev/null || true)
-  printf '%s\n' "$queue" | grep -F "stuck: $late heartbeat" >/dev/null \
-    || fail "the local breach was not durably queued before the forge timeout: $queue"
+  printf '%s\n' "$queue" | grep -F "stuck: $slow no-progress" >/dev/null \
+    || fail "the same-lane local breach was not durably queued before the forge timeout: $queue"
+  printf '%s\n' "$queue" | grep -F "stuck: $late no-progress" >/dev/null \
+    || fail "the later-lane local breach was not durably queued before the forge timeout: $queue"
   reap "$pid"
-  pass "a slow forge timeout preserves local stuck breaches and wakes once with the check error"
+  pass "same-lane and earlier-lane forge timeouts preserve all local no-progress breaches"
 }
 
 test_repeated_identical_failure_breaches_once_per_episode() {
@@ -4075,25 +3893,25 @@ test_repeated_identical_failure_breaches_once_per_episode() {
   printf 'failed: test command timed out\nworking: retrying\nfailed: test command timed out\n' \
     > "$state/$id.status"
   output=$(FM_STATE_OVERRIDE="$state" FM_CONFIG_OVERRIDE="$config" \
-    FM_STUCK_HEARTBEAT_SECS=9999 FM_STUCK_PROGRESS_SECS=9999 FM_STUCK_COMMAND_SECS=9999 \
+    FM_STUCK_HEARTBEAT_SECS=9999 FM_STUCK_PROGRESS_SECS=9999 \
     FM_STUCK_DRAFT_PR_SECS=99999 FM_STUCK_REVIEW_SECS=99999 FM_STUCK_READY_PR_SECS=99999 \
     "$ROOT/bin/fm-stuck-board.sh" scan)
   [ "$output" = "stuck: $id repeated-failure" ] \
     || fail "two identical failures separated by progress did not breach: $output"
   output=$(FM_STATE_OVERRIDE="$state" FM_CONFIG_OVERRIDE="$config" \
-    FM_STUCK_HEARTBEAT_SECS=9999 FM_STUCK_PROGRESS_SECS=9999 FM_STUCK_COMMAND_SECS=9999 \
+    FM_STUCK_HEARTBEAT_SECS=9999 FM_STUCK_PROGRESS_SECS=9999 \
     FM_STUCK_DRAFT_PR_SECS=99999 FM_STUCK_REVIEW_SECS=99999 FM_STUCK_READY_PR_SECS=99999 \
     "$ROOT/bin/fm-stuck-board.sh" scan)
   [ -z "$output" ] || fail "a repeated failure episode was reported again: $output"
   printf 'working: retry underway\n' >> "$state/$id.status"
   output=$(FM_STATE_OVERRIDE="$state" FM_CONFIG_OVERRIDE="$config" \
-    FM_STUCK_HEARTBEAT_SECS=9999 FM_STUCK_PROGRESS_SECS=9999 FM_STUCK_COMMAND_SECS=9999 \
+    FM_STUCK_HEARTBEAT_SECS=9999 FM_STUCK_PROGRESS_SECS=9999 \
     FM_STUCK_DRAFT_PR_SECS=99999 FM_STUCK_REVIEW_SECS=99999 FM_STUCK_READY_PR_SECS=99999 \
     "$ROOT/bin/fm-stuck-board.sh" scan)
   [ -z "$output" ] || fail "clearing the failure episode emitted an unexpected breach: $output"
   printf 'failed: test command timed out\n' >> "$state/$id.status"
   output=$(FM_STATE_OVERRIDE="$state" FM_CONFIG_OVERRIDE="$config" \
-    FM_STUCK_HEARTBEAT_SECS=9999 FM_STUCK_PROGRESS_SECS=9999 FM_STUCK_COMMAND_SECS=9999 \
+    FM_STUCK_HEARTBEAT_SECS=9999 FM_STUCK_PROGRESS_SECS=9999 \
     FM_STUCK_DRAFT_PR_SECS=99999 FM_STUCK_REVIEW_SECS=99999 FM_STUCK_READY_PR_SECS=99999 \
     "$ROOT/bin/fm-stuck-board.sh" scan)
   [ "$output" = "stuck: $id repeated-failure" ] \
@@ -5846,12 +5664,10 @@ test_wedge_escalation_resets_when_pane_becomes_active
 test_busy_pane_below_turn_age_bound_is_absorbed
 test_busy_pane_stable_hash_escalates_past_turn_age_bound
 test_busy_pane_changing_hash_escalates_past_turn_age_bound
-test_ticking_live_worker_with_missing_heartbeat_and_long_child_wakes_stuck_board
-test_stuck_board_ignores_idle_mcp_child_and_terminal_lane
-test_stuck_board_command_ownership_matrix
-test_stuck_board_supports_herdr_process_info
+test_ticking_live_worker_with_missing_heartbeat_wakes_stuck_board
+test_stuck_board_ignores_terminal_lanes_and_old_base_commits
 test_stuck_board_handles_pr_boolean_empty_review_and_failed_reads
-test_slow_forge_read_does_not_starve_later_local_stuck_breach
+test_slow_forge_reads_do_not_starve_local_no_progress_breaches
 test_repeated_identical_failure_breaches_once_per_episode
 test_busy_pane_turn_end_touch_resets_age
 test_busy_pane_native_progress_resets_age

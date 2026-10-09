@@ -3454,7 +3454,7 @@ fm_backend_clear_transition "$BACKEND" "$STATE" "$T" || true
 remove_pr_poll_artifacts "$STATE" "$ID" || exit 1
 retire_busy_state "$STATE" "$ID" "$BUSY_GEN" || exit 1
 status_retire_presentation_task "$STATE" "$ID" || exit 1
-for stuck_rule in heartbeat no-progress long-command missing-draft-pr review-wait ready-pr-wait repeated-failure; do
+for stuck_rule in heartbeat no-progress missing-draft-pr review-wait ready-pr-wait repeated-failure; do
   rm -f -- "$STATE/.stuck-$ID-$stuck_rule"
 done
 for stuck_signal in push progress review ready; do

@@ -21,7 +21,7 @@ The watcher checks ship and scout lanes for deterministic stuck signals and wake
 Each breach is surfaced once while that condition remains true, and the marker clears when the condition clears.
 Ship and scout briefs include the exact `bin/fm-task-heartbeat.sh` command and require workers to record a one-line activity note at least every 15 minutes.
 The heartbeat is a separate state record and does not append a status-log wake.
-The watcher also checks for no progress, a long-running child command, a missing draft pull request, a review wait, repeated identical failures, and a ready pull request that has waited too long.
+The watcher also checks for no observed progress, a missing draft pull request, a review wait, repeated identical failures, and a ready pull request that has waited too long.
 The check runs on the existing watcher slow-check cadence and makes no model calls.
 
 Each home can override the defaults in its gitignored `config/stuck-board` file.
@@ -30,16 +30,16 @@ Use one positive whole-number `key=value` entry per line; omitted keys keep thei
 ```text
 heartbeat_seconds=900
 progress_seconds=3600
-command_seconds=2700
 draft_pr_seconds=14400
 review_seconds=7200
 failure_repeats=2
 ready_pr_seconds=86400
 ```
 
-`progress_seconds` measures time since the latest status-log update, local commit, pushed head, or recorded pull-request head update, with the lane start as its earliest baseline.
-The child-command threshold uses the recorded tmux pane or Herdr pane process tree and counts command shells started under the worker harness after its startup period.
-MCP server processes and treehouse wrapper ancestors do not count as worker commands, and done, failed, needs-decision, blocked, and paused lanes do not trigger heartbeat, no-progress, or long-command rules.
+`progress_seconds` measures time since the latest locally observed status-log update or local commit, or last successfully observed pushed head or pull-request head update, with the lane start as its earliest baseline.
+The rule means no progress has been observed; when a forge read fails, its last good remote observation remains in use and is not refreshed.
+Done, failed, needs-decision, blocked, and paused lanes do not trigger heartbeat or no-progress rules.
+The separate 45-minute command rule is tracked in [issue #60](https://github.com/morecoffeyplease/firstmate/issues/60) and is not inferred from process trees here.
 Pull-request rules remain active for terminal lanes and read the URL recorded in task metadata.
 An empty review decision is treated as waiting when the open pull request has no approved review, and every open non-draft pull request is subject to the ready-pull-request timer.
 GitHub pull-request rules require the GitHub CLI to be authenticated.
