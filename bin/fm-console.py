@@ -128,7 +128,8 @@ def snapshot(home: Path, root: Path) -> dict:
 
 def issue_urls(record: dict, project_home: Path | None = None, include_title_references: bool = True) -> list[str]:
     backlog = record.get("backlog") or {}
-    values = [record.get("issue"), *(backlog.get("links") or record.get("links") or [])]
+    values = [record.get("issue"), *(record.get("issue_urls") or []),
+              *(backlog.get("links") or record.get("links") or [])]
     urls = []
     for value in values:
         if isinstance(value, str) and re.fullmatch(r"https://github\.com/[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+/issues/[1-9][0-9]*", value):
@@ -552,7 +553,8 @@ def decisions(home: Path, root: Path, value: dict) -> list[dict]:
             if verb == "needs-decision" and task in secondmate_task_ids and key.startswith("captain-hold-"):
                 continue
             decision = parse_decision(note)
-            out.append({"owner": "main", "task": task, "key": key, "verb": verb, "note": note,
+            out.append({"owner": "main", "task": task, "work_task_id": task,
+                        "key": key, "verb": verb, "note": note,
                         "decision": decision, "answerable": decision is not None})
             seen.add(("main", task, key))
     targets_by_key = {}
@@ -573,7 +575,8 @@ def decisions(home: Path, root: Path, value: dict) -> list[dict]:
         identity = ("main", worker, key)
         if isinstance(key, str) and ID_RE.fullmatch(key) and identity not in seen:
             decision = decision_from_body(row.get("body_lines"))
-            out.append({"owner": "main", "task": worker, "key": key, "verb": "captain-hold",
+            out.append({"owner": "main", "task": worker, "work_task_id": target or key,
+                        "key": key, "verb": "captain-hold",
                         "note": row.get("hold_reason") or row.get("title") or "Captain-held task",
                         "decision": decision, "answerable": decision is not None,
                         "direct_hold": worker is None})
@@ -603,7 +606,8 @@ def decisions(home: Path, root: Path, value: dict) -> list[dict]:
                 queued_row = next((row for row in home_record.get("queued", [])
                                    if isinstance(row, dict) and row.get("id") == (item.get("id") or task)), {})
                 decision = parse_decision(item.get("decision")) or parse_decision(item.get("summary") or item.get("reason")) or decision_from_body(queued_row.get("body_lines"))
-                out.append({"owner": owner, "remote": remote, "task": task, "key": key,
+                out.append({"owner": owner, "remote": remote, "task": task,
+                            "work_task_id": task or item.get("id") or key, "key": key,
                             "verb": item["verb"], "note": item.get("summary") or item.get("reason") or "Open decision",
                             "decision": decision,
                             "answerable": decision is not None and (direct_hold or isinstance(task, str) and ID_RE.fullmatch(task) is not None),
@@ -611,6 +615,7 @@ def decisions(home: Path, root: Path, value: dict) -> list[dict]:
                 seen.add(identity)
     for item in out:
         item["card_id"] = decision_card_id(item)
+        item.update(decision_work_context(item, value, home))
     return sorted(out, key=lambda item: (item.get("owner") or "", item.get("task") or "", item.get("key") or ""))
 
 
@@ -656,6 +661,71 @@ def decision_from_body(lines: object) -> dict | None:
 def decision_card_id(item: dict) -> str:
     safe = lambda value: re.sub(r"[^A-Za-z0-9_-]", "_", str(value or ""))
     return "decision-" + "-".join(safe(item.get(field)) for field in ("owner", "task", "key"))
+
+
+def worktree_branch(record: dict) -> str | None:
+    worktree = ((record.get("paths") or {}).get("worktree") or {})
+    raw_path = worktree.get("path")
+    if worktree.get("present") is not True or not isinstance(raw_path, str) or not raw_path.startswith("/"):
+        return None
+    path = Path(raw_path)
+    try:
+        if path.is_symlink() or not path.is_dir():
+            return None
+        result = subprocess.run(["git", "-C", str(path), "branch", "--show-current"],
+                                capture_output=True, text=True, timeout=3)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if result.returncode:
+        return None
+    return result.stdout.strip() or "Detached HEAD"
+
+
+def decision_work_context(item: dict, value: dict, home: Path) -> dict:
+    owner = item.get("owner")
+    task_id = item.get("work_task_id") or item.get("task")
+    sources = []
+    project_home: Path | None = home
+    if owner == "main":
+        task_record = next((record for record in value.get("tasks", [])
+                            if isinstance(record, dict) and record.get("id") == task_id), None)
+        backlog_records = (value.get("backlog") or {}).get("records", [])
+        backlog_record = next((record for record in backlog_records
+                               if isinstance(record, dict) and record.get("id") == task_id), None)
+        hold_record = next((record for record in backlog_records
+                            if isinstance(record, dict) and record.get("id") == item.get("key")), None)
+        sources = [record for record in (task_record, backlog_record, hold_record) if record]
+    else:
+        home_record = next((record for record in ((value.get("secondmate_current") or {}).get("records") or [])
+                            if isinstance(record, dict) and record.get("id") == owner), None)
+        if home_record:
+            child = next((record for record in home_record.get("active_children", [])
+                          if isinstance(record, dict) and record.get("id") == task_id), None)
+            queued = next((record for record in home_record.get("queued", [])
+                           if isinstance(record, dict) and record.get("id") in (task_id, item.get("key"))), None)
+            sources = [record for record in (child, queued) if record]
+            if home_record.get("remote") is True:
+                project_home = None
+            else:
+                try:
+                    project_home = validated_local_secondmate_home(home_record, owner)
+                except (ValueError, OSError):
+                    project_home = None
+
+    project = next((record.get("project") or record.get("repo")
+                    for record in sources if record.get("project") or record.get("repo")), None)
+    title = next((record.get("title") or record.get("name")
+                  for record in sources if record.get("title") or record.get("name")), None)
+    branch = next((branch for record in sources if (branch := worktree_branch(record))), None)
+    linked_issues = sorted({url for record in sources for url in issue_urls(record, project_home, False)})
+    linked_prs = sorted({url for record in sources for url in pr_urls(record)})
+    links = [{"kind": "issue", "url": url, "label": f"Issue #{url.rsplit('/', 1)[1]}"}
+             for url in linked_issues]
+    links.extend({"kind": "pull request", "url": url, "label": f"PR #{url.rsplit('/', 1)[1]}"}
+                 for url in linked_prs)
+    task_label = str(title) if title else (f"Task {task_id}" if task_id else "No linked task")
+    return {"project": project or "Home operations", "task_title": task_label,
+            "branch": branch or "Unavailable", "work_links": links}
 
 
 def queue_data(snap: dict, home: Path, root: Path) -> list[dict]:
@@ -803,12 +873,12 @@ def queue_data(snap: dict, home: Path, root: Path) -> list[dict]:
     return out
 
 
-def page(token: str, port: int) -> bytes:
+def page(token: str, port: int, sample_data: bool = False) -> bytes:
     token_json = json.dumps(token)
     html_page = r"""<!doctype html><html lang="en"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Firstmate Console</title>
 <style>
-:root{font:16px system-ui,sans-serif;color-scheme:light dark}body{max-width:1200px;margin:2rem auto;padding:0 1rem}header{display:flex;align-items:center;gap:1rem;flex-wrap:wrap}h1{margin-right:auto}nav{display:flex;gap:.5rem;border-bottom:1px solid #888;padding:.5rem 0}button{font:inherit;padding:.55rem .8rem;border:1px solid #888;border-radius:.35rem;background:Canvas;color:CanvasText;cursor:pointer}button[aria-selected=true]{border-bottom:3px solid #3978db}.muted{color:GrayText}.error{color:#b42318}.tab{padding-top:1rem}table{border-collapse:collapse;width:100%;margin-top:1rem}th,td{text-align:left;vertical-align:top;padding:.65rem;border-bottom:1px solid #8885}a{color:LinkText}textarea{display:block;width:min(48rem,100%);min-height:5rem;margin:.5rem 0;font:inherit}#status{white-space:pre-wrap}label{display:block;margin:.4rem 0}.decision-card{border:1px solid #8885;border-radius:.65rem;padding:1.2rem;margin:1rem 0;box-shadow:0 1px 3px #0002}.decision-card h2{margin:.1rem 0 .65rem}.decision-context{max-width:75ch;line-height:1.55}.decision-option{border-top:1px solid #8885;padding:.65rem 0}.decision-option h3{margin:.1rem 0 .4rem}.decision-option ul{margin:.35rem 0}.recommendation{border-left:4px solid #39825a;background:color-mix(in srgb,Canvas 92%,#39825a);padding:.8rem 1rem;margin:.8rem 0}.rewrite{color:#8a4b00;font-weight:650}.issue-link{display:block;margin:.2rem 0}
-</style><header><h1>Firstmate Console</h1><button id="refresh">Refresh</button></header><p id="status" class="muted" role="status">Loading…</p><nav role="tablist" aria-label="Console sections"><button role="tab" aria-selected="true" aria-controls="status-tab" id="status-button">Status</button><button role="tab" aria-selected="false" aria-controls="decisions-tab" id="decisions-button">Open decisions</button><button role="tab" aria-selected="false" aria-controls="queue-tab" id="queue-button">Queue</button></nav>
+:root{font:16px system-ui,sans-serif;color-scheme:light dark}body{max-width:1200px;margin:2rem auto;padding:0 1rem}header{display:flex;align-items:center;gap:1rem;flex-wrap:wrap}h1{margin-right:auto}nav{display:flex;gap:.5rem;border-bottom:1px solid #888;padding:.5rem 0}button{font:inherit;padding:.55rem .8rem;border:1px solid #888;border-radius:.35rem;background:Canvas;color:CanvasText;cursor:pointer}button[aria-selected=true]{border-bottom:3px solid #3978db}.muted{color:GrayText}.error{color:#b42318}.tab{padding-top:1rem}table{border-collapse:collapse;width:100%;margin-top:1rem}th,td{text-align:left;vertical-align:top;padding:.65rem;border-bottom:1px solid #8885}a{color:LinkText}textarea{display:block;width:min(48rem,100%);min-height:5rem;margin:.5rem 0;font:inherit}#status{white-space:pre-wrap}label{display:block;margin:.4rem 0}.decision-card{border:1px solid #8885;border-radius:.65rem;padding:1.2rem;margin:1rem 0;box-shadow:0 1px 3px #0002}.decision-card h2{margin:.1rem 0 .65rem}.decision-context{max-width:75ch;line-height:1.55}.decision-option{border-top:1px solid #8885;padding:.65rem 0}.decision-option h3{margin:.1rem 0 .4rem}.decision-option ul{margin:.35rem 0}.recommendation{border-left:4px solid #39825a;background:color-mix(in srgb,Canvas 92%,#39825a);padding:.8rem 1rem;margin:.8rem 0}.rewrite{color:#8a4b00;font-weight:650}.issue-link{display:block;margin:.2rem 0}.sample-notice{padding:.8rem 1rem;border:1px solid #996e00;border-radius:.4rem;background:color-mix(in srgb,Canvas 86%,#d9aa32);font-weight:650}.decision-work{display:flex;gap:.6rem 1.2rem;flex-wrap:wrap;margin:0 0 .8rem;padding:.7rem .9rem;border-radius:.4rem;background:color-mix(in srgb,Canvas 94%,#3978db);font-size:.95rem}.decision-work p{margin:0}.decision-work-links{flex-basis:100%}.answer-feedback{padding:.7rem .9rem;border-radius:.4rem;font-weight:650}.answer-feedback.success{color:#216e39;background:color-mix(in srgb,Canvas 88%,#7bc98c)}.answer-feedback.error{color:#9f241b;background:color-mix(in srgb,Canvas 90%,#e79087)}
+</style><header><h1>Firstmate Console</h1><button id="refresh">Refresh</button></header><p id="status" class="muted" role="status">Loading…</p><p id="sample-notice" class="sample-notice" role="alert" __SAMPLE_HIDDEN__>Sample data only. Nothing will be sent from this console.</p><nav role="tablist" aria-label="Console sections"><button role="tab" aria-selected="true" aria-controls="status-tab" id="status-button">Status</button><button role="tab" aria-selected="false" aria-controls="decisions-tab" id="decisions-button">Open decisions</button><button role="tab" aria-selected="false" aria-controls="queue-tab" id="queue-button">Queue</button></nav>
 <section class="tab" role="tabpanel" id="status-tab" aria-labelledby="status-button"><label>Project <select id="project"></select></label><div id="status-content"></div></section>
 <section class="tab" role="tabpanel" id="decisions-tab" aria-labelledby="decisions-button" hidden><div id="decisions-content"></div></section>
 <section class="tab" role="tabpanel" id="queue-tab" aria-labelledby="queue-button" hidden><div id="queue-content"></div></section>
@@ -820,23 +890,27 @@ tabs.forEach((tab,index)=>{tab.onclick=()=>activate(tab);tab.onkeydown=event=>{i
 function link(url,label){const a=document.createElement('a');a.href=url;a.target='_blank';a.textContent=label;a.rel='noopener noreferrer';return a}
 function prCell(prs){const root=document.createElement('div');for(const pr of prs||[]){const state=pr.merged?'merged':pr.state==='closed'?'closed unmerged':pr.draft?'draft PR':pr.state;root.append(link(pr.url,`PR · ${state}`),node(` · review ${pr.review}; checks ${pr.checks}`),document.createElement('br'))}if(!prs?.length)root.textContent='No linked PR';return root}
 function table(parent,headers,rows){const t=document.createElement('table'),head=document.createElement('thead'),hr=document.createElement('tr');headers.forEach(h=>{const th=document.createElement('th');th.textContent=h;hr.append(th)});head.append(hr);const body=document.createElement('tbody');rows.forEach(row=>{const tr=document.createElement('tr');row.forEach(value=>{const td=document.createElement('td');if(value instanceof Node)td.append(value);else td.append(node(value));tr.append(td)});body.append(tr)});t.append(head,body);parent.replaceChildren(t)}
-const drafts=new Map();let latestData=null,refreshing=false,refreshAgain=false,refreshError='';
+const drafts=new Map(),answerStates=new Map(),sentItems=new Map();let latestData=null,refreshing=false,refreshAgain=false,refreshError='';
 function updateSnapshotStatus(){if(!latestData)return;const data=latestData,s=data.status||{},generated=data.generated_epoch||s.generated_epoch||0,age=Math.max(0,Math.floor(Date.now()/1000-generated)),notices=[...(s.failures||[]),...(data.warnings||[])],label=refreshing?'Refreshing; showing last snapshot':refreshError?'Refresh failed; showing last snapshot':s.stale?'Stale cached':'Updated';status.className=refreshError||s.stale||notices.length?'error':'muted';status.textContent=`${label} ${new Date(generated*1000).toLocaleString()} · snapshot age ${age}s${refreshError?' · '+refreshError:''}${s.error?' · '+s.error:''}${notices.length?'\n'+notices.join('\n'):''}`}
-function renderDecision(item){const card=document.createElement('article');card.className='decision-card';card.id=item.card_id;const title=document.createElement('h2');title.textContent=item.decision?.question||'Decision needs rewrite';card.append(title);if(!item.decision){const rewrite=document.createElement('p');rewrite.className='rewrite';rewrite.textContent='Needs rewrite: add a plain-language context, user impact, lettered options with pros and cons, and a recommendation before this can be answered.';card.append(rewrite);return card}const context=document.createElement('p');context.className='decision-context';context.textContent=`${item.decision.context} User impact: ${item.decision.user_impact}`;card.append(context);const options=document.createElement('div');for(const option of item.decision.options){const section=document.createElement('section');section.className='decision-option';const heading=document.createElement('h3');heading.textContent=`${option.label}. ${option.title}`;section.append(heading);for(const [label,values] of [['Pros',option.pros],['Cons',option.cons]]){const strong=document.createElement('strong');strong.textContent=label;const list=document.createElement('ul');values.forEach(value=>{const li=document.createElement('li');li.textContent=value;list.append(li)});section.append(strong,list)}options.append(section)}card.append(options);const recommendation=document.createElement('p');recommendation.className='recommendation';recommendation.textContent=`Recommended: ${item.decision.recommended_option}. ${item.decision.recommendation}`;card.append(recommendation);if(!item.answerable){const notice=document.createElement('p');notice.textContent='Answer unavailable: owning task could not be resolved.';card.append(notice);return card}const identity=JSON.stringify([item.owner,item.task,item.key]),form=document.createElement('form'),label=document.createElement('label'),area=document.createElement('textarea'),send=document.createElement('button');label.textContent='Reply with an option letter or your own answer';area.name='answer';area.maxLength=8192;area.required=true;area.setAttribute('aria-label',`Answer ${item.decision.question}`);area.placeholder=`For example: ${item.decision.recommended_option} or describe another choice`;area.value=drafts.get(identity)||'';area.oninput=()=>drafts.set(identity,area.value);send.textContent='Answer and send';form.append(label,area,send);form.onsubmit=async event=>{event.preventDefault();send.disabled=true;try{const result=await fetch('/api/answer',{method:'POST',headers:{'Content-Type':'application/json','X-FM-Token':token},body:JSON.stringify({owner:item.owner,task:item.task,key:item.key,answer:area.value})}).then(x=>x.json());if(!result.ok)throw Error(result.error||'answer was not delivered');drafts.delete(identity);await load(true)}catch(error){status.className='error';status.textContent='Answer failed: '+error.message;send.disabled=false}};card.append(form);return card}
-function render(data){const s=data.status||{},d=data.decisions||[],q=data.queue||[];const select=el('project'),prior=select.value;select.replaceChildren(...(s.projects||[]).map(name=>{const o=document.createElement('option');o.value=name;o.textContent=name;return o}));if((s.projects||[]).includes(prior))select.value=prior;const rows=(s.rows||[]).filter(row=>!select.value||row.project===select.value).map(row=>[row.project,row.issue_missing?row.title:link(row.url,`#${row.number} ${row.title||'(title unavailable)'}`),row.issue_state,row.tasks.map(task=>`${task.owner||'main'}/${task.id}: ${task.stage} (${task.state})`).join('\n'),prCell(row.prs)]);if(rows.length)table(el('status-content'),['Project','Issue','Issue state','Lane stage','PR status'],rows);else el('status-content').textContent=select.value?'No admitted issues or unlinked work are recorded for this project.':'No registered projects are available.';updateSnapshotStatus();el('decisions-content').replaceChildren(...d.map(renderDecision));if(!d.length)el('decisions-content').textContent='No open decisions.';const issueCell=item=>{const root=document.createElement('div');if(item.issue_missing){root.textContent='No linked GitHub issue';return root}for(const issue of item.issues||[]){const a=link(issue.html_url,issue.title||issue.html_url);a.className='issue-link';root.append(a);if(issue.milestone?.title)root.append(node(`Milestone: ${issue.milestone.title}`));else root.append(node(issue.title==='Issue details unavailable'?'Milestone unavailable':'No milestone'));root.append(document.createElement('br'))}return root};const reasonCell=item=>{const root=document.createElement('div');root.append(node(item.start_reason));if(item.decision_card_id){root.append(document.createElement('br'));const a=document.createElement('a');a.href=`#${item.decision_card_id}`;a.textContent='View decision';root.append(a)}return root};if(q.length)table(el('queue-content'),['Task','Project','GitHub issue','State','Why it has not started'],q.map(item=>[`${item.id||''} ${item.title||''}`,item.repo||'Home operations',issueCell(item),item.state,reasonCell(item)]));else el('queue-content').textContent='No queued or in-flight work.'}
+function answerIdentity(item){return JSON.stringify([item.owner,item.task,item.key])}
+function workCard(item){const context=document.createElement('section');context.className='decision-work';context.setAttribute('aria-label','Related work');for(const [label,value] of [['Project',item.project||'Home operations'],['Task',item.task_title||'No linked task'],['Feature branch',item.branch||'Unavailable']]){const field=document.createElement('p');field.append(node(`${label}: ${value}`));context.append(field)}const links=document.createElement('p');links.className='decision-work-links';links.append(node('Related GitHub work: '));if(item.work_links?.length){item.work_links.forEach((work,index)=>{if(index)links.append(node(' · '));links.append(link(work.url,work.label))})}else{links.append(node('No linked issue or pull request'))}context.append(links);return context}
+function feedback(card,state){if(!state)return null;const message=document.createElement('p');message.className=`answer-feedback ${state.kind==='success'?'success':'error'}`;message.setAttribute('role','status');message.setAttribute('aria-live','polite');message.textContent=state.message;card.append(message);return message}
+function renderDecision(item){const card=document.createElement('article');card.className='decision-card';card.id=item.card_id;card.append(workCard(item));const title=document.createElement('h2');title.textContent=item.decision?.question||'Decision needs rewrite';card.append(title);if(!item.decision){const rewrite=document.createElement('p');rewrite.className='rewrite';rewrite.textContent='Needs rewrite: add a plain-language context, user impact, lettered options with pros and cons, and a recommendation before this can be answered.';card.append(rewrite);return card}const context=document.createElement('p');context.className='decision-context';context.textContent=`${item.decision.context} User impact: ${item.decision.user_impact}`;card.append(context);const options=document.createElement('div');for(const option of item.decision.options){const section=document.createElement('section');section.className='decision-option';const heading=document.createElement('h3');heading.textContent=`${option.label}. ${option.title}`;section.append(heading);for(const [label,values] of [['Pros',option.pros],['Cons',option.cons]]){const strong=document.createElement('strong');strong.textContent=label;const list=document.createElement('ul');values.forEach(value=>{const li=document.createElement('li');li.textContent=value;list.append(li)});section.append(strong,list)}options.append(section)}card.append(options);const recommendation=document.createElement('p');recommendation.className='recommendation';recommendation.textContent=`Recommended: ${item.decision.recommended_option}. ${item.decision.recommendation}`;card.append(recommendation);const identity=answerIdentity(item),saved=answerStates.get(identity);if(saved?.kind==='success'){feedback(card,saved);return card}if(!item.answerable){const notice=document.createElement('p');notice.textContent='Answer unavailable: owning task could not be resolved.';card.append(notice);return card}const responseMessage=feedback(card,saved)||document.createElement('p');if(!saved){responseMessage.className='answer-feedback error';responseMessage.setAttribute('role','status');responseMessage.setAttribute('aria-live','polite');responseMessage.hidden=true;card.append(responseMessage)}const form=document.createElement('form'),label=document.createElement('label'),area=document.createElement('textarea'),send=document.createElement('button');label.textContent='Reply with an option letter or your own answer';area.name='answer';area.maxLength=8192;area.required=true;area.setAttribute('aria-label',`Answer ${item.decision.question}`);area.placeholder=`For example: ${item.decision.recommended_option} or describe another choice`;area.value=drafts.get(identity)||'';area.oninput=()=>drafts.set(identity,area.value);send.textContent='Answer and send';form.append(label,area,send);form.onsubmit=async event=>{event.preventDefault();send.disabled=true;responseMessage.hidden=false;responseMessage.className='answer-feedback error';responseMessage.textContent='Sending answer…';answerStates.set(identity,{kind:'pending',message:'Sending answer…'});try{const response=await fetch('/api/answer',{method:'POST',headers:{'Content-Type':'application/json','X-FM-Token':token},body:JSON.stringify({owner:item.owner,task:item.task,key:item.key,answer:area.value})});const result=await response.json();if(!response.ok||!result.ok)throw Error(result.error||'answer was not delivered');const success={kind:'success',message:'Answer sent successfully.'};answerStates.set(identity,success);sentItems.set(identity,item);drafts.delete(identity);responseMessage.className='answer-feedback success';responseMessage.textContent=success.message;await load(true)}catch(error){const failure={kind:'error',message:`Answer not sent: ${error.message}`};answerStates.set(identity,failure);responseMessage.className='answer-feedback error';responseMessage.textContent=failure.message;send.disabled=false}};card.append(form);return card}
+function render(data){const s=data.status||{},d=data.decisions||[],q=data.queue||[];el('sample-notice').hidden=!data.sample_data;const select=el('project'),prior=select.value;select.replaceChildren(...(s.projects||[]).map(name=>{const o=document.createElement('option');o.value=name;o.textContent=name;return o}));if((s.projects||[]).includes(prior))select.value=prior;const rows=(s.rows||[]).filter(row=>!select.value||row.project===select.value).map(row=>[row.project,row.issue_missing?row.title:link(row.url,`#${row.number} ${row.title||'(title unavailable)'}`),row.issue_state,row.tasks.map(task=>`${task.owner||'main'}/${task.id}: ${task.stage} (${task.state})`).join('\n'),prCell(row.prs)]);if(rows.length)table(el('status-content'),['Project','Issue','Issue state','Lane stage','PR status'],rows);else el('status-content').textContent=select.value?'No admitted issues or unlinked work are recorded for this project.':'No registered projects are available.';updateSnapshotStatus();const visible=new Map(d.map(item=>[answerIdentity(item),item]));for(const [identity,item] of sentItems){if(!visible.has(identity))visible.set(identity,item)}const cards=[...visible.values()].map(renderDecision);el('decisions-content').replaceChildren(...cards);if(!cards.length)el('decisions-content').textContent='No open decisions.';const issueCell=item=>{const root=document.createElement('div');if(item.issue_missing){root.textContent='No linked GitHub issue';return root}for(const issue of item.issues||[]){const a=link(issue.html_url,issue.title||issue.html_url);a.className='issue-link';root.append(a);if(issue.milestone?.title)root.append(node(`Milestone: ${issue.milestone.title}`));else root.append(node(issue.title==='Issue details unavailable'?'Milestone unavailable':'No milestone'));root.append(document.createElement('br'))}return root};const reasonCell=item=>{const root=document.createElement('div');root.append(node(item.start_reason));if(item.decision_card_id){root.append(document.createElement('br'));const a=document.createElement('a');a.href=`#${item.decision_card_id}`;a.textContent='View decision';root.append(a)}return root};if(q.length)table(el('queue-content'),['Task','Project','GitHub issue','State','Why it has not started'],q.map(item=>[`${item.id||''} ${item.title||''}`,item.repo||'Home operations',issueCell(item),item.state,reasonCell(item)]));else el('queue-content').textContent='No queued or in-flight work.'}
 async function load(force=false){if(refreshing){refreshAgain=refreshAgain||force;return}refreshing=true;refreshError='';const button=el('refresh');button.disabled=true;button.textContent='Refreshing…';if(latestData)updateSnapshotStatus();else{status.className='muted';status.textContent='Loading snapshot…'}try{const query=force?'?refresh=1':'';const response=await fetch('/api/data'+query),data=await response.json();if(!response.ok||data.unavailable||!data.status)throw Error(data.error||'console data unavailable');latestData=data;render(data)}catch(error){refreshError=error.message;if(latestData)updateSnapshotStatus();else{status.className='error';status.textContent='Could not load a snapshot: '+error.message}}finally{refreshing=false;button.disabled=false;button.textContent='Refresh';if(latestData)updateSnapshotStatus();if(refreshAgain){refreshAgain=false;void load(true)}}}
 el('project').onchange=()=>{if(latestData)render(latestData)};el('refresh').onclick=()=>{void load(true)};void load();setInterval(()=>{if(!document.hidden&&latestData)updateSnapshotStatus()},10000);setInterval(()=>{if(!document.hidden)void load()},30000);
 </script></html>"""
-    return html_page.replace("__TOKEN__", token_json).encode()
+    sample_hidden = "" if sample_data else "hidden"
+    return html_page.replace("__TOKEN__", token_json).replace("__SAMPLE_HIDDEN__", sample_hidden).encode()
 
 
-def compose_data(home: Path, root: Path, value: dict) -> dict:
+def compose_data(home: Path, root: Path, value: dict, sample_data: bool = False) -> dict:
     status = status_data(home, root, value)
     generated = snapshot_epoch(value)
     warnings = list(status.get("warnings") or [])
     return {"generated_epoch": generated, "age_seconds": max(0, int(time.time()) - generated),
             "status": status, "decisions": decisions(home, root, value), "queue": queue_data(value, home, root),
-            "warnings": warnings, "stale": False, "unavailable": False}
+            "warnings": warnings, "stale": False, "unavailable": False, "sample_data": sample_data}
 
 
 def validated_local_secondmate_home(record: dict, owner: str) -> Path:
@@ -852,7 +926,7 @@ def validated_local_secondmate_home(record: dict, owner: str) -> Path:
     return path.resolve(strict=True)
 
 
-def serve(home: Path, root: Path, port: int | None) -> int:
+def serve(home: Path, root: Path, port: int | None, sample_data: bool = False) -> int:
     token = secrets.token_urlsafe(32)
     cached: dict | None = None
     cache_at = 0.0
@@ -883,7 +957,7 @@ def serve(home: Path, root: Path, port: int | None) -> int:
                 return
             parsed = urllib.parse.urlparse(self.path)
             if parsed.path == "/":
-                body = page(token, self.server.server_port)
+                body = page(token, self.server.server_port, sample_data)
                 self.send_response(200)
                 self.send_header("Content-Type", "text/html; charset=utf-8")
                 self.send_header("Cache-Control", "no-store")
@@ -896,7 +970,7 @@ def serve(home: Path, root: Path, port: int | None) -> int:
                 if query.get("refresh") == ["1"] or cached is None or time.monotonic() - cache_at >= 20:
                     try:
                         snap = snapshot(home, root)
-                        cached = compose_data(home, root, snap)
+                        cached = compose_data(home, root, snap, sample_data)
                         cache_at = time.monotonic()
                     except (RuntimeError, ValueError, OSError, subprocess.SubprocessError) as exc:
                         if cached is None:
@@ -918,6 +992,9 @@ def serve(home: Path, root: Path, port: int | None) -> int:
             if (self.path != "/api/answer" or not self.valid_host() or self.headers.get("Origin") != expected_origin
                     or not secrets.compare_digest(self.headers.get("X-FM-Token", ""), token)):
                 self.send(403, {"error": "request refused"})
+                return
+            if sample_data:
+                self.send(409, {"ok": False, "error": "Sample data only. Nothing was sent."})
                 return
             try:
                 staged_answer: Path | None = None
@@ -1015,10 +1092,12 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--root", default=str(Path(__file__).resolve().parent.parent))
     parser.add_argument("--home", default=os.environ.get("FM_HOME"))
     parser.add_argument("--port", type=int)
+    parser.add_argument("--sample-data", action="store_true",
+                        help="mark this as sample data and refuse to send answers")
     args = parser.parse_args(argv)
     root = Path(args.root).expanduser().resolve()
     home = Path(args.home).expanduser().resolve() if args.home else root
-    return serve(home, root, args.port)
+    return serve(home, root, args.port, args.sample_data)
 
 
 if __name__ == "__main__":

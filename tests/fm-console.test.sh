@@ -2,8 +2,20 @@
 # End-to-end tests for the local operator console tabs and answer delivery.
 set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-TMP="$(mktemp -d)"
-trap 'rm -rf -- "$TMP"' EXIT
+if [[ "${FM_CONSOLE_KEEP_TEST_FIXTURE:-}" == "1" ]]; then
+  TMP="$ROOT/.tmp-fm-console-fixture-$$"
+  mkdir -p "$TMP"
+else
+  TMP="$(mktemp -d)"
+fi
+cleanup() {
+  if [[ "${FM_CONSOLE_KEEP_TEST_FIXTURE:-}" == "1" ]]; then
+    printf 'FM_CONSOLE_FIXTURE_DIR=%s\n' "$TMP"
+  else
+    rm -rf -- "$TMP"
+  fi
+}
+trap cleanup EXIT
 
 python3 - "$ROOT" "$TMP" <<'PY'
 import json
@@ -44,6 +56,7 @@ home = tmp / "home"
 (home / "data" / "projects.md").write_text("- alpha - Example project\n")
 subprocess.run(["git", "init", "-q", str(home / "projects" / "alpha")], check=True)
 subprocess.run(["git", "-C", str(home / "projects" / "alpha"), "config", "remote.origin.url", "git@github.com:example/alpha.git"], check=True)
+subprocess.run(["git", "-C", str(home / "projects" / "alpha"), "checkout", "-qb", "feature/guest-route"], check=True)
 issue_url = "https://github.com/example/alpha/issues/7"
 pr_url = "https://github.com/example/alpha/pull/8"
 decision = {"schema": "fm-captain-decision.v1", "question": "Which route should guests use?",
@@ -89,12 +102,13 @@ snapshot = {
     "schema": "fm-fleet-snapshot.v1",
     "generated": datetime.datetime.now(datetime.timezone.utc).isoformat(),
     "tasks": [
-        {"id": "worker", "issue": issue_url, "project": "alpha", "decision_keys": [], "endpoint": {"exists": True}, "backlog": {"repo": "alpha", "state": "in_flight", "links": [], "pr_url": pr_url}, "current_state": {"state": "working"}},
+        {"id": "worker", "issue": issue_url, "project": "alpha", "decision_keys": [], "endpoint": {"exists": True}, "paths": {"worktree": {"path": str(home / "projects" / "alpha"), "present": True}}, "backlog": {"repo": "alpha", "state": "in_flight", "links": [], "pr_url": pr_url}, "current_state": {"state": "working"}},
         {"id": "unknown-worker", "project": "alpha", "backlog": {"repo": "alpha", "state": "queued"}, "current_state": {"state": "unknown"}},
         {"id": "unlinked", "project": "alpha", "backlog": {"repo": "alpha", "state": "in_flight"}, "current_state": {"state": "working"}},
         {"id": "mate", "kind": "secondmate", "project": "alpha", "endpoint": {"exists": True}, "backlog": {"repo": "alpha", "state": "in_flight"}, "current_state": {"state": "working"}},
     ],
     "backlog": {"records": [
+        {"id": "worker", "title": "Guest route selection", "repo": "alpha", "state": "in_flight", "links": [issue_url], "pr_url": pr_url},
         {"id": "next", "title": "Waiting task", "repo": "alpha", "state": "queued", "links": [issue_url], "blocked_by_ids": ["worker"], "unresolved_blocker_ids": ["worker"]},
         {"id": "held-call", "title": "Pick a route", "repo": "alpha", "state": "queued", "captain_actionable": True, "hold_reason": "Choose a route", "target_task_id": "worker", "body_lines": [decision_line]},
         {"id": "ready", "title": "Ready task", "repo": "alpha", "state": "queued", "links": [], "blocked_by_ids": [], "unresolved_blocker_ids": []},
@@ -109,7 +123,7 @@ snapshot = {
     "secondmate_current": {"truncated": 0, "records": [
         {"id": "mate", "home": str(home / "projects" / "mate-home"), "remote": False, "registered": True,
          "current": {"state": "captain_decision", "reason": None}, "freshness": {"status": "fresh", "age_seconds": 0},
-         "active_children": [{"id": "mate-child", "state": "working", "repo": "alpha", "issue": issue_url, "pr_url": pr_url, "decision_keys": ["mate-held"]}],
+         "active_children": [{"id": "mate-child", "name": "Guest route follow-up", "state": "working", "repo": "alpha", "issue": issue_url, "pr_url": pr_url, "decision_keys": ["mate-held"]}],
          "decisions_open": [
              {"id": "mate-child", "key": "mate-choice", "verb": "needs-decision", "summary": json.dumps(decision), "target_task_id": "mate-child"},
              {"id": "mate-held", "key": "mate-held", "verb": "captain-hold", "summary": json.dumps(decision), "target_task_id": "mate-child"},
@@ -228,7 +242,16 @@ try:
     structured = next(item for item in decisions if item["key"] == "decision-a")
     legacy = next(item for item in decisions if item["key"] == "legacy")
     assert structured["answerable"] is True and structured["decision"]["question"] == decision["question"]
+    assert structured["project"] == "alpha" and structured["task_title"] == "Guest route selection", structured
+    assert structured["branch"] == "feature/guest-route", structured
+    assert {(work["kind"], work["url"]) for work in structured["work_links"]} == {
+        ("issue", issue_url), ("pull request", pr_url)}
     assert legacy["answerable"] is False and legacy["decision"] is None
+    mate_decision = next(item for item in decisions if item["key"] == "mate-choice")
+    assert mate_decision["project"] == "alpha" and mate_decision["task_title"] == "Guest route follow-up", mate_decision
+    assert mate_decision["branch"] == "Unavailable", mate_decision
+    assert {(work["kind"], work["url"]) for work in mate_decision["work_links"]} == {
+        ("issue", issue_url), ("pull request", pr_url)}
     orphan_mate = next(item for item in decisions if item["key"] == "mate-orphan-hold")
     assert orphan_mate["answerable"] is True and orphan_mate["direct_hold"] is True
     queue = data["queue"]
@@ -306,6 +329,31 @@ try:
     except urllib.error.HTTPError as exc:
         assert json.load(exc)["ok"] is False
     assert len(capture.read_text().splitlines()) == 2
+    decisions_path.write_text("worker\tdecision-a\tneeds-decision\t" + json.dumps(decision, separators=(",", ":")) + "\n")
+    sample_proc = subprocess.Popen([sys.executable, str(repo / "bin" / "fm-console.py"), "--root", str(root),
+                                    "--home", str(home), "--port", "0", "--sample-data"],
+                                   stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, env=env)
+    try:
+        sample_base = sample_proc.stdout.readline().strip().rstrip("/")
+        assert sample_base.startswith("http://127.0.0.1:"), sample_base
+        sample_page = urllib.request.urlopen(sample_base + "/", timeout=3).read().decode()
+        assert "Sample data only. Nothing will be sent from this console." in sample_page
+        sample_data = json.load(urllib.request.urlopen(sample_base + "/api/data", timeout=3))
+        assert sample_data["sample_data"] is True
+        sample_token = json.loads(re.search(r"const token=(\"[^\"]+\")", sample_page).group(1))
+        sample_body = json.dumps({"owner": "main", "task": "worker", "key": "decision-a", "answer": "A"}).encode()
+        sample_request = urllib.request.Request(sample_base + "/api/answer", data=sample_body, method="POST",
+                                                headers={"Content-Type": "application/json", "Origin": sample_base,
+                                                         "X-FM-Token": sample_token})
+        try:
+            urllib.request.urlopen(sample_request, timeout=3)
+            raise AssertionError("sample-data console accepted an answer")
+        except urllib.error.HTTPError as exc:
+            assert exc.code == 409 and json.load(exc)["error"] == "Sample data only. Nothing was sent."
+        assert len(capture.read_text().splitlines()) == 2
+    finally:
+        sample_proc.terminate()
+        sample_proc.wait(timeout=5)
 finally:
     proc.terminate()
     proc.wait(timeout=5)
@@ -352,13 +400,18 @@ JSON
 exit 0
 SH
   chmod +x "$real_home/fakebin/tmux"
-  env PATH="$real_home/fakebin:$PATH" FM_ROOT_OVERRIDE="$ROOT" FM_HOME="$real_home" \
+  env PATH="$real_home/fakebin:$PATH" BROWSER=/usr/bin/true FM_ROOT_OVERRIDE="$ROOT" FM_HOME="$real_home" \
     FM_STATE_OVERRIDE="$real_home/state" FM_DATA_OVERRIDE="$real_home/data" \
     FM_CONFIG_OVERRIDE="$real_home/config" FM_SEND_SETTLE=0 \
     "$ROOT/bin/fm-console.py" --root "$ROOT" --home "$real_home" --port 0 \
     > "$real_home/console.url" 2> "$real_home/console.err" &
   console_pid=$!
-  trap 'kill "$console_pid" 2>/dev/null || true; rm -rf -- "$TMP"' EXIT
+  cleanup_console() {
+    kill "$console_pid" 2>/dev/null || true
+    wait "$console_pid" 2>/dev/null || true
+    cleanup
+  }
+  trap cleanup_console EXIT
   python3 - "$ROOT" "$real_home" "$console_pid" <<'PY'
 import json
 import datetime
@@ -422,7 +475,7 @@ PY
   printf '%s' "$show" | grep -F 'state: done' >/dev/null
   show=$(cd "$real_home" && tasks-axi show orphan-call --full --file data/backlog.md)
   printf '%s' "$show" | grep -F 'state: done' >/dev/null
-  trap 'rm -rf -- "$TMP"' EXIT
+  trap cleanup EXIT
 else
   echo 'skip: tasks-axi unavailable for captain-hold console integration'
 fi
