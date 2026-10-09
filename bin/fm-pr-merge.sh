@@ -113,9 +113,12 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 FM_ROOT="${FM_ROOT_OVERRIDE:-$(cd "$SCRIPT_DIR/.." && pwd)}"
 FM_HOME="${FM_HOME:-${FM_ROOT_OVERRIDE:-$FM_ROOT}}"
 STATE="${FM_STATE_OVERRIDE:-$FM_HOME/state}"
+DATA="${FM_DATA_OVERRIDE:-$FM_HOME/data}"
 
 # shellcheck source=bin/fm-pr-lib.sh
 . "$SCRIPT_DIR/fm-pr-lib.sh"
+# shellcheck source=bin/fm-issue-events-lib.sh
+. "$SCRIPT_DIR/fm-issue-events-lib.sh"
 # shellcheck source=bin/fm-backlog-transition-lib.sh
 . "$SCRIPT_DIR/fm-backlog-transition-lib.sh"
 # shellcheck source=bin/fm-merge-outcome-lib.sh
@@ -951,6 +954,14 @@ persist_accepted_merge_authority() {
   fm_merge_authority_persist "$STATE" "$ID" "$META" \
     "$PROVIDER" "$PR_HOST" "$PR_PATH" "$PR_NUMBER" "$FM_PR_MERGE_AUTHORITY" \
     || status=1
+  if [ "$status" -eq 0 ]; then
+    local generation
+    generation=$(grep '^spawn_gen=' "$META" | tail -1 | cut -d= -f2- || true)
+    if [ -n "$generation" ]; then
+      fm_issue_event_append "$DATA/$ID" "$ID" "$generation" merge-requested \
+        "$(jq -cn --arg url "$URL" --arg authority "$FM_PR_MERGE_AUTHORITY" '{url:$url,authority:$authority}')" || true
+    fi
+  fi
   fm_lock_release "$MERGE_META_LOCK" || status=1
   MERGE_META_LOCK=
   if [ "$status" -eq 0 ]; then

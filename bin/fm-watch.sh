@@ -125,8 +125,11 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 FM_ROOT="${FM_ROOT_OVERRIDE:-$(cd "$SCRIPT_DIR/.." && pwd)}"
 FM_HOME="${FM_HOME:-${FM_ROOT_OVERRIDE:-$FM_ROOT}}"
 STATE="${FM_STATE_OVERRIDE:-$FM_HOME/state}"
+DATA="${FM_DATA_OVERRIDE:-$FM_HOME/data}"
 CONFIG="${FM_CONFIG_OVERRIDE:-$FM_HOME/config}"
 mkdir -p "$STATE"
+# shellcheck source=bin/fm-issue-events-lib.sh
+. "$SCRIPT_DIR/fm-issue-events-lib.sh"
 
 # The native event fast-path and only its true dependencies have one narrow
 # production owner. The Herdr event-wait smoke test consumes this same owner
@@ -1491,6 +1494,42 @@ watcher_beat() {
 }
 
 # Layer 2 + 3 signal scan: status files and turn-end markers.
+# The existing watcher records an observable status signature, not a timestamp
+# per appended event. This side band records first observation with a bounded
+# previous-observation bracket and never changes wake handling.
+issue_status_seen_event() { # <status-file> <captured-end> <captured-identity>
+  local file=$1 end=$2 ident=$3 id meta generation line state key now marker old_epoch old_end fields tmp
+  id=$(basename "$file" .status)
+  meta="$STATE/$id.meta"
+  [ -d "$DATA/$id" ] && [ ! -L "$DATA/$id" ] && [ -f "$meta" ] && [ ! -L "$meta" ] || return 0
+  generation=$(grep '^spawn_gen=' "$meta" | tail -1 | cut -d= -f2- || true)
+  [ -n "$generation" ] || return 0
+  marker="$DATA/$id/.status-observed"
+  [ ! -L "$marker" ] || return 0
+  old_epoch='' old_end=''
+  if [ -f "$marker" ]; then
+    old_epoch=$(awk -F= '$1=="epoch" {print $2; exit}' "$marker")
+    old_end=$(awk -F= '$1=="end" {print $2; exit}' "$marker")
+  fi
+  [ "$old_end" != "$end:$ident" ] || return 0
+  line=$(tail -n 1 -- "$file" 2>/dev/null || true)
+  state=${line%%:*}
+  case "$state" in working|needs-decision|blocked|paused|done|failed|resolved|note|receipt|waiting|busy|running|complete|completed) ;; *) state=unknown ;; esac
+  key=$(printf '%s' "$line" | sed -n 's/.*\[key=\([A-Za-z0-9._-][A-Za-z0-9._-]*\)\].*/\1/p' | head -1)
+  now=$(date -u +%s)
+  case "$old_epoch" in ''|*[!0-9]*) old_epoch=null ;; esac
+  fields=$(jq -cn --arg state "$state" --arg key "$key" --argjson from "$old_epoch" --argjson to "$now" '{state:$state,key:(if $key == "" then null else $key end),from_epoch:$from,to_epoch:$to}') || return 0
+  fm_issue_event_append "$DATA/$id" "$id" "$generation" status-seen "$fields" detected || true
+  tmp=$(umask 077; mktemp "$DATA/$id/.status-observed.XXXXXX") || return 0
+  printf 'epoch=%s\nend=%s\n' "$now" "$end:$ident" > "$tmp" || { rm -f "$tmp"; return 0; }
+  if chmod 600 "$tmp" && mv -f -- "$tmp" "$marker"; then
+    :
+  else
+    rm -f "$tmp"
+  fi
+  return 0
+}
+
 # Each file is compared against its persisted reported signature in .seen-* rather
 # than mtime-vs-a-startup-touch, so signals that land while no watcher is running
 # are caught by the next one and same-second writes cannot slip through a strict
@@ -2433,6 +2472,7 @@ EOF
       while IFS=$(printf '\t') read -r f surface_end surface_ident; do
         [ -n "$f" ] || continue
         fm_wake_status_seen_commit "$STATE" "$f" "$surface_end" "$surface_ident" || true
+        issue_status_seen_event "$f" "$surface_end" "$surface_ident"
         mark_surfaced "$f" "$surface_end" "$surface_ident"
       done <<EOF
 $FM_SIGNAL_SURFACE_ENDPOINTS
@@ -2450,6 +2490,7 @@ EOF
         [ -n "$f" ] || continue
         fm_wake_status_seen_commit "$STATE" "$f" "$surface_end" "$surface_ident" \
           || signal_commit_error=1
+        issue_status_seen_event "$f" "$surface_end" "$surface_ident"
       done <<EOF
 $FM_SIGNAL_SURFACE_ENDPOINTS
 EOF

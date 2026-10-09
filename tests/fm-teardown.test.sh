@@ -661,11 +661,13 @@ test_local_only_fork_remote_allows() {
 }
 
 test_teardown_closes_the_backlog_item_itself() {
-  local case_dir out
+  local case_dir out generation
   case_dir=$(make_case tasks-axi-close)
   write_meta "$case_dir" direct-PR ship
   printf '%s\n' 'pr=https://github.com/example/repo/pull/7' >> "$case_dir/state/task-x1.meta"
   seed_backlog_in_flight "$case_dir"
+  mkdir -p "$case_dir/data/task-x1"
+  generation=$(sed -n 's/^spawn_gen=//p' "$case_dir/state/task-x1.meta" | tail -1)
 
   out=$(run_teardown "$case_dir") || fail "teardown failed with a real backlog"
   [ "$(backlog_row_state "$case_dir")" = "done" ] \
@@ -674,6 +676,10 @@ test_teardown_closes_the_backlog_item_itself() {
     "closed backlog item did not record the task's PR"
   assert_absent "$case_dir/state/task-x1.backlog-close" \
     "a landed close left its pending-close record behind"
+  jq -se --arg generation "$generation" \
+    'any(.[]; .task == "task-x1" and .generation == $generation and .kind == "done" and .fields.transition == "close")' \
+    "$case_dir/data/task-x1/events.jsonl" >/dev/null \
+    || fail "a confirmed teardown did not retain its generation-stamped done event"
   printf '%s\n' "$out" | grep -F 'bin/fm-tasks-axi.sh ready' >/dev/null \
     || fail "teardown dropped the dependency-cleared follow-up: $out"
   printf '%s\n' "$out" | grep -F 'check date gates' >/dev/null \

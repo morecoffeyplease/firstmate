@@ -93,6 +93,10 @@ def projected($input; $saved; $now; $max_age):
        elif $o.can_merge == true then {actor:"captain",reason:"checks green; merge approval needed"}
        else {actor:"maintainer",reason:"delivery awaits the maintainer"} end) as $action
     | $k + {kind:($record.kind // (if ($k.url | contains("/issues/")) then "issue" else "pr" end)),
+         forge:(if $record.observation == null then null else {state:$o.state,title:$o.title,number:$o.number,
+           updated_at:$o.updated_at,merged_at:$o.merged_at,closed_at:$o.closed_at,head:$observed_head,
+           draft:$o.draft,review_decision:$o.review_decision,mergeable:$o.mergeable,
+           reviews:$reviews,checks:$checks,checked_at:$record.checked_at} end),
          checked_at:$record.checked_at,checked:$fresh,final:$final,head:($observed_head // $recorded_head // $o.head),verdict:$verdict,reviews:$reviews,
          distinct_checks:($checks | length),missing_verdicts:(($no_verdict | length) + (($o.absent_checks // []) | length)),
          pending_checks:($pending | length),failed_checks:($failed | length),

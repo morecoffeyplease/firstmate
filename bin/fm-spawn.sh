@@ -404,6 +404,8 @@ FM_HOME="${FM_HOME:-${FM_ROOT_OVERRIDE:-$FM_ROOT}}"
 . "$SCRIPT_DIR/fm-tasks-axi-lib.sh"
 # shellcheck source=bin/fm-backlog-transition-lib.sh
 . "$SCRIPT_DIR/fm-backlog-transition-lib.sh"
+# shellcheck source=bin/fm-issue-events-lib.sh
+. "$SCRIPT_DIR/fm-issue-events-lib.sh"
 
 resolve_directory_input() {
   local name=$1 path=$2 resolved raw_bytes
@@ -4790,6 +4792,8 @@ spawn_send_text_line "$T" "export GOTMPDIR=$TASK_TMP/gotmp"
 # syntax of its own.
 if [ "$KIND" = ship ] || [ "$KIND" = scout ]; then
   spawn_send_text_line "$T" "export FM_TASK_ID=$ID"
+  spawn_send_text_line "$T" "export FM_TASK_GENERATION=$SPAWN_GEN"
+  spawn_send_text_line "$T" "export FM_LANE_RECEIPTS=$(shell_quote "$DATA/$ID/lane-receipts")"
 fi
 # Send through the exact channel that already ships GOTMPDIR, so every backend
 # and harness - ship, scout, and secondmate - gets it before launch. Skipped
@@ -4814,7 +4818,7 @@ if [ "$LAUNCH_ENV_ENABLED" = 1 ]; then
     TMPDIR TMP TEMP GOTMPDIR TMUX TMUX_PANE HERDR_ENV HERDR_SESSION HERDR_SOCKET_PATH \
     HERDR_PANE_ID CMUX_WORKSPACE_ID CMUX_SURFACE_ID CMUX_TAB_ID CMUX_PANEL_ID \
     CMUX_SOCKET_PATH ZELLIJ ZELLIJ_SESSION_NAME ZELLIJ_PANE_ID FM_ZELLIJ_SESSION \
-    FM_TASK_ID \
+    FM_TASK_ID FM_TASK_GENERATION FM_LANE_RECEIPTS \
     $LAUNCH_ENV_NAMES; do
     # Only validated names enter shell syntax. Values expand once, quoted, in
     # the pane shell and never become source text or spawn-process snapshots.
@@ -4953,6 +4957,20 @@ trap - HUP INT TERM
 if [ "$SPAWN_BACKLOG_COMMIT_STATUS" -ne 0 ]; then
   exit "$SPAWN_BACKLOG_COMMIT_STATUS"
 fi
+if [ "$KIND" = ship ] || [ "$KIND" = scout ]; then
+  receipt_dir="$DATA/$ID/lane-receipts"
+  if mkdir -p "$receipt_dir" 2>/dev/null; then
+    marker_tmp=$(umask 077; mktemp "$receipt_dir/.instrumented.XXXXXX" 2>/dev/null || true)
+    if [ -n "$marker_tmp" ]; then
+      if printf '%s\n' "$SPAWN_GEN" > "$marker_tmp" && mv -f -- "$marker_tmp" "$receipt_dir/.instrumented"; then
+        :
+      else
+        rm -f -- "$marker_tmp" 2>/dev/null || true
+      fi
+    fi
+  fi
+fi
+fm_issue_event_append "$DATA/$ID" "$ID" "$SPAWN_GEN" started "$(jq -cn --arg kind "$KIND" '{kind:$kind}')" || true
 if [ -n "$SPAWN_DEFERRED_SIGNAL" ]; then
   case "$SPAWN_DEFERRED_SIGNAL" in
   HUP) SPAWN_DEFERRED_SIGNAL_STATUS=129 ;;

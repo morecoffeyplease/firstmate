@@ -12,9 +12,12 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 FM_ROOT="${FM_ROOT_OVERRIDE:-$(cd "$SCRIPT_DIR/.." && pwd)}"
 FM_HOME="${FM_HOME:-${FM_ROOT_OVERRIDE:-$FM_ROOT}}"
 STATE="${FM_STATE_OVERRIDE:-$FM_HOME/state}"
+DATA="${FM_DATA_OVERRIDE:-$FM_HOME/data}"
 
 # shellcheck source=bin/fm-pr-lib.sh
 . "$SCRIPT_DIR/fm-pr-lib.sh"
+# shellcheck source=bin/fm-issue-events-lib.sh
+. "$SCRIPT_DIR/fm-issue-events-lib.sh"
 # shellcheck source=bin/fm-wake-lib.sh
 . "$SCRIPT_DIR/fm-wake-lib.sh"
 # shellcheck source=bin/fm-parent-channel-lib.sh
@@ -133,6 +136,11 @@ fm_pr_metadata_identity_parse "$META" || exit 1
 [ "$FM_PR_META_PROVIDER" = "$PROVIDER" ] && [ "$FM_PR_META_URL" = "$URL" ] \
   && [ "$FM_PR_META_HOST" = "$HOST" ] && [ "$FM_PR_META_PATH" = "$PROJECT_PATH" ] \
   && [ "$FM_PR_META_NUMBER" = "$NUMBER" ] || exit 1
+SPAWN_GEN=$(grep '^spawn_gen=' "$META" | tail -1 | cut -d= -f2- || true)
+if [ -n "$SPAWN_GEN" ]; then
+  fm_issue_event_append "$DATA/$ID" "$ID" "$SPAWN_GEN" pr-bound \
+    "$(jq -cn --arg url "$URL" --arg head "$PR_HEAD" '{url:$url,head:$head}')" || true
+fi
 fm_lock_release "$META_LOCK"
 META_LOCK_HELD=0
 

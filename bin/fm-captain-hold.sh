@@ -214,6 +214,8 @@ DATA="${FM_DATA_OVERRIDE:-$FM_HOME/data}"
 # shellcheck source=bin/fm-backlog-transition-lib.sh
 # shellcheck disable=SC1091
 . "$SCRIPT_DIR/fm-backlog-transition-lib.sh"
+# shellcheck source=bin/fm-issue-events-lib.sh
+. "$SCRIPT_DIR/fm-issue-events-lib.sh"
 # shellcheck source=bin/fm-wake-lib.sh
 # shellcheck disable=SC1091
 . "$SCRIPT_DIR/fm-wake-lib.sh"
@@ -1912,9 +1914,30 @@ command_open() {  # <task-id> [--identity] [--distinguish-absent]
   exit 2
 }
 
+issue_event_for_task() { # <task> <kind>
+  local id=$1 kind=$2 meta generation fields
+  case "$id" in ''|*[!A-Za-z0-9._-]*) return 0 ;; esac
+  meta="$STATE/$id.meta"
+  [ -f "$meta" ] && [ ! -L "$meta" ] || return 0
+  generation=$(grep '^spawn_gen=' "$meta" | tail -1 | cut -d= -f2- || true)
+  [ -n "$generation" ] || return 0
+  fields=$(jq -cn '{source:"captain-hold"}') || return 0
+  fm_issue_event_append "$DATA/$id" "$id" "$generation" "$kind" "$fields" || true
+}
+
 case "${1:-}" in
-  hold) shift; command_hold "$@" ;;
-  answer) shift; command_answer "$@" ;;
+  hold)
+    shift
+    task_id=${1:-}
+    if command_hold "$@"; then issue_event_for_task "$task_id" held; else exit $?; fi
+    ;;
+  answer)
+    shift
+    task_id=${1:-}
+    event_kind=answered
+    for arg in "$@"; do [ "$arg" != --release ] || event_kind=released; done
+    if command_answer "$@"; then issue_event_for_task "$task_id" "$event_kind"; else exit $?; fi
+    ;;
   answers) shift; command_answers "$@" ;;
   reconcile-requests) shift; command_reconcile_requests "$@" ;;
   bind) shift; command_bind "$@" ;;

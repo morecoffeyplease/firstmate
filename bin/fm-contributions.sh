@@ -3,6 +3,7 @@
 #
 # Usage:
 #   fm-contributions.sh snapshot <input.json> [--all]
+#   fm-contributions.sh catalog <owner/repository>
 #   fm-contributions.sh poll
 #   fm-contributions.sh pending
 #   fm-contributions.sh verdict <task> <url> <judged-head> <source-url> <actor> <summary>
@@ -98,6 +99,33 @@ jq_lib() { # jq options/program via final argument
   local program=${!#}
   set -- "${@:1:$#-1}"
   jq -L "$SCRIPT_DIR" "$@" "include \"fm-contributions\"; $program"
+}
+
+catalog() { # <owner/repository>; observational, never touches ownership or wake state
+  local repo=$1 owner name raw rc
+  case "$repo" in
+    */*) owner=${repo%%/*}; name=${repo#*/} ;;
+    *) fail 'catalog needs canonical owner/repository' ;;
+  esac
+  case "$owner" in ''|*[!A-Za-z0-9._-]*) fail 'invalid canonical owner/repository' ;; esac
+  case "$name" in ''|*'/'*|*[!A-Za-z0-9._-]*) fail 'invalid canonical owner/repository' ;; esac
+  raw="$TMP/catalog-pages.jsonl"
+  rc=0
+  GH_PROMPT_DISABLED=1 GH_NO_UPDATE_NOTIFIER=1 \
+    gh-axi api "repos/$owner/$name/issues?state=all&per_page=100" --paginate --jq '.[]' --full \
+      > "$raw" 2> "$TMP/catalog.err" || rc=$?
+  if [ "$rc" -ne 0 ]; then
+    cat "$TMP/catalog.err" >&2
+    return "$rc"
+  fi
+  jq -s --arg repo "$repo" --arg now "$NOW" '
+    ([.[] | select(type == "object" and (has("pull_request") | not))
+       | select((.number|type)=="number" and (.title|type)=="string"
+         and (.html_url|type)=="string" and (.state|IN("open","closed")))
+       | {number,title,url:.html_url,state,updated_at:.updated_at}]
+       | sort_by(.number)) as $issues
+    | {schema:"fm-issue-catalog.v1",repository:$repo,observed_at:$now,
+       complete:true,issues:$issues,known:($issues|length)}' "$raw"
 }
 
 read_saved() {
@@ -212,7 +240,8 @@ observe() { # canonical GitHub URL -> normalized JSON
       --slurpfile statuses "$TMP/statuses.json" --slurpfile repo "$TMP/repo.json" '
       $core[0] as $c
       | ($reviews[0] | add // []) as $reviews
-      | {head:$c.head.sha,state:(if $c.merged_at != null then "merged" else $c.state end),
+      | {number:$c.number,title:$c.title,url:$c.html_url,updated_at:$c.updated_at,merged_at:$c.merged_at,closed_at:$c.closed_at,
+          head:$c.head.sha,state:(if $c.merged_at != null then "merged" else $c.state end),
           draft:$c.draft,mergeable:(if $c.mergeable == true then "mergeable" elif $c.mergeable == false then "conflicting" else "unknown" end),
           can_merge:($repo[0].permissions.push // false),
           review_decision:($after[0].reviewDecision // ""),
@@ -230,7 +259,8 @@ observe() { # canonical GitHub URL -> normalized JSON
     label=${FM_CONTRIBUTIONS_READY_LABEL:-ready-for-pr}
     forge api "repos/$part/issues/$number/events?per_page=100" --paginate --slurp > "$TMP/issue-events.json" || return 1
     jq -n --slurpfile timeline "$TMP/issue-events.json" --arg label "$label" --slurpfile core "$TMP/core.json" --slurpfile comments "$TMP/comments.json" '
-      $core[0] as $c | {state:$c.state,head:null,
+      $core[0] as $c | {number:$c.number,title:$c.title,url:$c.html_url,updated_at:$c.updated_at,
+        merged_at:$c.merged_at,closed_at:$c.closed_at,state:$c.state,head:null,
         ready:any($c.labels[]; (.name | ascii_downcase) == ($label | ascii_downcase)),
         checks:[],reviews:[],events:($comments[0] | add // []
           | map(select(.user.login != $c.user.login and (.author_association | IN("OWNER","MEMBER","COLLABORATOR")))
@@ -377,6 +407,10 @@ arm() {
 }
 
 case "${1:-}" in
+  catalog)
+    [ "$#" -eq 2 ] || fail 'catalog needs canonical owner/repository'
+    catalog "$2"
+    ;;
   snapshot)
     [ "$#" -ge 2 ] && [ "$#" -le 3 ] || fail 'snapshot needs canonical input'
     read_saved

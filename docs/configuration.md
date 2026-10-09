@@ -473,6 +473,17 @@ Non-Claude workers add new lesson files and append one line per file to `MEMORY.
 The resolved directory is recorded as `project_memory=` in task metadata only when the selected harness is covered.
 The registry is inherited into secondmate homes under the [`secondmate-provisioning`](../.agents/skills/secondmate-provisioning/SKILL.md) inherited-local-material contract.
 
+## Product verification lanes (config/project-lanes.json)
+
+`config/project-lanes.json` is an optional local, gitignored JSON object keyed by registered project name.
+Each project may define `full` and `verify` as nonempty argument arrays, for example `{"buttertrip-mvp":{"full":["npm","test"],"verify":["npm","run","verify"]}}`.
+The `focused` lane takes an explicit command and argument array at invocation time.
+`bin/fm-lane-run.sh` uses direct argument arrays and preserves its caller's working directory, environment, input, output streams, exit status, and signal result.
+Launch briefs include the exact wrapped full and verify commands for a configured project.
+Unwrapped commands remain invisible to the Issues projection.
+The project lane configuration is inherited into secondmate homes with the other primary-authoritative local config.
+The [local Issues view](issue-status.md) owns projection, catalog freshness, timestamp, and summary behavior.
+
 ## Crew dispatch profiles (config/crew-dispatch.json)
 
 `config/crew-dispatch.json` is an optional local, gitignored file containing natural-language rules that firstmate reads before dispatching a crewmate or scout.

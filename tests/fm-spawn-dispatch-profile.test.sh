@@ -1325,14 +1325,33 @@ SH
   done
 }
 
+test_project_lanes_config_is_inherited_by_default() {
+  local rec dest
+  rec=$(make_spawn_case project-lanes-inherit codex project-lanes-inherit)
+  read_case_record "$rec"
+  dest="$CASE_DIR/inherited-home"
+  mkdir -p "$dest/config"
+  printf '%s\n' '{"alpha":{"focused":["/bin/echo","focused"],"full":["/bin/echo","full"],"verify":["/bin/echo","verify"]}}' \
+    > "$HOME_DIR/config/project-lanes.json"
+  (
+    # shellcheck source=/dev/null
+    . "$ROOT/bin/fm-config-inherit-lib.sh"
+    propagate_inheritable_config "$HOME_DIR/config" "$dest/config"
+  ) || fail "project-lanes local configuration inheritance failed"
+  cmp -s "$HOME_DIR/config/project-lanes.json" "$dest/config/project-lanes.json" \
+    || fail "project-lanes.json was not copied by the default inheritable configuration set"
+  pass "project-lanes.json is inherited by default through local configuration propagation"
+}
+
 test_launch_environment_allowlist
 test_launch_environment_invalid_config_refuses
 test_launch_environment_inaccessible_config_refuses
 test_launch_environment_inherited_by_secondmate
 test_launch_environment_inheritance_preserves_on_source_errors
+test_project_lanes_config_is_inherited_by_default
 
 test_worker_launch_delivers_role_scope() {
-  local rec id out launch kind prompt envelope encoded brief_kind brief content first_line role_line task_line inbox
+  local rec id out launch command_lines command_log kind prompt envelope encoded brief_kind brief content first_line role_line task_line inbox generation receipt_dir
   for brief_kind in heading legacy scaffold; do
   for kind in direct-PR local-only scout; do
     id="role-launch-$brief_kind-$kind"
@@ -1361,13 +1380,26 @@ test_worker_launch_delivers_role_scope() {
 printf '%s\n' "$@" > "$FM_ROLE_PROMPT"
 SH
     chmod +x "$FAKEBIN_DIR/codex"
+    command_log="$LAUNCH_LOG.commands"
+    : > "$command_log"
     if [ "$kind" = scout ]; then
-      out=$(run_spawn "$HOME_DIR" "$WT_DIR" "$FAKEBIN_DIR" "$LAUNCH_LOG" "$id" "$PROJ_DIR" --scout)
+      out=$(FM_FAKE_CMD_LOG="$command_log" run_spawn "$HOME_DIR" "$WT_DIR" "$FAKEBIN_DIR" "$LAUNCH_LOG" "$id" "$PROJ_DIR" --scout)
     else
-      out=$(run_spawn "$HOME_DIR" "$WT_DIR" "$FAKEBIN_DIR" "$LAUNCH_LOG" "$id" "$PROJ_DIR" --mode "$kind" --yolo off)
+      out=$(FM_FAKE_CMD_LOG="$command_log" run_spawn "$HOME_DIR" "$WT_DIR" "$FAKEBIN_DIR" "$LAUNCH_LOG" "$id" "$PROJ_DIR" --mode "$kind" --yolo off)
     fi
     expect_code 0 "$?" "$kind worker spawn failed: $out"
     launch=$(cat "$LAUNCH_LOG")
+    command_lines=$(cat "$command_log")
+    generation=$(sed -n 's/^spawn_gen=//p' "$HOME_DIR/state/$id.meta" | tail -1)
+    receipt_dir="$HOME_DIR/data/$id/lane-receipts"
+    [ -n "$generation" ] || fail "$kind worker metadata did not record its spawn generation"
+    assert_contains "$command_lines" "export FM_TASK_ID=$id" "$kind command stream omitted its task ID export"
+    assert_contains "$command_lines" "export FM_TASK_GENERATION=$generation" "$kind command stream omitted its receipt generation export"
+    assert_contains "$command_lines" "export FM_LANE_RECEIPTS=" "$kind command stream omitted its task-specific receipt directory variable"
+    assert_contains "$command_lines" "$receipt_dir" "$kind command stream omitted its task-specific receipt directory path"
+    assert_present "$receipt_dir/.instrumented" "$kind spawn did not publish its instrumentation marker"
+    [ "$(cat "$receipt_dir/.instrumented")" = "$generation" ] \
+      || fail "$kind instrumentation marker did not match the task generation"
     envelope="$CASE_DIR/prompt-envelope"
     encoded="$CASE_DIR/encoded-prompt"
     prompt="$CASE_DIR/prompt"

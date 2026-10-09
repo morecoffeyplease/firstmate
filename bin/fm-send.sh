@@ -261,6 +261,8 @@ fi
 . "$SCRIPT_DIR/fm-task-inbox-lib.sh"
 # shellcheck source=bin/fm-timeout-lib.sh
 . "$SCRIPT_DIR/fm-timeout-lib.sh"
+# shellcheck source=bin/fm-issue-events-lib.sh
+. "$SCRIPT_DIR/fm-issue-events-lib.sh"
 
 FM_GUARD_CONTINUE_LINE='This is a supervision warning only; the requested message WILL still be sent.' "$SCRIPT_DIR/fm-guard.sh" || true
 
@@ -702,7 +704,7 @@ fi
 # (bin/fm-wake-lib.sh) and does not wake this same session again; any
 # concurrent foreign status bytes leave the watcher's wake path untouched.
 fm_send_close_resolved_keys() { # <answer-text>
-  local note=$1 k line close_note append_rc still manual_close_cmd
+  local note=$1 k line close_note append_rc still manual_close_cmd task_generation
   note=$(printf '%s' "$note" | tr '\n\r\t' '   ' | LC_ALL=C tr -d '\000-\037\177')
   for k in $RESOLVE_STATUS_KEYS; do
     close_note=$(fm_send_resolve_close_note "$k" "$note")
@@ -722,6 +724,8 @@ fm_send_close_resolved_keys() { # <answer-text>
       return 1
       ;;
     esac
+    task_generation=$(fm_meta_get "$TARGET_META" spawn_gen)
+    fm_issue_event_append "$FM_HOME/data/$RESOLVE_TASK_ID" "$RESOLVE_TASK_ID" "$task_generation" decision-resolved "$(jq -cn --arg key "$k" '{key:$key}')" || true
   done
 }
 

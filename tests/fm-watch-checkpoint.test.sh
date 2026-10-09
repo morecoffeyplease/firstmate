@@ -31,6 +31,8 @@ test_quiet_checkpoint_exits_124_cleanly() {
 test_signal_passes_through_and_exits_zero() {
   local home out err status drained
   home=$(make_home signal)
+  mkdir -p "$home/data/demo"
+  printf '%s\n' 'spawn_gen=watch-gen-1' > "$home/state/demo.meta"
   out="$home/out.txt"
   err="$home/err.txt"
   (
@@ -43,6 +45,10 @@ test_signal_passes_through_and_exits_zero() {
   assert_contains "$(cat "$out")" "signal:" "signal wake was not passed through"
   drained=$(FM_HOME="$home" "$ROOT/bin/fm-wake-drain.sh")
   assert_contains "$drained" $'\tsignal\tdemo.status\t' "signal wake was not queued durably"
+  jq -se --arg generation watch-gen-1 \
+    'any(.[]; .task == "demo" and .generation == $generation and .kind == "status-seen" and .class == "detected" and .fields.state == "done")' \
+    "$home/data/demo/events.jsonl" >/dev/null \
+    || fail "status observation did not append the generation-stamped detected event"
   pass "checkpoint passes through a real watcher wake and leaves the queue for drain"
 }
 
