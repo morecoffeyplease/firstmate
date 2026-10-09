@@ -3790,7 +3790,7 @@ esac
 SH
   chmod +x "$fakebin/tmux"
   output=$(FM_STUCK_PS_TABLE="$dir/processes" FM_FAKE_TMUX_PANE_PID=1000 \
-    FM_STUCK_HEARTBEAT_SECS=99999 FM_STUCK_PROGRESS_SECS=9999 FM_STUCK_COMMAND_SECS=1 \
+    FM_STUCK_HEARTBEAT_SECS=99999 FM_STUCK_PROGRESS_SECS=3600 FM_STUCK_COMMAND_SECS=1 \
     FM_STUCK_DRAFT_PR_SECS=99999 FM_STUCK_REVIEW_SECS=99999 FM_STUCK_READY_PR_SECS=99999 \
     stuck_scan "$state" "$fakebin")
   [ -z "$output" ] || fail "an idle Claude worker's long-lived MCP process caused a breach: $output"
@@ -3809,7 +3809,7 @@ SH
 2002 2001 00:58:00 node node /worker/mcp-server.js
 PS
   output=$(FM_STUCK_PS_TABLE="$dir/processes" \
-    FM_STUCK_HEARTBEAT_SECS=1 FM_STUCK_PROGRESS_SECS=1 FM_STUCK_COMMAND_SECS=1 \
+    FM_STUCK_HEARTBEAT_SECS=1 FM_STUCK_PROGRESS_SECS=3600 FM_STUCK_COMMAND_SECS=1 \
     FM_STUCK_DRAFT_PR_SECS=99999 FM_STUCK_REVIEW_SECS=99999 FM_STUCK_READY_PR_SECS=99999 \
     stuck_scan "$state" "$fakebin")
   [ -z "$output" ] || fail "a completed lane triggered heartbeat, no-progress, or long-command: $output"
@@ -3825,19 +3825,123 @@ PS
   printf '%s\tfresh heartbeat\n' "$now" > "$state/$id.heartbeat"
   printf '%s\n' "$now" > "$state/$id.started"
   output=$(FM_STUCK_PS_TABLE="$dir/processes" FM_STUCK_HEARTBEAT_SECS=9999 \
-    FM_STUCK_PROGRESS_SECS=1 FM_STUCK_COMMAND_SECS=9999 FM_STUCK_DRAFT_PR_SECS=99999 \
+    FM_STUCK_PROGRESS_SECS=3600 FM_STUCK_COMMAND_SECS=9999 FM_STUCK_DRAFT_PR_SECS=99999 \
     FM_STUCK_REVIEW_SECS=99999 FM_STUCK_READY_PR_SECS=99999 \
     stuck_scan "$state" "$fakebin")
   [ -z "$output" ] || fail "a fresh lane inherited no-progress from its old base commit: $output"
   printf '%s\tfreshness expired\n' "$((now - 7200))" > "$state/$id.heartbeat"
   printf '%s\n' "$((now - 7200))" > "$state/$id.started"
   output=$(FM_STUCK_PS_TABLE="$dir/processes" FM_STUCK_HEARTBEAT_SECS=99999 \
-    FM_STUCK_PROGRESS_SECS=1 FM_STUCK_COMMAND_SECS=9999 FM_STUCK_DRAFT_PR_SECS=99999 \
+    FM_STUCK_PROGRESS_SECS=3600 FM_STUCK_COMMAND_SECS=9999 FM_STUCK_DRAFT_PR_SECS=99999 \
     FM_STUCK_REVIEW_SECS=99999 FM_STUCK_READY_PR_SECS=99999 \
     stuck_scan "$state" "$fakebin")
   printf '%s\n' "$output" | grep -F "stuck: $id no-progress" >/dev/null \
     || fail "an aged lane with an old base commit and heartbeat did not breach no-progress: $output"
   pass "idle MCP children and completed lanes do not trigger active-worker stuck rules"
+}
+
+test_stuck_board_command_ownership_matrix() {
+  local dir state fakebin now output
+  dir=$(make_case stuck-board-command-ownership); state="$dir/state"; fakebin="$dir/fakebin"
+  now=$(date +%s)
+  # These fixtures match Codex and Claude process shapes captured with ps on 2026-10-09.
+  # They include Codex's shell-free npm-to-node command and long-lived tool helpers.
+  cat > "$dir/processes" <<'PS'
+1000 1 02:00:00 bash bash
+1001 1000 01:59:00 claude claude
+1002 1001 01:50:00 zsh zsh -c npm test
+1003 1002 01:49:00 npm npm test
+2000 1 02:00:00 bash bash
+2001 2000 01:59:00 codex codex
+2002 2001 01:50:00 npm npm exec vitest
+2003 2002 01:49:00 node node /repo/node_modules/.bin/vitest run
+3000 1 02:00:00 bash bash
+3001 3000 01:59:00 claude claude
+3002 3001 01:58:00 node node /worker/mcp-server.js
+3003 3001 01:58:00 node node /app/cua-repl.mjs
+3004 3001 01:58:00 node_repl node_repl
+3005 3001 01:58:00 codex-code-mode-host codex-code-mode-host
+4000 1 02:00:00 bash bash
+4001 4000 01:59:00 codex codex
+4002 4001 01:50:00 node node /repo/node_modules/.bin/vitest run
+5000 1 02:00:00 bash bash
+5001 5000 01:59:00 claude claude
+5002 5001 01:50:00 zsh zsh -c npm test
+5003 5002 01:49:00 npm npm test
+6000 1 02:00:00 bash bash
+6001 6000 01:59:00 codex codex
+6002 6001 01:50:00 node node /repo/node_modules/.bin/vitest run
+7000 1 02:00:00 bash bash
+7001 7000 01:59:00 claude claude
+7002 7001 01:50:00 zsh zsh -c test-suite
+8000 1 02:00:00 bash bash
+8001 8000 01:00:20 codex codex
+8002 8001 01:00:00 node node /repo/node_modules/.bin/vitest run
+PS
+  write_stuck_fake_ps "$fakebin"
+  cat > "$fakebin/tmux" <<'SH'
+#!/usr/bin/env bash
+case "$*" in
+  *claude-shell*) printf '1000\n' ;;
+  *idle-helper*) printf '3000\n' ;;
+  *codex-tmux*) printf '4000\n' ;;
+  *terminal-done*) printf '6000\n' ;;
+  *terminal-paused*) printf '7000\n' ;;
+  *early-command*) printf '8000\n' ;;
+  *) exit 1 ;;
+esac
+SH
+  cat > "$fakebin/herdr" <<'SH'
+#!/usr/bin/env bash
+case "$*" in
+  'pane process-info --pane pane-codex --session session-codex')
+    printf '{"result":{"type":"pane_process_info","process_info":{"pane_id":"pane-codex","shell_pid":2000}}}\n'
+    ;;
+  'pane process-info --pane pane-claude --session session-claude')
+    printf '{"result":{"type":"pane_process_info","process_info":{"pane_id":"pane-claude","shell_pid":5000}}}\n'
+    ;;
+  *) exit 64 ;;
+esac
+SH
+  chmod +x "$fakebin/tmux" "$fakebin/herdr"
+  printf 'window=test:fm-claude-shell\nkind=scout\nharness=claude\n' > "$state/claude-shell.meta"
+  printf 'window=test:fm-codex-herdr\nkind=scout\nharness=codex\nbackend=herdr\nherdr_session=session-codex\nherdr_pane_id=pane-codex\n' > "$state/codex-herdr.meta"
+  printf 'window=test:fm-codex-tmux\nkind=scout\nharness=codex\n' > "$state/codex-tmux.meta"
+  printf 'window=test:fm-claude-herdr\nkind=scout\nharness=claude\nbackend=herdr\nherdr_session=session-claude\nherdr_pane_id=pane-claude\n' > "$state/claude-herdr.meta"
+  printf 'window=test:fm-idle-helper\nkind=scout\nharness=claude\n' > "$state/idle-helper.meta"
+  printf 'window=test:fm-terminal-done\nkind=scout\nharness=codex\n' > "$state/terminal-done.meta"
+  printf 'window=test:fm-terminal-paused\nkind=ship\nharness=claude\n' > "$state/terminal-paused.meta"
+  printf 'window=test:fm-early-command\nkind=scout\nharness=codex\n' > "$state/early-command.meta"
+  for id in claude-shell codex-herdr codex-tmux claude-herdr idle-helper terminal-done terminal-paused early-command; do
+    printf '%s\tactive\n' "$now" > "$state/$id.heartbeat"
+    printf '%s\n' "$now" > "$state/$id.started"
+  done
+  printf 'working: running tests\n' > "$state/claude-shell.status"
+  printf 'working: running tests\n' > "$state/codex-herdr.status"
+  printf 'working: running tests\n' > "$state/codex-tmux.status"
+  printf 'working: running tests\n' > "$state/claude-herdr.status"
+  printf 'working: waiting for MCP\n' > "$state/idle-helper.status"
+  printf 'done: finished\n' > "$state/terminal-done.status"
+  printf 'paused: waiting for input\n' > "$state/terminal-paused.status"
+  printf 'working: running a test command started with the worker\n' > "$state/early-command.status"
+
+  output=$(FM_STUCK_PS_TABLE="$dir/processes" FM_FAKE_TMUX_PANE_PID=1000 \
+    FM_STUCK_HEARTBEAT_SECS=99999 FM_STUCK_PROGRESS_SECS=86400 FM_STUCK_COMMAND_SECS=60 \
+    FM_STUCK_DRAFT_PR_SECS=99999 FM_STUCK_REVIEW_SECS=99999 FM_STUCK_READY_PR_SECS=99999 \
+    FM_BACKEND_HERDR_CLIENT_SESSION=unused-session stuck_scan "$state" "$fakebin")
+  printf '%s\n' "$output" | grep -F 'stuck: claude-shell long-command' >/dev/null \
+    || fail "a retained shell running npm was not attributed to Claude: $output"
+  printf '%s\n' "$output" | grep -F 'stuck: codex-herdr long-command' >/dev/null \
+    || fail "a shell-free npm-to-node command was not attributed through Herdr: $output"
+  printf '%s\n' "$output" | grep -F 'stuck: codex-tmux long-command' >/dev/null \
+    || fail "a shell-free Node command was not attributed through tmux: $output"
+  printf '%s\n' "$output" | grep -F 'stuck: claude-herdr long-command' >/dev/null \
+    || fail "a retained-shell command was not attributed through Herdr: $output"
+  printf '%s\n' "$output" | grep -F 'stuck: early-command long-command' >/dev/null \
+    || fail "a command started within 30 seconds of its worker was not attributed: $output"
+  ! printf '%s\n' "$output" | grep -E 'stuck: (idle-helper|terminal-done|terminal-paused) long-command' >/dev/null \
+    || fail "an idle helper or terminal lane was attributed a command: $output"
+  pass "command ownership covers shell-hosted and shell-free Codex/Claude trees on tmux and Herdr, while excluding MCP helpers and terminal lanes"
 }
 
 test_stuck_board_supports_herdr_process_info() {
@@ -5744,6 +5848,7 @@ test_busy_pane_stable_hash_escalates_past_turn_age_bound
 test_busy_pane_changing_hash_escalates_past_turn_age_bound
 test_ticking_live_worker_with_missing_heartbeat_and_long_child_wakes_stuck_board
 test_stuck_board_ignores_idle_mcp_child_and_terminal_lane
+test_stuck_board_command_ownership_matrix
 test_stuck_board_supports_herdr_process_info
 test_stuck_board_handles_pr_boolean_empty_review_and_failed_reads
 test_slow_forge_read_does_not_starve_later_local_stuck_breach

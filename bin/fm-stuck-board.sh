@@ -205,9 +205,29 @@ process_is_descendant() {  # <ps-output> <child-pid> <ancestor-pid>
   ' <<< "$1"
 }
 
+process_is_persistent_helper() {  # <comm> <command-line>
+  awk -v comm="$1" -v args="$2" 'BEGIN {
+    command = tolower(comm " " args)
+    if (command ~ /(^|[\/. _-])mcp([\/. _-]|$)/ || command ~ /mcp[-_]server/ \
+      || command ~ /language[-_ ]server/ || command ~ /(^|[\/. _-])lsp([\/. _-]|$)/ \
+      || command ~ /extension[-_ ]host/ || command ~ /plugin[-_ ]host/ \
+      || command ~ /watchman/ || command ~ /file[-_ ]watcher/ \
+      || command ~ /cua[-_]repl/ || command ~ /node_repl/ || command ~ /codex-code-mode-host/) exit 0
+    exit 1
+  }'
+}
+
+process_runs_shell_command() {  # <command-line>
+  awk -v args="$1" 'BEGIN {
+    command = tolower(args)
+    if (command ~ /(^|[[:space:]])-[a-z]*c([[:space:]]|$)/) exit 0
+    exit 1
+  }'
+}
+
 command_age() {
-  local meta=$1 root table rows harness agent_pid='' agent_age=0 agent_depth=999
-  local pid depth etime comm args argv0 verdict age launch_delta maximum=0
+  local meta=$1 root table rows harness agent_pid='' agent_depth=999
+  local pid depth etime comm args argv0 verdict age maximum=0
   root=$(pane_process_root "$meta") || return 1
   case "$root" in ''|*[!0-9]*) return 1 ;; esac
   table=$(ps -axo pid=,ppid=,etime=,comm=,args= 2>/dev/null) || return 1
@@ -226,7 +246,6 @@ command_age() {
     if [ "$depth" -lt "$agent_depth" ]; then
       agent_pid=$pid
       agent_depth=$depth
-      agent_age=$(elapsed_seconds "$etime" || echo 0)
     fi
   done <<EOF_AGENT
 $rows
@@ -236,11 +255,11 @@ EOF_AGENT
   while IFS=$'\t' read -r pid depth etime comm args; do
     [ -n "$pid" ] && [ "$depth" -gt "$agent_depth" ] || continue
     process_is_descendant "$table" "$pid" "$agent_pid" || continue
-    verdict=$(fm_agent_process_classify_name "$comm" "${args%% *}")
-    [ "$verdict" = shell ] || continue
+    verdict=$(fm_agent_process_classify "$comm" "${args%% *}" "$args" "$pid")
+    [ "$verdict" != agent ] || continue
+    process_is_persistent_helper "$comm" "$args" && continue
+    [ "$verdict" != shell ] || process_runs_shell_command "$args" || continue
     age=$(elapsed_seconds "$etime" || echo 0)
-    launch_delta=$((agent_age - age))
-    [ "$launch_delta" -gt 30 ] || continue
     [ "$age" -gt "$maximum" ] && maximum=$age
   done <<EOF_COMMANDS
 $rows
