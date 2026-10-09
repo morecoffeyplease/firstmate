@@ -46,6 +46,8 @@ jobs:
       # and the pre-push gate on this script so a self-broken ci.yml still
       # fails locally before merge.
       - run: bin/fm-lint.sh
+        env:
+          FM_LINT_JOBS: "1"
 
   # Deterministic proof that portable parallel shards + portable serial + Herdr
   # equal the complete tests/*.test.sh inventory with no missing or duplicates,
