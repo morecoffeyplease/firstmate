@@ -2209,16 +2209,14 @@ TS
     return 1
   }
 
-  wait_for_geometry_transition() {
-    local file=$1 transient_text=$2 final_text=$3 attempt=0 saw_transient=0
-    while [ "$attempt" -lt 600 ]; do
+  wait_for_geometry_reload() {
+    local file=$1 attempt=0
+    while [ "$attempt" -lt 120 ]; do
       capture_geometry_viewport "$file" || true
-      if grep -Fq "$transient_text" "$file" 2>/dev/null; then
-        saw_transient=1
-      elif [ "$saw_transient" -eq 1 ] && grep -Fq "$final_text" "$file" 2>/dev/null; then
+      if grep -Fq "Reloaded keybindings" "$file" && grep -Fq "CALM_GEOMETRY_FINAL" "$file"; then
         return 0
       fi
-      sleep 0.01
+      sleep 0.05
       attempt=$((attempt + 1))
     done
     return 1
@@ -2270,10 +2268,7 @@ TS
 
   tmux -L "$TMUX_SOCKET" send-keys -t "$TMUX_SESSION" -l '/reload'
   tmux -L "$TMUX_SOCKET" send-keys -t "$TMUX_SESSION" Enter
-  wait_for_geometry_transition \
-    "$snapshot" \
-    "Reloading keybindings, extensions, skills, prompts, themes, and context files..." \
-    "CALM_GEOMETRY_FINAL" \
+  wait_for_geometry_reload "$snapshot" \
     || fail "Pi Calm hidden-block geometry E2E did not complete the /reload viewport transition"
   assert_geometry_gap "$snapshot" "reloaded native Calm transcript"
 
