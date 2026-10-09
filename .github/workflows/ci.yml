@@ -50,6 +50,8 @@ jobs:
       # and the pre-push gate on this script so a self-broken ci.yml still
       # fails locally before merge.
       - name: Run bin/fm-lint.sh with runner profiling
+        env:
+          FM_LINT_JOBS: "1"
         run: |
           set -u
           profile="$RUNNER_TEMP/fm-lint-profile-${{ strategy.job-index }}"
