@@ -150,6 +150,8 @@ fm_lint_worker() {  # <manifest> <output-dir> <shard-index>
         fi
         printf '%s\t%s\t%s\t%s\t%s\t%s\n' \
           "$shard_index" "$path" "$root_index" "$root_started" "$root_ended" "$root_timing" >> "$root_profile"
+        printf 'fm-lint-root\tshard=%s\tpath=%s\tstart=%s\tend=%s\t%s\n' \
+          "$shard_index" "$path" "$root_started" "$root_ended" "$root_timing" >&2
       fi
       if [ "$rc" -eq 0 ] && [ "$invocation_rc" -ne 0 ]; then
         rc=$invocation_rc

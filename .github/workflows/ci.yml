@@ -74,21 +74,22 @@ jobs:
               mem_total_kib=$(awk '/^MemTotal:/ {print $2}' /proc/meminfo)
               shellcheck_count=$(pgrep -x shellcheck 2>/dev/null | wc -l | tr -d '[:space:]')
               shellcheck_rss_kib=$(ps -C shellcheck -o rss= 2>/dev/null | awk '{sum += $1} END {printf "%.0f", sum + 0}')
-              printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+              printf 'fm-lint-memory\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
                 "$timestamp" "$memory_current" "$memory_peak" "$memory_events" \
-                "$mem_total_kib" "$mem_available_kib" "${shellcheck_count:-0}" "$shellcheck_rss_kib"
-              sleep 5
+                "$mem_total_kib" "$mem_available_kib" "${shellcheck_count:-0}" "$shellcheck_rss_kib" \
+                | tee -a "$profile/memory-samples.tsv"
+              sleep 30
             done
           }
-          capture_runner_state > "$profile/runner.before.tsv"
-          sample_runner_memory > "$profile/memory-samples.tsv" &
+          capture_runner_state | tee "$profile/runner.before.tsv"
+          sample_runner_memory &
           sampler_pid=$!
           finish_profile() {
             rc=$?
             trap - EXIT TERM
             kill "$sampler_pid" 2>/dev/null || true
             wait "$sampler_pid" 2>/dev/null || true
-            capture_runner_state > "$profile/runner.after.tsv"
+            capture_runner_state | tee "$profile/runner.after.tsv"
             printf 'lint_exit\t%s\n' "$rc" > "$profile/result.tsv"
             printf '%s\n' 'Runner memory before:'
             cat "$profile/runner.before.tsv"
