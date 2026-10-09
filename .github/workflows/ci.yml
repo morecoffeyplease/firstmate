@@ -45,7 +45,64 @@ jobs:
       # and GitHub workflow lint). Do not re-spell the checks here; keep CI
       # and the pre-push gate on this script so a self-broken ci.yml still
       # fails locally before merge.
-      - run: bin/fm-lint.sh
+      - name: Run bin/fm-lint.sh with runner profiling
+        run: |
+          set -u
+          profile="$RUNNER_TEMP/fm-lint-profile"
+          mkdir -p "$profile"
+          capture_runner_state() {
+            printf 'timestamp_utc\t%s\n' "$(date -u +%FT%TZ)"
+            for metric in memory.current memory.peak memory.events; do
+              if [ -r "/sys/fs/cgroup/$metric" ]; then
+                printf '%s\t' "$metric"
+                tr '\n' ' ' < "/sys/fs/cgroup/$metric"
+                printf '\n'
+              fi
+            done
+            awk '/^MemAvailable:/ {print "mem_available_kib\t" $2}' /proc/meminfo
+          }
+          sample_runner_memory() {
+            while :; do
+              timestamp=$(date -u +%s)
+              memory_current=$(cat /sys/fs/cgroup/memory.current 2>/dev/null || printf unavailable)
+              memory_peak=$(cat /sys/fs/cgroup/memory.peak 2>/dev/null || printf unavailable)
+              memory_events=$(awk '$1 == "oom" || $1 == "oom_kill" || $1 == "oom_group_kill" {printf "%s=%s,", $1, $2}' /sys/fs/cgroup/memory.events 2>/dev/null || printf unavailable)
+              shellcheck_count=$(pgrep -x shellcheck 2>/dev/null | wc -l | tr -d '[:space:]')
+              shellcheck_rss_kib=$(ps -C shellcheck -o rss= 2>/dev/null | awk '{sum += $1} END {printf "%.0f", sum + 0}')
+              printf '%s\t%s\t%s\t%s\t%s\t%s\n' "$timestamp" "$memory_current" "$memory_peak" "$memory_events" "${shellcheck_count:-0}" "$shellcheck_rss_kib"
+              sleep 5
+            done
+          }
+          capture_runner_state > "$profile/runner.before.tsv"
+          sample_runner_memory > "$profile/memory-samples.tsv" &
+          sampler_pid=$!
+          finish_profile() {
+            rc=$?
+            trap - EXIT TERM
+            kill "$sampler_pid" 2>/dev/null || true
+            wait "$sampler_pid" 2>/dev/null || true
+            capture_runner_state > "$profile/runner.after.tsv"
+            printf 'lint_exit\t%s\n' "$rc" > "$profile/result.tsv"
+            printf '%s\n' 'Runner memory before:'
+            cat "$profile/runner.before.tsv"
+            printf '%s\n' 'Runner memory after:'
+            cat "$profile/runner.after.tsv"
+            if [ -d "$profile/summary.tsv.roots" ]; then
+              printf '%s\n' 'Per-root ShellCheck profile:'
+              cat "$profile"/summary.tsv.roots/worker.*.tsv 2>/dev/null || true
+            fi
+            exit "$rc"
+          }
+          trap 'exit 143' TERM
+          trap finish_profile EXIT
+          FM_LINT_TELEMETRY="$profile/summary.tsv" bin/fm-lint.sh
+      - name: Upload lint runner profile
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fm-lint-runner-profile
+          path: ${{ runner.temp }}/fm-lint-profile
+          if-no-files-found: warn
 
   # Deterministic proof that portable parallel shards + portable serial + Herdr
   # equal the complete tests/*.test.sh inventory with no missing or duplicates,

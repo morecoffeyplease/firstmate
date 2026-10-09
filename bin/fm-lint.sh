@@ -46,8 +46,8 @@
 # deterministic shard and root order after every worker finishes. FM_LINT_JOBS=1
 # runs the same shards serially with byte-identical diagnostics and exit selection.
 #
-# Optional quiet telemetry writes one bounded TSV snapshot of content and source
-# graph identity, wall/CPU/RSS, shard load, and competing ShellCheck processes.
+# Optional telemetry writes a bounded TSV snapshot and per-root wall/RSS data.
+# The snapshot covers content/source identity, shard load, and ShellCheck processes.
 #
 # Usage:
 #   fm-lint.sh                         lint the context-selected file set (see above)
@@ -80,6 +80,7 @@ fm_lint_worker_stop() {
 
 fm_lint_worker() {  # <manifest> <output-dir> <shard-index>
   local manifest=$1 output_dir=$2 shard_index=$3 tab index path output invocation_rc rc=0
+  local root_timing root_profile root_index=0
   local -a roots shellcheck_args
   roots=()
   tab=$(printf '\t')
@@ -113,11 +114,40 @@ fm_lint_worker() {  # <manifest> <output-dir> <shard-index>
     # before any diagnostic could name a culprit; one process per root caps
     # peak memory at the single largest root instead of their sum.
     for path in "${roots[@]}"; do
+      root_index=$((root_index + 1))
       invocation_rc=0
-      "$FM_LINT_SHELLCHECK" "${shellcheck_args[@]}" -- "$path" >> "$output.out" 2>&1 &
+      if [ -n "${FM_LINT_INTERNAL_ROOT_PROFILE_DIR:-}" ] && [ -x /usr/bin/time ]; then
+        root_timing="$FM_LINT_INTERNAL_ROOT_PROFILE_DIR/root.$shard_index.$root_index.time"
+        root_profile="$FM_LINT_INTERNAL_ROOT_PROFILE_DIR/worker.$shard_index.tsv"
+        if [ "$(uname)" = Darwin ]; then
+          /usr/bin/time -lp -o "$root_timing" \
+            "$FM_LINT_SHELLCHECK" "${shellcheck_args[@]}" -- "$path" >> "$output.out" 2>&1 &
+        else
+          /usr/bin/time -f 'wall_seconds=%e user_seconds=%U system_seconds=%S max_rss_kib=%M' \
+            -o "$root_timing" "$FM_LINT_SHELLCHECK" "${shellcheck_args[@]}" -- "$path" >> "$output.out" 2>&1 &
+        fi
+      else
+        root_timing=
+        root_profile=
+        "$FM_LINT_SHELLCHECK" "${shellcheck_args[@]}" -- "$path" >> "$output.out" 2>&1 &
+      fi
       FM_LINT_WORKER_SHELLCHECK_PID=$!
       wait "$FM_LINT_WORKER_SHELLCHECK_PID" || invocation_rc=$?
       FM_LINT_WORKER_SHELLCHECK_PID=
+      if [ -n "$root_profile" ] && [ -s "$root_timing" ]; then
+        if [ "$(uname)" = Darwin ]; then
+          root_timing=$(awk '
+            /^real / {wall=$2}
+            /^user / {user=$2}
+            /^sys / {sys_cpu=$2}
+            /maximum resident set size/ {rss=$1}
+            END {printf "wall_seconds=%s user_seconds=%s system_seconds=%s max_rss_bytes=%s", wall, user, sys_cpu, rss}
+          ' "$root_timing")
+        else
+          root_timing=$(cat "$root_timing")
+        fi
+        printf '%s\t%s\t%s\t%s\n' "$shard_index" "$path" "$root_index" "$root_timing" >> "$root_profile"
+      fi
       if [ "$rc" -eq 0 ] && [ "$invocation_rc" -ne 0 ]; then
         rc=$invocation_rc
       fi
@@ -396,6 +426,7 @@ fm_lint_run_backend_purity() {
 
 JOBS=${FM_LINT_JOBS:-2}
 TELEMETRY=${FM_LINT_TELEMETRY:-}
+ROOT_PROFILE_DIR=
 FAST=0
 ANALYSIS_MODE=full
 LIST_FILES=0
@@ -572,6 +603,11 @@ if [ -n "$TELEMETRY" ]; then
     printf 'fm-lint.sh: telemetry directory does not exist: %s\n' "$telemetry_parent" >&2
     exit 2
   }
+  ROOT_PROFILE_DIR="$TELEMETRY.roots"
+  mkdir -p "$ROOT_PROFILE_DIR" || {
+    printf 'fm-lint.sh: could not create root profile directory %s.\n' "$ROOT_PROFILE_DIR" >&2
+    exit 2
+  }
 fi
 
 TMP_ROOT=$(mktemp -d "${TMPDIR:-/tmp}/fm-lint.XXXXXX") || exit 1
@@ -692,6 +728,7 @@ fm_lint_run_worker() {  # <worker-index>
         /usr/bin/time -lp -o "$timing" \
         env FM_LINT_INTERNAL=1 FM_LINT_INTERNAL_FAST="$FAST" \
         FM_LINT_INTERNAL_FOLLOW_SOURCES="$FOLLOW_SOURCES" FM_LINT_INTERNAL_EXCLUDE="$EXCLUDE_CODES" \
+        FM_LINT_INTERNAL_ROOT_PROFILE_DIR="$ROOT_PROFILE_DIR" \
         FM_LINT_SHELLCHECK="$SHELLCHECK_BIN" \
         "${BASH:-bash}" "$SELF" --internal-worker "$manifest" "$OUTPUT_DIR" "$worker_index"
     else
@@ -699,6 +736,7 @@ fm_lint_run_worker() {  # <worker-index>
         /usr/bin/time -f 'wall_seconds=%e\nuser_seconds=%U\nsystem_seconds=%S\nmax_rss_kib=%M' -o "$timing" \
         env FM_LINT_INTERNAL=1 FM_LINT_INTERNAL_FAST="$FAST" \
         FM_LINT_INTERNAL_FOLLOW_SOURCES="$FOLLOW_SOURCES" FM_LINT_INTERNAL_EXCLUDE="$EXCLUDE_CODES" \
+        FM_LINT_INTERNAL_ROOT_PROFILE_DIR="$ROOT_PROFILE_DIR" \
         FM_LINT_SHELLCHECK="$SHELLCHECK_BIN" \
         "${BASH:-bash}" "$SELF" --internal-worker "$manifest" "$OUTPUT_DIR" "$worker_index"
     fi
@@ -707,6 +745,7 @@ fm_lint_run_worker() {  # <worker-index>
     exec "$PERL_BIN" -e 'setpgrp(0, 0) or die "setpgrp: $!"; exec @ARGV or die "exec: $!"' \
       env FM_LINT_INTERNAL=1 FM_LINT_INTERNAL_FAST="$FAST" \
       FM_LINT_INTERNAL_FOLLOW_SOURCES="$FOLLOW_SOURCES" FM_LINT_INTERNAL_EXCLUDE="$EXCLUDE_CODES" \
+      FM_LINT_INTERNAL_ROOT_PROFILE_DIR="$ROOT_PROFILE_DIR" \
       FM_LINT_SHELLCHECK="$SHELLCHECK_BIN" \
       "${BASH:-bash}" "$SELF" --internal-worker "$manifest" "$OUTPUT_DIR" "$worker_index"
   fi
