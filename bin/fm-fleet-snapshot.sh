@@ -859,7 +859,7 @@ task_json_lines() {
     fi
     if [ -n "$project" ] && [ -n "$spawn_gen" ] && [ "$kind" != secondmate ]; then
       case "$source_dirty" in true) dirty_arg=true ;; false) dirty_arg=false ;; *) dirty_arg=unknown ;; esac
-      verification_json=$(FM_HOME="$FM_HOME" fm_run_timed "$FM_SNAPSHOT_TERMINAL_TIMEOUT" python3 "$SCRIPT_DIR/fm-issues.py" \
+      verification_json=$(fm_run_timed "$FM_SNAPSHOT_TERMINAL_TIMEOUT" env FM_HOME="$FM_HOME" python3 "$SCRIPT_DIR/fm-issues.py" \
         --home "$FM_HOME" --lane-evidence-task "$id" --lane-evidence-project "$project" \
         --lane-evidence-generation "$spawn_gen" --lane-evidence-head "$source_head" \
         --lane-evidence-dirty "$dirty_arg" 2>/dev/null) || verification_json='{}'
@@ -1007,7 +1007,7 @@ secondmate_home_summary_json() {  # <backlog-json-file> <tasks-json-file> <produ
     if fm_issue_event_validate_file "$event_path" "$task_id"; then
       jq -sc '.[-32:][]' "$event_path" >> "$issue_events_file" || return 1
     fi
-  done < <(jq -r --argjson limit "$queued_n" '.records[:$limit][]? | select(.state == "done" and (.id | type) == "string") | .id' "$1")
+  done < <(jq -r --argjson limit "$FM_SNAPSHOT_SECONDMATE_QUEUED" '.records[:$limit][]? | select(.state == "done" and (.id | type) == "string") | .id' "$1")
   jq -n \
     --arg generated "$SNAPSHOT_NOW" \
     --argjson generated_epoch "$SNAPSHOT_EPOCH" \
