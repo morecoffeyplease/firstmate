@@ -25,6 +25,7 @@ install_runner() {  # <case-dir>
   cp "$ROOT/bin/fm-afk-return.sh" "$dir/bin/"
   cp "$ROOT/bin/fm-wake-lib.sh" "$dir/bin/"
   cp "$ROOT/bin/fm-classify-lib.sh" "$dir/bin/"
+  cp "$ROOT/bin/fm-decision-lib.sh" "$dir/bin/"
   # fm-timeout-lib.sh: the shared hard bound fm-classify-lib.sh sources for the
   # wedge detector's bounded worktree write probe.
   cp "$ROOT/bin/fm-timeout-lib.sh" "$dir/bin/"
@@ -387,7 +388,10 @@ test_return_brief_composes_from_record_store_and_held_set() {
   printf 'window=synthetic:fm-fix-windows\nbackend=tmux\nkind=ship\n' > "$dir/home/state/fix-windows.meta"
   printf 'blocked [key=token]: firstmate can refresh the token\n' > "$dir/home/state/fix-windows.status"
   printf 'window=synthetic:fm-other\nbackend=tmux\nkind=ship\n' > "$dir/home/state/other.meta"
-  printf 'blocked [key=dep]: needs the upstream dependency\nneeds-decision [key=pick]: choose the target\n' > "$dir/home/state/other.status"
+  printf '%s\n%s\n' \
+    'blocked [key=dep]: needs the upstream dependency' \
+    'needs-decision [key=pick]: {"schema":"fm-captain-decision.v1","question":"choose the target","context":"The target is unclear","user_impact":"The choice affects the user","options":[{"label":"A","title":"Target A","pros":["A benefit"],"cons":["A cost"]},{"label":"B","title":"Target B","pros":["B benefit"],"cons":["B cost"]}],"recommended_option":"A","recommendation":"Choose A because it best meets the user need."}' \
+    > "$dir/home/state/other.status"
   printf 'window=synthetic:fm-dead\nbackend=tmux\nkind=scout\n' > "$dir/home/state/dead.meta"
   printf 'failed: the reproduction never compiled\n' > "$dir/home/state/dead.status"
   outcome_in "$dir" append --task fix-windows --verdict captain \
