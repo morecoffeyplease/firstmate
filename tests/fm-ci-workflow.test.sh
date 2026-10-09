@@ -115,7 +115,7 @@ end
   pass "every ci.yml job carries a finite timeout"
 }
 
-# The four jobs the incident found unbounded, at the report's recommended caps.
+# The lint matrix keeps the 25-minute cap, while its required aggregate gate is a short check.
 test_previously_unbounded_jobs_keep_their_caps() {
   local job expected actual
   while read -r job expected; do
@@ -123,13 +123,41 @@ test_previously_unbounded_jobs_keep_their_caps() {
     actual=$(job_timeout "$job") || fail "could not read the $job timeout"
     [ "$actual" = "$expected" ] \
       || fail "$job timeout must stay $expected minutes, got $actual"
-  done <<'CAPS'
-lint 25
+done <<'CAPS'
+lint-shards 25
+lint 5
 test-coverage 5
 tests-timing-aggregate 5
 invariants 5
 CAPS
   pass "the incident's unbounded jobs keep their recommended caps"
+}
+
+test_lint_matrix_has_a_required_complete_gate() {
+  ruby -ryaml -e '
+require "open3"
+jobs = YAML.load_file(ARGV[0]).fetch("jobs")
+shards = jobs.fetch("lint-shards")
+matrix = shards.fetch("strategy").fetch("matrix").fetch("shard")
+raise "lint matrix must contain all four canonical shards" unless matrix == ["1/4", "2/4", "3/4", "4/4"]
+raise "lint matrix must not fail fast" unless shards.fetch("strategy").fetch("fail-fast") == false
+gate = jobs.fetch("lint")
+raise "Lint gate must wait for every shard" unless gate.fetch("needs") == "lint-shards"
+raise "Lint gate must evaluate after shard failure" unless gate.fetch("if") == "always()"
+step = gate.fetch("steps").find { |item| item["name"] == "Require all four lint shards" }
+raise "Lint gate step is missing" unless step
+raise "Lint gate must consume the matrix result" unless step.fetch("env").fetch("SHARDS_RESULT").include?("needs.lint-shards.result")
+
+%w[success failure cancelled skipped].push("").each do |result|
+  _, _, status = Open3.capture3(
+    { "SHARDS_RESULT" => result },
+    "/bin/bash", "--noprofile", "--norc", "-e", "-o", "pipefail", "-c", step.fetch("run")
+  )
+  expected = result == "success" ? 0 : 1
+  raise "Lint gate returned #{status.exitstatus} for #{result.inspect}, expected #{expected}" unless status.exitstatus == expected
+end
+' "$CI_WORKFLOW" || fail "lint matrix or aggregate completion contract changed"
+  pass "the four lint shards report independently and the required Lint gate rejects incomplete results"
 }
 
 # Cancellation makes an undersized cap costlier: a falsely tripped job now also
@@ -157,3 +185,4 @@ test_main_pushes_are_never_cancelled
 test_every_job_has_a_finite_timeout
 test_previously_unbounded_jobs_keep_their_caps
 test_measured_lanes_keep_their_existing_bounds
+test_lint_matrix_has_a_required_complete_gate

@@ -26,6 +26,23 @@ set -u
 # shellcheck source=/dev/null
 . "$ROOT/bin/fm-marker-lib.sh"
 
+# Harness membership must consume the complete producer output before it can
+# return on the first match, and it must retain exact whole-line matching.
+CONTROL_SUPPORT_OUTPUT=$(fm_control_harness_supported claude 2>&1) \
+  || fail 'the first verified harness was not recognized'
+[ -z "$CONTROL_SUPPORT_OUTPUT" ] \
+  || fail "the first harness membership check emitted output: $CONTROL_SUPPORT_OUTPUT"
+CONTROL_SUPPORT_OUTPUT=$(fm_control_harness_supported agy 2>&1) \
+  || fail 'the last verified harness was not recognized'
+[ -z "$CONTROL_SUPPORT_OUTPUT" ] \
+  || fail "the last harness membership check emitted output: $CONTROL_SUPPORT_OUTPUT"
+if fm_control_harness_supported claud; then
+  fail 'a near-match harness was accepted'
+fi
+if fm_control_harness_supported claude-extra; then
+  fail 'a prefixed harness near-match was accepted'
+fi
+
 CONTROL="$ROOT/bin/fm-control.sh"
 SEND="$ROOT/bin/fm-send.sh"
 # fm_test_tmproot's own cleanup trap fires when its command substitution exits,

@@ -157,6 +157,7 @@ test_help_reports_the_complete_interface() {
   assert_contains "$help" "--list-files" "fm-lint.sh --help omitted --list-files"
   assert_contains "$help" "--help" "fm-lint.sh --help omitted --help"
   assert_contains "$help" "--fast" "fm-lint.sh --help omitted --fast"
+  assert_contains "$help" "--shard" "fm-lint.sh --help omitted --shard"
   assert_contains "$help" "SC1091" "fm-lint.sh --help omitted the local SC1091 exclusion"
   assert_contains "$help" "SC2034" "fm-lint.sh --help omitted the local SC2034 exclusion"
   assert_contains "$help" "SC2153" "fm-lint.sh --help omitted the local SC2153 exclusion"
@@ -174,6 +175,257 @@ test_list_files_reports_the_shell_inventory() {
   [ "$(printf '%s\n' "$listed" | LC_ALL=C sort)" = "$expected" ] \
     || fail "fm-lint.sh --list-files did not return the complete shell inventory"
   pass "fm-lint.sh --list-files reports the complete shell inventory"
+}
+
+test_canonical_shards_partition_once_and_propagate_findings() {
+  local tmp fixture fakebin realbin no_worker_bin log action_log flag_log expected actual shard out rc full_out full_rc
+  local first_root failed_shard
+  local tiny full_diagnostics
+  tmp=$(fm_test_tmproot fm-lint-shards)
+  fixture="$tmp/repo"
+  fakebin=$(fm_fakebin "$tmp")
+  mkdir -p "$fixture/bin" "$fixture/bin/backends" "$fixture/tests" "$fixture/.github/workflows"
+  cp "$LINT" "$fixture/bin/fm-lint.sh"
+  cp "$ROOT/bin/fm-lint-workflows.sh" "$fixture/bin/fm-lint-workflows.sh"
+  printf 'name: fixture\n' > "$fixture/.github/workflows/ci.yml"
+  cat > "$fakebin/actionlint" <<'SH'
+#!/usr/bin/env bash
+if [ "${1:-}" = -version ]; then
+  printf '1.7.12\n'
+fi
+[ -z "${FM_TEST_ACTION_LOG:-}" ] || printf '%s\n' "$*" >> "$FM_TEST_ACTION_LOG"
+exit 0
+SH
+  chmod +x "$fakebin/actionlint"
+  log="$tmp/shellcheck.log"
+  action_log="$tmp/actionlint.log"
+  flag_log="$tmp/flags.log"
+  cat > "$fakebin/shellcheck" <<'SH'
+#!/usr/bin/env bash
+if [ "${1:-}" = --version ]; then
+  printf 'ShellCheck - shell script analysis tool\nversion: 0.11.0\n'
+  exit 0
+fi
+norc=no
+external=no
+extended=yes
+exclude=no
+while [ "$#" -gt 0 ] && [ "$1" != -- ]; do
+  case "$1" in
+    --norc) norc=yes ;;
+    --external-sources) external=yes ;;
+    --extended-analysis=false) extended=no ;;
+    --exclude|--exclude=*) exclude=yes ;;
+  esac
+  shift
+done
+[ "$#" -eq 0 ] || shift
+path=${1:-}
+[ -z "$path" ] || printf '%s:%s\n' "${FM_TEST_SHARD_LABEL:-full}" "$path" >> "$FM_TEST_ROOT_LOG"
+[ -z "$path" ] || printf 'norc=%s external=%s extended=%s exclude=%s roots=%s\n' \
+  "$norc" "$external" "$extended" "$exclude" "$#" >> "$FM_TEST_FLAG_LOG"
+if [ "$path" = "${FM_TEST_FAIL_ROOT:-}" ]; then
+  printf '%s:1:1: warning: fixture finding (SC9999)\n' "$path"
+  exit 1
+fi
+exit 0
+SH
+  chmod +x "$fakebin/shellcheck"
+  cat > "$fixture/bin/owner.sh" <<'SH'
+#!/usr/bin/env bash
+printf 'owner\n'
+SH
+  cat > "$fixture/tests/library.sh" <<'SH'
+#!/usr/bin/env bash
+defined_in_library=ok
+printf '%s\n' "$missing_from_library"
+SH
+  for name in a b c d e f; do
+    cat > "$fixture/tests/$name.sh" <<SH
+#!/usr/bin/env bash
+# shellcheck source=tests/library.sh
+. "\$(dirname "\${BASH_SOURCE[0]}")/library.sh"
+printf '%s\n' "\$defined_in_library" >/dev/null
+SH
+  done
+  printf '#!/usr/bin/env bash\n# tie-root-1\n' > "$fixture/tests/tie1.sh"
+  printf '#!/usr/bin/env bash\n# tie-root-2\n' > "$fixture/tests/tie2.sh"
+  chmod +x "$fixture"/bin/*.sh "$fixture"/tests/*.sh
+  expected=$(cd "$fixture" && find bin bin/backends tests -maxdepth 1 -type f -name '*.sh' -print | LC_ALL=C sort)
+
+  : > "$log"
+  : > "$flag_log"
+  for shard in 1/4 2/4 3/4 4/4; do
+    out=$(cd "$fixture" && PATH="$fakebin:$PATH" CI=true GITHUB_ACTIONS=true \
+      FM_TEST_ROOT_LOG="$log" FM_TEST_FLAG_LOG="$flag_log" FM_TEST_ACTION_LOG="$action_log" FM_TEST_SHARD_LABEL="$shard" \
+      /bin/bash bin/fm-lint.sh --shard "$shard" 2>&1) \
+      || fail "canonical shard $shard failed unexpectedly"$'\n'"$out"
+  done
+  actual=$(cut -d: -f2- "$log" | LC_ALL=C sort)
+  [ "$actual" = "$expected" ] \
+    || fail "four shard execution did not cover each canonical root exactly once"$'\nexpected:\n'"$expected"$'\nactual:\n'"$actual"
+  [ "$(wc -l < "$flag_log" | tr -d '[:space:]')" -eq "$(printf '%s\n' "$expected" | wc -l | tr -d '[:space:]')" ] \
+    || fail "a root did not receive exactly one ShellCheck invocation"
+  if grep -Ev '^norc=yes external=yes extended=yes exclude=no roots=1$' "$flag_log" >/dev/null; then
+    fail "a shard invocation weakened full-analysis flags or batched roots"$'\n'"$(cat "$flag_log")"
+  fi
+  [ "$(grep -c '^1/4:' "$log")" -gt 0 ] && [ "$(grep -c '^2/4:' "$log")" -gt 0 ] \
+    && [ "$(grep -c '^3/4:' "$log")" -gt 0 ] && [ "$(grep -c '^4/4:' "$log")" -gt 0 ] \
+    || fail "one or more shard manifests selected zero roots"
+  cp "$log" "$tmp/assignment.first"
+  : > "$log"
+  for shard in 1/4 2/4 3/4 4/4; do
+    out=$(cd "$fixture" && PATH="$fakebin:$PATH" CI=true GITHUB_ACTIONS=true \
+      FM_TEST_ROOT_LOG="$log" FM_TEST_FLAG_LOG="$tmp/flags.repeat" FM_TEST_ACTION_LOG="$action_log" FM_TEST_SHARD_LABEL="$shard" \
+      /bin/bash bin/fm-lint.sh --shard "$shard" 2>&1) \
+      || fail "repeat canonical shard $shard failed unexpectedly"$'\n'"$out"
+  done
+  [ "$(LC_ALL=C sort "$tmp/assignment.first")" = "$(LC_ALL=C sort "$log")" ] \
+    || fail "equal-byte root tie assignment changed between repeated runs"
+  [ "$(wc -l < "$action_log" | tr -d '[:space:]')" -eq 16 ] \
+    || fail "workflow validation did not execute on every shard run"
+
+  printf '#!/usr/bin/env bash\n# added-root\n' > "$fixture/tests/added.sh"
+  chmod +x "$fixture/tests/added.sh"
+  expected=$(cd "$fixture" && find bin bin/backends tests -maxdepth 1 -type f -name '*.sh' -print | LC_ALL=C sort)
+  : > "$log"
+  for shard in 1/4 2/4 3/4 4/4; do
+    out=$(cd "$fixture" && PATH="$fakebin:$PATH" CI=true GITHUB_ACTIONS=true \
+      FM_TEST_ROOT_LOG="$log" FM_TEST_FLAG_LOG="$tmp/flags.added" FM_TEST_ACTION_LOG="$action_log" FM_TEST_SHARD_LABEL="$shard" \
+      /bin/bash bin/fm-lint.sh --shard "$shard" 2>&1) \
+      || fail "shard failed after adding a canonical root"$'\n'"$out"
+  done
+  [ "$(cut -d: -f2- "$log" | LC_ALL=C sort)" = "$expected" ] \
+    || fail "added canonical root was omitted or another root was duplicated"
+  rm "$fixture/tests/added.sh"
+  expected=$(cd "$fixture" && find bin bin/backends tests -maxdepth 1 -type f -name '*.sh' -print | LC_ALL=C sort)
+  : > "$log"
+  for shard in 1/4 2/4 3/4 4/4; do
+    out=$(cd "$fixture" && PATH="$fakebin:$PATH" CI=true GITHUB_ACTIONS=true \
+      FM_TEST_ROOT_LOG="$log" FM_TEST_FLAG_LOG="$tmp/flags.removed" FM_TEST_ACTION_LOG="$action_log" FM_TEST_SHARD_LABEL="$shard" \
+      /bin/bash bin/fm-lint.sh --shard "$shard" 2>&1) \
+      || fail "shard failed after removing a canonical root"$'\n'"$out"
+  done
+  [ "$(cut -d: -f2- "$log" | LC_ALL=C sort)" = "$expected" ] \
+    || fail "removed canonical root remained in a shard manifest"
+
+  first_root=$(printf '%s\n' "$expected" | head -n 1)
+  : > "$log"
+  full_rc=0
+  full_out=$(cd "$fixture" && PATH="$fakebin:$PATH" CI=true GITHUB_ACTIONS=true \
+    FM_TEST_ROOT_LOG="$log" FM_TEST_FAIL_ROOT="$first_root" FM_TEST_ACTION_LOG="$action_log" \
+    /bin/bash bin/fm-lint.sh 2>&1) || full_rc=$?
+  [ "$full_rc" -ne 0 ] || fail "full lint hid a ShellCheck diagnostic failure"
+  assert_contains "$full_out" "SC9999" "full lint lost the injected diagnostic"
+  [ "$(cut -d: -f2- "$log" | LC_ALL=C sort)" = "$expected" ] \
+    || fail "full lint stopped after an earlier root diagnostic"
+  full_diagnostics=$(printf '%s\n' "$full_out" | grep 'SC9999' || true)
+  for shard in 1/4 2/4 3/4 4/4; do
+    rc=0
+    out=$(cd "$fixture" && PATH="$fakebin:$PATH" CI=true GITHUB_ACTIONS=true \
+      FM_TEST_ROOT_LOG="$log" FM_TEST_FAIL_ROOT="$first_root" FM_TEST_ACTION_LOG="$action_log" \
+      /bin/bash bin/fm-lint.sh --shard "$shard" 2>&1) || rc=$?
+    failed_shard=$(awk -F: -v root="$first_root" '$2 == root {print $1; exit}' "$tmp/assignment.first")
+    if [ "$shard" = "$failed_shard" ]; then
+      [ "$rc" -ne 0 ] || fail "nonzero ShellCheck result did not fail its selected shard"
+      assert_contains "$out" "SC9999" "failing shard lost the injected diagnostic"
+      [ "$(printf '%s\n' "$out" | grep 'SC9999' || true)" = "$full_diagnostics" ] \
+        || fail "full and sharded normalized diagnostics differ"
+    else
+      [ "$rc" -eq 0 ] || fail "unaffected shard $shard failed unexpectedly"$'\n'"$out"
+    fi
+  done
+
+  for args in "--shard" "--shard 0/4" "--shard 5/4" "--shard=0/4" "--shard 1/4 --shard 2/4" \
+    "--shard 1/4 --fast" "--shard 1/4 --jobs 1" "--shard 1/4 --list-files" \
+    "--shard 1/4 bin/owner.sh"; do
+    rc=0
+    # These cases are intentionally fixed strings so the word split is the CLI.
+    # shellcheck disable=SC2086
+    (cd "$fixture" && PATH="$fakebin:$PATH" CI=true GITHUB_ACTIONS=true \
+      /bin/bash bin/fm-lint.sh $args >/dev/null 2>&1) || rc=$?
+    [ "$rc" -eq 2 ] || fail "invalid shard CLI was accepted: $args (exit $rc)"
+  done
+
+  for empty_option in equals separate; do
+    rc=0
+    if [ "$empty_option" = equals ]; then
+      (cd "$fixture" && PATH="$fakebin:$PATH" CI=true GITHUB_ACTIONS=true \
+        /bin/bash bin/fm-lint.sh --shard= >/dev/null 2>&1) || rc=$?
+    else
+      (cd "$fixture" && PATH="$fakebin:$PATH" CI=true GITHUB_ACTIONS=true \
+        /bin/bash bin/fm-lint.sh --shard "" >/dev/null 2>&1) || rc=$?
+    fi
+    [ "$rc" -eq 2 ] || fail "empty shard option was accepted via --shard $empty_option (exit $rc)"
+  done
+
+  tiny="$tmp/tiny"
+  mkdir -p "$tiny/bin" "$tiny/tests"
+  cp "$LINT" "$tiny/bin/fm-lint.sh"
+  printf '#!/usr/bin/env bash\nprintf ok\\n\n' > "$tiny/tests/only.sh"
+  rc=0
+  out=$(cd "$tiny" && /bin/bash bin/fm-lint.sh --shard 4/4 2>&1) || rc=$?
+  [ "$rc" -eq 2 ] || fail "an empty production shard unexpectedly succeeded"$'\n'"$out"
+  assert_contains "$out" "selected zero roots" "empty shard failure omitted its cause"
+
+  no_worker_bin=$(fm_fakebin "$tmp/no-worker")
+  cat > "$no_worker_bin/perl" <<'SH'
+#!/usr/bin/env bash
+exit 127
+SH
+  chmod +x "$no_worker_bin/perl"
+  rc=0
+  out=$(cd "$fixture" && PATH="$no_worker_bin:$fakebin:$PATH" CI=true GITHUB_ACTIONS=true \
+    /bin/bash bin/fm-lint.sh --shard 1/4 2>&1) || rc=$?
+  [ "$rc" -ne 0 ] || fail "missing worker result unexpectedly passed its shard"
+  assert_contains "$out" "worker produced no result for shard 0" \
+    "missing worker result failure omitted its shard diagnostic"
+
+  if pinned_ready; then
+    local library_shard consumer_shard selected_consumer real_out without_sources with_sources shard_index
+    realbin=$(fm_fakebin "$tmp/real")
+    cp "$fakebin/actionlint" "$realbin/actionlint"
+    library_shard=$(awk -F: '$2 == "tests/library.sh" {print $1; exit}' "$tmp/assignment.first")
+    consumer_shard=
+    selected_consumer=
+    while IFS=: read -r shard path; do
+      case "$path" in
+        tests/*.sh)
+          if [ "$path" != tests/library.sh ] && [ "$shard" != "$library_shard" ]; then
+            consumer_shard=$shard
+            selected_consumer=$path
+            break
+          fi
+          ;;
+      esac
+    done < "$tmp/assignment.first"
+    [ -n "$consumer_shard" ] || fail "fixture did not separate a consumer from its library shard"
+    without_sources=$(cd "$fixture" && shellcheck --norc -- "$selected_consumer" 2>&1 || true)
+    with_sources=$(cd "$fixture" && shellcheck --norc --external-sources -- "$selected_consumer" 2>&1 || true)
+    assert_contains "$without_sources" "SC2154" "negative source-following control did not expose the undefined variable"
+    assert_not_contains "$with_sources" "SC2154" "external-source control failed to load the library declaration"
+    rc=0
+    real_out=$(cd "$fixture" && PATH="$realbin:$PATH" CI=true GITHUB_ACTIONS=true \
+      FM_LINT_TELEMETRY="$tmp/consumer-telemetry.tsv" \
+      /bin/bash bin/fm-lint.sh --shard "$consumer_shard" 2>&1) || rc=$?
+    [ "$rc" -eq 0 ] || fail "real pinned ShellCheck shard failed its source-following control"$'\n'"$real_out"
+    assert_not_contains "$real_out" "SC2154" "shard did not follow the declaration from its sourced library"
+    shard_index=${consumer_shard%/4}
+    assert_grep "$selected_consumer" "$tmp/consumer-telemetry.tsv.roots/worker.$((shard_index - 1)).tsv" \
+      "selected consumer root was not recorded in its shard invocation profile"
+    assert_grep $'selected_root_count\t' "$tmp/consumer-telemetry.tsv" \
+      "shard telemetry omitted the selected root count"
+    rc=0
+    real_out=$(cd "$fixture" && PATH="$realbin:$PATH" CI=true GITHUB_ACTIONS=true \
+      FM_LINT_TELEMETRY="$tmp/library-telemetry.tsv" \
+      /bin/bash bin/fm-lint.sh --shard "$library_shard" 2>&1) || rc=$?
+    [ "$rc" -ne 0 ] || fail "the library's own shard lost its injected ShellCheck diagnostic"
+    assert_contains "$real_out" "SC2154" "library diagnostic did not survive its assigned shard"
+    assert_contains "$real_out" "tests/library.sh" "library diagnostic lost root attribution"
+  else
+    pass "SKIP (ShellCheck $REQUIRED not resolved): real sourced-library shard diagnostic"
+  fi
+  pass "canonical shards partition roots exactly once, reassign deterministically, and preserve failures"
 }
 
 # fm_lint_stub_git <fakebin-dir>: install a git stub for the changed-file mode
@@ -610,7 +862,7 @@ test_ci_mode_invokes_shellcheck_once_per_root() {
     || fail "CI-mode lint did not analyze every root"$'\n'"logged: $(cat "$log")"
   invocation_count=$(grep -c '^external-sources=yes$' "$flag_log" || true)
   [ "$invocation_count" -eq "${#roots[@]}" ] \
-    || fail "CI-mode (--external-sources) lint used $invocation_count ShellCheck calls for ${#roots[@]} roots, not one per root: this is the regression guard for the exit-143 OOM fix - a batched call here would reintroduce it"
+    || fail "CI-mode (--external-sources) lint used $invocation_count ShellCheck calls for ${#roots[@]} roots, not one per root; the historical exit-143 sender remains unknown"
   pass "fm-lint.sh invokes ShellCheck once per root even with --external-sources, so the full-analysis lane cannot silently re-batch roots into one process"
 }
 
@@ -1220,7 +1472,7 @@ SH
 
   telemetry_out=$(FM_LINT_JOBS=2 FM_LINT_TELEMETRY="$telemetry" "$LINT" "$good" 2>&1) \
     || fail "telemetry-enabled clean lint failed"
-  [ "$telemetry_out" = "$out_clean_2" ] || fail "quiet telemetry changed routine lint output"
+  [ "$telemetry_out" = "$out_clean_2" ] || fail "quiet telemetry changed routine lint output"$'\nwithout:\n'"$out_clean_2"$'\nwith:\n'"$telemetry_out"
   assert_grep $'format\tfm-lint-telemetry-v1' "$telemetry" "telemetry format marker is missing"
   assert_grep $'analysis_mode\tfull' "$telemetry" "telemetry did not record full analysis mode"
   assert_grep $'jobs\t2' "$telemetry" "telemetry did not record bounded jobs"
@@ -1391,6 +1643,7 @@ SH
 
 test_help_reports_the_complete_interface
 test_list_files_reports_the_shell_inventory
+test_canonical_shards_partition_once_and_propagate_findings
 test_fast_mode_disables_extended_analysis
 test_ci_defaults_to_full_analysis
 test_ci_rejects_explicit_fast_mode

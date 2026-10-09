@@ -13,7 +13,8 @@
 # version floor that decides whether an unconfigured home is projected at all,
 # against what Part A measured about this very release.
 # On a future release whose explicit close preserves focus, Part A records
-# that and Parts B and C keep outcome-only assertions, so no version is guessed.
+# that and Part C still requires readable samples and exact focus restoration,
+# while the positive control adapts to whether this release steals focus.
 # Every CLI operation is routed through one guarded named non-default lab, and
 # lab teardown verifies that the default fleet session is byte-identical.
 set -u
@@ -81,13 +82,129 @@ mkws() {  # <label> -> "<workspace_id> <tab_id> <pane_id>"
     | jq -er '"\(.result.workspace.workspace_id) \(.result.tab.tab_id) \(.result.root_pane.pane_id)"'
 }
 focus_snapshot() {
-  local list workspace tab tabs
+  local list
   list=$(lab workspace list) || return 1
-  workspace=$(printf '%s' "$list" | jq -er '[.result.workspaces[] | select(.focused == true)] | select(length == 1) | .[0].workspace_id') || return 1
-  tab=$(printf '%s' "$list" | jq -er --arg workspace "$workspace" '[.result.workspaces[] | select(.workspace_id == $workspace)] | select(length == 1) | .[0].active_tab_id') || return 1
-  tabs=$(lab tab list --workspace "$workspace") || return 1
-  printf '%s' "$tabs" | jq -e --arg tab "$tab" '([.result.tabs[] | select(.focused == true)] | length) == 1 and ([.result.tabs[] | select(.focused == true)][0].tab_id == $tab)' >/dev/null || return 1
-  printf '%s\t%s' "$workspace" "$tab"
+  # Take the workspace and its active tab from one Herdr snapshot. Separate
+  # workspace.list and tab.list calls can straddle the short focus transition
+  # under test and turn a valid state into a false unreadable sample.
+  printf '%s' "$list" | jq -er '
+    [.result.workspaces[] | select(.focused == true)]
+    | select(length == 1)
+    | .[0]
+    | select((.workspace_id | type) == "string" and (.workspace_id | length) > 0)
+    | select((.active_tab_id | type) == "string" and (.active_tab_id | length) > 0)
+    | [.workspace_id, .active_tab_id]
+    | @tsv
+  '
+}
+focus_samples_verdict() {  # <anchor workspace<TAB>tab> <samples file>
+  local anchor=$1 samples=$2 line workspace tab count=0 wrong=0
+  [ -s "$samples" ] || return 2
+  while IFS= read -r line || [ -n "$line" ]; do
+    case "$line" in
+      UNREADABLE) return 3 ;;
+    esac
+    case "$line" in
+      *$'\t'*) ;;
+      *) return 3 ;;
+    esac
+    workspace=${line%%$'\t'*}
+    tab=${line#*$'\t'}
+    [ -n "$workspace" ] && [ -n "$tab" ] || return 3
+    case "$tab" in *$'\t'*) return 3 ;; esac
+    count=$((count + 1))
+    [ "$line" = "$anchor" ] || wrong=$((wrong + 1))
+  done < "$samples"
+  [ "$count" -gt 0 ] || return 2
+  if [ "$wrong" -gt 0 ]; then
+    printf 'wrong:%s/%s\n' "$wrong" "$count"
+  else
+    printf 'anchor:%s\n' "$count"
+  fi
+}
+focus_trial_disposition() {  # <release> <invariants-passed:0|1> <verdict> <attempt> <budget>
+  local release=$1 invariants=$2 verdict=$3 attempt=$4 budget=$5
+  [ "$invariants" = 0 ] || { printf 'fail\n'; return 0; }
+  case "$release:$verdict" in
+    defective:anchor:*)
+      if [ "$attempt" -lt "$budget" ]; then printf 'retry\n'; else printf 'fail\n'; fi
+      ;;
+    defective:wrong:*) printf 'pass\n' ;;
+    preserving:anchor:*) printf 'pass\n' ;;
+    preserving:wrong:*) printf 'fail\n' ;;
+    *) printf 'fail\n' ;;
+  esac
+}
+start_focus_sampler() {  # <samples> <active marker> <ready marker> <stop marker>
+  local samples=$1 active=$2 ready=$3 stop=$4
+  : > "$samples"
+  rm -f "$ready" "$stop"
+  (
+    : > "$ready"
+    while [ ! -e "$stop" ]; do
+      if [ -e "$active" ]; then
+        if SAMPLE=$(focus_snapshot); then
+          printf '%s\n' "$SAMPLE" >> "$samples"
+        else
+          printf '%s\n' UNREADABLE >> "$samples"
+        fi
+      fi
+    done
+  ) &
+  SAMPLER_PID=$!
+  SAMPLER_STOP=$stop
+  local attempt=0
+  while [ ! -e "$ready" ] && [ "$attempt" -lt 100 ]; do
+    sleep 0.01
+    attempt=$((attempt + 1))
+  done
+  [ -e "$ready" ]
+}
+stop_focus_sampler() {  # <active marker> <stop marker>
+  rm -f "$1"
+  : > "$2"
+  wait "$SAMPLER_PID" 2>/dev/null || true
+  SAMPLER_PID=
+  SAMPLER_STOP=
+}
+wait_for_focus_sample() {  # <samples file>
+  local attempt=0
+  while [ ! -s "$1" ] && [ "$attempt" -lt 100 ]; do
+    sleep 0.01
+    attempt=$((attempt + 1))
+  done
+  [ -s "$1" ]
+}
+focus_sampler_self_test() {
+  local cases=$1 anchor=$2 output first_disposition later_disposition
+  printf '%s\n' "$anchor" "$anchor" > "$cases/anchor"
+  output=$(focus_samples_verdict "$anchor" "$cases/anchor") || return 1
+  [ "$output" = anchor:2 ] || return 1
+  printf '%s\n' "$anchor" "$(printf 'other-workspace\t%s' "${anchor#*$'\t'}")" > "$cases/wrong"
+  output=$(focus_samples_verdict "$anchor" "$cases/wrong") || return 1
+  [ "$output" = wrong:1/2 ] || return 1
+  printf '%s\n' UNREADABLE > "$cases/unreadable"
+  if focus_samples_verdict "$anchor" "$cases/unreadable" >/dev/null; then return 1; fi
+  printf '%s\n' "$anchor" UNREADABLE > "$cases/mixed"
+  if focus_samples_verdict "$anchor" "$cases/mixed" >/dev/null; then return 1; fi
+  : > "$cases/empty"
+  if focus_samples_verdict "$anchor" "$cases/empty" >/dev/null; then return 1; fi
+  printf '%s\n' 'not-a-pair' > "$cases/malformed"
+  if focus_samples_verdict "$anchor" "$cases/malformed" >/dev/null; then return 1; fi
+  [ "$(focus_trial_disposition defective 0 anchor:2 1 3)" = retry ] || return 1
+  [ "$(focus_trial_disposition defective 0 anchor:2 2 3)" = retry ] || return 1
+  [ "$(focus_trial_disposition defective 0 anchor:2 3 3)" = fail ] || return 1
+  [ "$(focus_trial_disposition defective 0 wrong:1/2 2 3)" = pass ] || return 1
+  [ "$(focus_trial_disposition preserving 0 anchor:2 1 1)" = pass ] || return 1
+  [ "$(focus_trial_disposition preserving 0 wrong:1/2 1 1)" = fail ] || return 1
+  # The failed invariant is terminal; a hypothetical later good trace cannot
+  # convert the failed trial into a retry or pass.
+  first_disposition=$(focus_trial_disposition defective 1 anchor:2 1 3)
+  later_disposition=not-run
+  if [ "$first_disposition" = retry ]; then
+    later_disposition=$(focus_trial_disposition defective 0 wrong:1/2 2 3)
+  fi
+  [ "$first_disposition" = fail ] && [ "$later_disposition" = not-run ] || return 1
 }
 ws_order() { lab workspace list | jq -er '[.result.workspaces[].workspace_id] | join(",")'; }
 wait_ws_gone() {  # <workspace_id>
@@ -99,6 +216,46 @@ wait_ws_gone() {  # <workspace_id>
   done
   return 1
 }
+
+# Pin verdict parsing and retry eligibility before relying on the live sampler.
+FOCUS_SELFTEST_ANCHOR=$(printf 'anchor-workspace\tanchor-tab')
+focus_sampler_self_test "$TMP_ROOT" "$FOCUS_SELFTEST_ANCHOR" \
+  || fail 'deterministic focus sampler/verdict cases failed'
+pass 'focus verdict: valid samples, unreadable traces, empty traces, and retry eligibility are classified fail-closed'
+
+# Calibrate the exact asynchronous sampler while focus is held on two known
+# states. This catches empty, unreadable, and constant-anchor samplers even if
+# the short Part C excursion happens to be missed.
+read -r CAL_ANCHOR_WS CAL_ANCHOR_TAB _ <<<"$(mkws flash-calibration-anchor)" \
+  || fail 'could not create the focus sampler calibration anchor'
+read -r CAL_OTHER_WS CAL_OTHER_TAB _ <<<"$(mkws flash-calibration-other)" \
+  || fail 'could not create the focus sampler calibration non-anchor'
+calibrate_focus_sampler() {  # <label> <workspace> <tab>
+  local label=$1 workspace=$2 tab=$3 before samples active ready stop verdict
+  lab tab focus "$tab" >/dev/null || fail "$label calibration could not focus its known tab"
+  before=$(focus_snapshot) || fail "$label calibration could not read its held focus"
+  [ "$before" = "$(printf '%s\t%s' "$workspace" "$tab")" ] \
+    || fail "$label calibration did not hold its intended workspace and tab"
+  samples="$TMP_ROOT/calibration-$label.samples"
+  active="$TMP_ROOT/calibration-$label.active"
+  ready="$TMP_ROOT/calibration-$label.ready"
+  stop="$TMP_ROOT/calibration-$label.stop"
+  start_focus_sampler "$samples" "$active" "$ready" "$stop" \
+    || fail "$label calibration sampler did not start"
+  : > "$active"
+  wait_for_focus_sample "$samples" \
+    || fail "$label calibration sampler produced no sample while focus was held"
+  stop_focus_sampler "$active" "$stop"
+  verdict=$(focus_samples_verdict "$before" "$samples") \
+    || fail "$label calibration sampler produced an unreadable or malformed observation"
+  case "$verdict" in
+    anchor:*) : ;;
+    *) fail "$label calibration expected the held focus, got $verdict" ;;
+  esac
+  pass "$label calibration: sampler captured the held focus $before ($verdict samples)"
+}
+calibrate_focus_sampler anchor "$CAL_ANCHOR_WS" "$CAL_ANCHOR_TAB"
+calibrate_focus_sampler non-anchor "$CAL_OTHER_WS" "$CAL_OTHER_TAB"
 
 # --- Part A: the OLD path (plain explicit close) steals focus on 0.7.5 -----
 # The spacer keeps the focused anchor away from the doomed workspace's right
@@ -143,25 +300,8 @@ B_SAMPLER_READY="$TMP_ROOT/sampler.ready"
 SAMPLER_STOP="$TMP_ROOT/sampler.stop"
 : > "$CALL_LOG"
 : > "$B_FOCUS_SAMPLES"
-(
-  : > "$B_SAMPLER_READY"
-  while [ ! -e "$SAMPLER_STOP" ]; do
-    if [ -e "$B_OPERATION_ACTIVE" ]; then
-      if B_SAMPLE=$(focus_snapshot); then
-        printf '%s\n' "$B_SAMPLE" >> "$B_FOCUS_SAMPLES"
-      else
-        printf '%s\n' UNREADABLE >> "$B_FOCUS_SAMPLES"
-      fi
-    fi
-  done
-) &
-SAMPLER_PID=$!
-B_READY_ATTEMPT=0
-while [ ! -e "$B_SAMPLER_READY" ] && [ "$B_READY_ATTEMPT" -lt 100 ]; do
-  sleep 0.01
-  B_READY_ATTEMPT=$((B_READY_ATTEMPT + 1))
-done
-[ -e "$B_SAMPLER_READY" ] || fail 'the Part B focus sampler did not start'
+start_focus_sampler "$B_FOCUS_SAMPLES" "$B_OPERATION_ACTIVE" "$B_SAMPLER_READY" "$SAMPLER_STOP" \
+  || fail 'the Part B focus sampler did not start'
 : > "$B_OPERATION_ACTIVE"
 B_OUT=$(PATH="$FAKEBIN:$HERDR_ORIGINAL_PATH" FM_FLASH_CALL_LOG="$CALL_LOG" bash -c '
   . "$1/bin/backends/herdr.sh"
@@ -174,16 +314,14 @@ B_OUT=$(PATH="$FAKEBIN:$HERDR_ORIGINAL_PATH" FM_FLASH_CALL_LOG="$CALL_LOG" bash 
   fm_backend_herdr_projection_close_pane_focus_preserving "$2" "$3"
 ' _ "$ROOT" "$HERDR_LAB_SESSION" "$B_DOOMED_PANE" 2>&1)
 B_STATUS=$?
-rm -f "$B_OPERATION_ACTIVE"
-: > "$SAMPLER_STOP"
-wait "$SAMPLER_PID" 2>/dev/null || true
-SAMPLER_PID=
+stop_focus_sampler "$B_OPERATION_ACTIVE" "$SAMPLER_STOP"
 [ "$B_STATUS" -eq 0 ] || fail "the production focus-preserving close failed (status $B_STATUS): $B_OUT"
-[ -s "$B_FOCUS_SAMPLES" ] || fail 'the Part B sampler captured no focus sample during the production close'
-B_WRONG_SAMPLE=$(grep -Fvx -- "$B_BEFORE" "$B_FOCUS_SAMPLES" | head -1)
-if [ -n "$B_WRONG_SAMPLE" ]; then
-  fail "the mitigation exposed a wrong or unreadable in-operation focus sample ($B_BEFORE -> $B_WRONG_SAMPLE)"
-fi
+B_SAMPLE_VERDICT=$(focus_samples_verdict "$B_BEFORE" "$B_FOCUS_SAMPLES") \
+  || fail 'the Part B sampler captured no readable focus sample during the production close'
+case "$B_SAMPLE_VERDICT" in
+  anchor:*) : ;;
+  *) fail "the mitigation exposed a wrong in-operation focus sample ($B_BEFORE -> $B_SAMPLE_VERDICT)" ;;
+esac
 wait_ws_gone "$B_DOOMED_WS" || fail 'the mitigation left the doomed workspace behind'
 if lab pane get "$B_DOOMED_PANE" >/dev/null 2>&1; then
   fail 'the mitigation left the doomed pane behind'
@@ -194,7 +332,7 @@ B_AFTER=$(focus_snapshot) || fail 'could not capture the Part B post-close focus
 [ "$(ws_order)" = "$B_SURVIVOR_ORDER" ] \
   || fail "the mitigation left a lasting workspace order change ($B_SURVIVOR_ORDER -> $(ws_order))"
 grep -q '^pane process-info' "$CALL_LOG" || fail 'the idle-shell proof never ran'
-pass 'mitigation: every in-operation sample preserved exact focus while the doomed workspace was removed'
+pass "mitigation: every in-operation sample preserved exact focus ($B_SAMPLE_VERDICT) while the doomed workspace was removed"
 
 if [ "$STEAL_LIVE" = 1 ]; then
   grep -q '^tab focus' "$CALL_LOG" \
@@ -205,148 +343,152 @@ if [ "$STEAL_LIVE" = 1 ]; then
 fi
 
 # --- Part C: the plain-close FALLBACK, the case Part B cannot reach ---------
-# Part B always hands the adapter a freshly created workspace whose pane is a
-# bare idle shell, so its emptying-close plan always takes the focus-preserving
-# pane-death route. The reported defect lives on the other branch: a doomed pane
-# whose shell holds a PERSISTENT child (a gitstatusd, a zsh-async worker,
-# direnv, or anything a crewmate backgrounded) fails the lone-idle-shell proof
-# permanently, and the plan falls back to the plain explicit close.
-# The geometry puts the doomed workspace AFTER the anchor so the plan performs
-# no repositioning at all, and puts a spacer immediately to its right so the
-# closing workspace's right neighbour - where a defective release lands focus -
-# is not the anchor. That is the exact shape the reporter saw.
-read -r C_ANCHOR_WS C_ANCHOR_TAB _ <<<"$(mkws flash-c-anchor)" || fail 'could not create the Part C anchor workspace'
-read -r C_DOOMED_WS _ C_DOOMED_PANE <<<"$(mkws flash-c-doomed)" || fail 'could not create the Part C doomed workspace'
-read -r C_SPACER_WS _ _ <<<"$(mkws flash-c-spacer)" || fail 'could not create the Part C spacer workspace'
-read -r _ _ _ <<<"$(mkws flash-c-tail)" || fail 'could not create the Part C tail workspace'
-lab tab focus "$C_ANCHOR_TAB" >/dev/null || fail 'could not focus the Part C anchor'
-C_BEFORE=$(focus_snapshot) || fail 'could not capture the Part C pre-close focus'
-[ "$C_BEFORE" = "$(printf '%s\t%s' "$C_ANCHOR_WS" "$C_ANCHOR_TAB")" ] \
-  || fail 'Part C anchor focus does not match the intended workspace and tab'
+# Part B uses an idle pane and takes the focus-preserving pane-death route.
+# Part C gives the doomed pane a persistent foreground child so the idle-shell
+# proof fails and production uses its plain explicit-close fallback.
+# Each trial creates fresh geometry and IDs; only an otherwise-complete,
+# readable, anchor-only trial on a defective release can be retried.
+run_focus_fallback_trial() {  # <attempt> -> global C_TRIAL_VERDICT
+  local attempt=$1 label="flash-c-$1" order_lines anchor_index doomed_index
+  local child_identity='' previous_child_identity='' child_attempt=0 child_stable=0
+  local call_log="$TMP_ROOT/call-c-$attempt.log"
+  local samples="$TMP_ROOT/focus-c-$attempt.samples"
+  local active="$TMP_ROOT/operation-c-$attempt.active"
+  local ready="$TMP_ROOT/sampler-c-$attempt.ready"
+  local stop="$TMP_ROOT/sampler-c-$attempt.stop"
+  local proof_polls=3 out status proof_calls before after right_neighbour survivor_order
+  local anchor_ws anchor_tab doomed_ws doomed_pane spacer_ws
 
-# Assert the geometry itself, so the case can never pass vacuously on a layout
-# where the plain close would land on the anchor by coincidence.
-C_ORDER=$(ws_order) || fail 'could not read the Part C workspace order'
-C_RIGHT_NEIGHBOUR=$(printf '%s' "$C_ORDER" | tr ',' '\n' | grep -A1 -Fx "$C_DOOMED_WS" | tail -1)
-[ "$C_RIGHT_NEIGHBOUR" = "$C_SPACER_WS" ] \
-  || fail "Part C needs the spacer immediately right of the doomed workspace, got '$C_RIGHT_NEIGHBOUR'"
-[ "$C_RIGHT_NEIGHBOUR" != "$C_ANCHOR_WS" ] \
-  || fail 'Part C geometry is vacuous: the right neighbour of the doomed workspace is the anchor'
-C_SURVIVOR_ORDER=$(printf '%s' "$C_ORDER" | tr ',' '\n' | grep -v "^$C_DOOMED_WS\$" | paste -sd, -) \
-  || fail 'could not capture the Part C survivor order'
+  read -r anchor_ws anchor_tab _ <<<"$(mkws "$label-anchor")" \
+    || fail "Part C attempt $attempt could not create its anchor workspace"
+  read -r doomed_ws _ doomed_pane <<<"$(mkws "$label-doomed")" \
+    || fail "Part C attempt $attempt could not create its doomed workspace"
+  read -r spacer_ws _ _ <<<"$(mkws "$label-spacer")" \
+    || fail "Part C attempt $attempt could not create its spacer workspace"
+  read -r _ _ _ <<<"$(mkws "$label-tail")" \
+    || fail "Part C attempt $attempt could not create its tail workspace"
+  lab tab focus "$anchor_tab" >/dev/null \
+    || fail "Part C attempt $attempt could not focus the anchor"
+  before=$(focus_snapshot) \
+    || fail "Part C attempt $attempt could not capture the pre-close focus"
+  [ "$before" = "$(printf '%s\t%s' "$anchor_ws" "$anchor_tab")" ] \
+    || fail "Part C attempt $attempt anchor focus did not match the intended workspace and tab"
 
-# Run one persistent foreground child through Herdr's atomic command surface.
-# This avoids racing separate send-text/send-keys calls, and process-info gives
-# the same public observation the production idle-shell proof consumes.
-lab pane run "$C_DOOMED_PANE" 'cd / && sleep 3000' >/dev/null \
-  || fail 'could not start the Part C persistent-child command'
-C_CHILD_IDENTITY=
-C_PREVIOUS_CHILD_IDENTITY=
-C_CHILD_ATTEMPT=0
-C_CHILD_STABLE=0
-while [ "$C_CHILD_ATTEMPT" -lt 100 ]; do
-  C_CHILD_IDENTITY=$(lab pane process-info --pane "$C_DOOMED_PANE" 2>/dev/null \
-    | jq -er '
-      .result.process_info as $process
-      | $process.foreground_processes
-      | map(select(.pid != $process.shell_pid))
-      | select(length > 0)
-      | [$process.shell_pid, .[0].pid]
-      | @tsv
-    ' 2>/dev/null) || C_CHILD_IDENTITY=
-  if [ -n "$C_CHILD_IDENTITY" ] && [ "$C_CHILD_IDENTITY" = "$C_PREVIOUS_CHILD_IDENTITY" ]; then
-    C_CHILD_STABLE=$((C_CHILD_STABLE + 1))
-    [ "$C_CHILD_STABLE" -ge 2 ] && break
-  else
-    C_CHILD_STABLE=0
-  fi
-  C_PREVIOUS_CHILD_IDENTITY=$C_CHILD_IDENTITY
-  sleep 0.1
-  C_CHILD_ATTEMPT=$((C_CHILD_ATTEMPT + 1))
-done
-[ "$C_CHILD_STABLE" -ge 2 ] || fail 'the Part C doomed pane never reported a stable persistent child process'
+  order_lines=$(ws_order | tr ',' '\n') \
+    || fail "Part C attempt $attempt could not read workspace order"
+  anchor_index=$(printf '%s\n' "$order_lines" | grep -n -Fx "$anchor_ws" | cut -d: -f1)
+  doomed_index=$(printf '%s\n' "$order_lines" | grep -n -Fx "$doomed_ws" | cut -d: -f1)
+  [ -n "$anchor_index" ] && [ -n "$doomed_index" ] \
+    || fail "Part C attempt $attempt geometry omitted its anchor or doomed workspace"
+  [ "$doomed_index" -gt "$anchor_index" ] \
+    || fail "Part C attempt $attempt geometry placed the doomed workspace before its anchor"
+  right_neighbour=$(printf '%s\n' "$order_lines" | grep -A1 -Fx "$doomed_ws" | tail -1)
+  [ "$right_neighbour" = "$spacer_ws" ] \
+    || fail "Part C attempt $attempt needs its spacer immediately right of the doomed workspace, got '$right_neighbour'"
+  [ "$right_neighbour" != "$anchor_ws" ] \
+    || fail "Part C attempt $attempt geometry is vacuous because the anchor is the right neighbour"
+  survivor_order=$(printf '%s\n' "$order_lines" | grep -v -Fx "$doomed_ws" | paste -sd, -) \
+    || fail "Part C attempt $attempt could not capture survivor order"
 
-C_CALL_LOG="$TMP_ROOT/call-c.log"
-C_FOCUS_SAMPLES="$TMP_ROOT/focus-c.samples"
-C_OPERATION_ACTIVE="$TMP_ROOT/operation-c.active"
-C_SAMPLER_READY="$TMP_ROOT/sampler-c.ready"
-SAMPLER_STOP="$TMP_ROOT/sampler-c.stop"
-: > "$C_CALL_LOG"
-: > "$C_FOCUS_SAMPLES"
-(
-  : > "$C_SAMPLER_READY"
-  while [ ! -e "$SAMPLER_STOP" ]; do
-    if [ -e "$C_OPERATION_ACTIVE" ]; then
-      if C_SAMPLE=$(focus_snapshot); then
-        printf '%s\n' "$C_SAMPLE" >> "$C_FOCUS_SAMPLES"
-      else
-        printf '%s\n' UNREADABLE >> "$C_FOCUS_SAMPLES"
-      fi
+  lab pane run "$doomed_pane" 'cd / && sleep 3000' >/dev/null \
+    || fail "Part C attempt $attempt could not start the persistent-child command"
+  while [ "$child_attempt" -lt 100 ]; do
+    child_identity=$(lab pane process-info --pane "$doomed_pane" 2>/dev/null \
+      | jq -er '
+        .result.process_info as $process
+        | $process.foreground_processes
+        | map(select(.pid != $process.shell_pid))
+        | select(length > 0)
+        | [$process.shell_pid, .[0].pid]
+        | @tsv
+      ' 2>/dev/null) || child_identity=
+    if [ -n "$child_identity" ] && [ "$child_identity" = "$previous_child_identity" ]; then
+      child_stable=$((child_stable + 1))
+      [ "$child_stable" -ge 2 ] && break
+    else
+      child_stable=0
     fi
+    previous_child_identity=$child_identity
+    sleep 0.1
+    child_attempt=$((child_attempt + 1))
   done
-) &
-SAMPLER_PID=$!
-C_READY_ATTEMPT=0
-while [ ! -e "$C_SAMPLER_READY" ] && [ "$C_READY_ATTEMPT" -lt 100 ]; do
-  sleep 0.01
-  C_READY_ATTEMPT=$((C_READY_ATTEMPT + 1))
-done
-[ -e "$C_SAMPLER_READY" ] || fail 'the Part C focus sampler did not start'
-: > "$C_OPERATION_ACTIVE"
-# A short proof budget keeps the exhausted-proof path fast; the count below is
-# what proves the proof was exhausted rather than skipped.
-C_PROOF_POLLS=3
-C_OUT=$(PATH="$FAKEBIN:$HERDR_ORIGINAL_PATH" FM_FLASH_CALL_LOG="$C_CALL_LOG" \
-  FM_BACKEND_HERDR_IDLE_SHELL_PROOF_POLLS="$C_PROOF_POLLS" bash -c '
-  . "$1/bin/backends/herdr.sh"
-  fm_backend_herdr_cli() {
-    local session=$1
-    shift
-    printf "%s\n" "$*" >> "$FM_FLASH_CALL_LOG"
-    HERDR_SESSION="$session" herdr "$@" --session "$session"
-  }
-  fm_backend_herdr_projection_close_pane_focus_preserving "$2" "$3"
-' _ "$ROOT" "$HERDR_LAB_SESSION" "$C_DOOMED_PANE" 2>&1)
-C_STATUS=$?
-rm -f "$C_OPERATION_ACTIVE"
-: > "$SAMPLER_STOP"
-wait "$SAMPLER_PID" 2>/dev/null || true
-SAMPLER_PID=
-[ "$C_STATUS" -eq 0 ] || fail "the production focus-preserving close failed (status $C_STATUS): $C_OUT"
-wait_ws_gone "$C_DOOMED_WS" || fail 'the fallback close left the doomed workspace behind'
-if lab pane get "$C_DOOMED_PANE" >/dev/null 2>&1; then
-  fail 'the fallback close left the doomed pane behind'
-fi
-[ "$(ws_order)" = "$C_SURVIVOR_ORDER" ] \
-  || fail "the fallback close left a lasting workspace order change ($C_SURVIVOR_ORDER -> $(ws_order))"
+  [ "$child_stable" -ge 2 ] \
+    || fail "Part C attempt $attempt never observed a stable persistent child process"
 
-# Prove the FALLBACK is what ran, not the pane-death route Part B covers: the
-# idle-shell proof must have been attempted and exhausted, and the explicit
-# close must have been issued.
-C_PROOF_CALLS=$(grep -c '^pane process-info' "$C_CALL_LOG" || true)
-[ "$C_PROOF_CALLS" -eq "$C_PROOF_POLLS" ] \
-  || fail "Part C did not exhaust the idle-shell proof ($C_PROOF_CALLS of $C_PROOF_POLLS samples); the persistent child did not block it"
-grep -q '^pane close' "$C_CALL_LOG" \
-  || fail 'Part C never reached the plain explicit close, so the fallback branch was not exercised'
-pass 'fallback: a doomed pane holding a persistent child exhausts the proof and takes the plain explicit close'
+  : > "$call_log"
+  start_focus_sampler "$samples" "$active" "$ready" "$stop" \
+    || fail "Part C attempt $attempt focus sampler did not start"
+  : > "$active"
+  out=$(PATH="$FAKEBIN:$HERDR_ORIGINAL_PATH" FM_FLASH_CALL_LOG="$call_log" \
+    FM_BACKEND_HERDR_IDLE_SHELL_PROOF_POLLS="$proof_polls" bash -c '
+    . "$1/bin/backends/herdr.sh"
+    fm_backend_herdr_cli() {
+      local session=$1
+      shift
+      printf "%s\n" "$*" >> "$FM_FLASH_CALL_LOG"
+      HERDR_SESSION="$session" herdr "$@" --session "$session"
+    }
+    fm_backend_herdr_projection_close_pane_focus_preserving "$2" "$3"
+  ' _ "$ROOT" "$HERDR_LAB_SESSION" "$doomed_pane" 2>&1)
+  status=$?
+  stop_focus_sampler "$active" "$stop"
+  [ "$status" -eq 0 ] \
+    || fail "Part C attempt $attempt production close failed (status $status): $out"
+  wait_ws_gone "$doomed_ws" \
+    || fail "Part C attempt $attempt fallback left the doomed workspace behind"
+  if lab pane get "$doomed_pane" >/dev/null 2>&1; then
+    fail "Part C attempt $attempt fallback left the doomed pane behind"
+  fi
+  [ "$(ws_order)" = "$survivor_order" ] \
+    || fail "Part C attempt $attempt fallback changed survivor order ($survivor_order -> $(ws_order))"
+  proof_calls=$(grep -c '^pane process-info' "$call_log" || true)
+  [ "$proof_calls" -eq "$proof_polls" ] \
+    || fail "Part C attempt $attempt did not exhaust the idle-shell proof ($proof_calls of $proof_polls samples)"
+  grep -q '^pane close' "$call_log" \
+    || fail "Part C attempt $attempt never reached the plain explicit close"
+  after=$(focus_snapshot) \
+    || fail "Part C attempt $attempt could not capture post-close focus"
+  [ "$after" = "$before" ] \
+    || fail "Part C attempt $attempt fallback left focus off the exact anchor ($before -> $after)"
+  C_TRIAL_VERDICT=$(focus_samples_verdict "$before" "$samples") \
+    || fail "Part C attempt $attempt had empty, unreadable, or malformed in-operation samples"
+  pass "fallback attempt $attempt: persistent child exhausted $proof_polls proof polls, explicit close removed the doomed pane, and focus returned to anchor; samples=$C_TRIAL_VERDICT"
+}
 
-C_AFTER=$(focus_snapshot) || fail 'could not capture the Part C post-close focus'
-[ "$C_AFTER" = "$C_BEFORE" ] \
-  || fail "the fallback close left focus off the anchor ($C_BEFORE -> $C_AFTER)"
-C_WRONG=$(grep -Fvxc -- "$C_BEFORE" "$C_FOCUS_SAMPLES" || true)
+# Three complete attempts bound extra lifecycle work while allowing two fresh
+# trials after an inconclusive but otherwise valid positive-control trace.
+C_FOCUS_ATTEMPT_BUDGET=3
+C_ATTEMPT_COUNTS=
 if [ "$STEAL_LIVE" = 1 ]; then
-  # A defective release cannot make this path focus-safe, which is precisely why
-  # default-on projection is floored above it. The wrong-focus window is
-  # explicitly accepted here, but only as a BOUNDED one: the restore backstop
-  # must have put the anchor back exactly, and the whole exposure must end with
-  # the operation rather than parking the captain somewhere else.
-  [ "$C_WRONG" -ge 1 ] \
-    || fail 'Part C reached the fallback on a defective release but observed no wrong-focus sample at all, so the sampler proved nothing'
-  pass "fallback on a defective release: a bounded wrong-focus window of $C_WRONG samples was fully restored to the anchor"
+  C_ATTEMPT=1
+  while [ "$C_ATTEMPT" -le "$C_FOCUS_ATTEMPT_BUDGET" ]; do
+    run_focus_fallback_trial "$C_ATTEMPT"
+    C_ATTEMPT_COUNTS="${C_ATTEMPT_COUNTS}${C_ATTEMPT_COUNTS:+, }$C_ATTEMPT:$C_TRIAL_VERDICT"
+    C_DISPOSITION=$(focus_trial_disposition defective 0 "$C_TRIAL_VERDICT" "$C_ATTEMPT" "$C_FOCUS_ATTEMPT_BUDGET")
+    case "$C_DISPOSITION" in
+      pass)
+        pass "fallback positive control: valid wrong focus observed on attempt $C_ATTEMPT/$C_FOCUS_ATTEMPT_BUDGET; samples=[$C_ATTEMPT_COUNTS]"
+        break
+        ;;
+      retry)
+        if [ "$C_ATTEMPT" -eq "$C_FOCUS_ATTEMPT_BUDGET" ]; then
+          fail "fallback positive control exhausted $C_FOCUS_ATTEMPT_BUDGET complete anchor-only trials; samples=[$C_ATTEMPT_COUNTS]"
+        fi
+        pass "fallback positive control attempt $C_ATTEMPT was readable and anchor-only; retrying with fresh geometry"
+        ;;
+      fail)
+        fail "fallback positive control exhausted $C_FOCUS_ATTEMPT_BUDGET complete anchor-only trials; samples=[$C_ATTEMPT_COUNTS]"
+        ;;
+      *) fail "fallback positive control rejected its trial verdict $C_TRIAL_VERDICT" ;;
+    esac
+    C_ATTEMPT=$((C_ATTEMPT + 1))
+  done
 else
-  [ "$C_WRONG" -eq 0 ] \
-    || fail "a focus-preserving release exposed $C_WRONG wrong-focus samples on the fallback path"
-  pass 'fallback on a focus-preserving release: the plain explicit close preserved exact focus throughout'
+  C_ATTEMPT=1
+  run_focus_fallback_trial "$C_ATTEMPT"
+  [ "$(focus_trial_disposition preserving 0 "$C_TRIAL_VERDICT" "$C_ATTEMPT" "$C_ATTEMPT")" = pass ] \
+    || fail "focus-preserving release exposed a wrong focus sample ($C_TRIAL_VERDICT)"
+  pass "fallback on a focus-preserving release: exact focus held throughout; samples=$C_TRIAL_VERDICT"
 fi
 
 # The live guard on the version floor itself: Part A measured whether THIS
