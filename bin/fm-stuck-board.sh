@@ -13,6 +13,8 @@ CONFIG="${FM_CONFIG_OVERRIDE:-$FM_HOME/config}"
 . "$SCRIPT_DIR/fm-pr-lib.sh"
 # shellcheck source=bin/fm-backend.sh
 . "$SCRIPT_DIR/fm-backend.sh"
+# shellcheck source=bin/fm-agent-process-lib.sh
+. "$SCRIPT_DIR/fm-agent-process-lib.sh"
 
 fail() { printf 'stuck-board-error: %s\n' "$*"; printf 'fm-stuck-board: %s\n' "$*" >&2; exit 2; }
 usage() { sed -n '2,/^set -u$/s/^# \{0,1\}//p' "$0"; }
@@ -110,94 +112,193 @@ since_for_head() {  # <task-id> <rule> <head-oid>
       case "$old_ts" in ''|*[!0-9]*) ;; *) printf '%s' "$old_ts"; return 0 ;; esac
     fi
   fi
-  umask 077
   tmp=$(mktemp "$STATE/.$1.$2-since.XXXXXX") || return 1
-  if printf '%s\t%s\n' "$head" "$now" > "$tmp" && chmod 0600 "$tmp" \
+  if (umask 077; printf '%s\t%s\n' "$head" "$now" > "$tmp" && chmod 0600 "$tmp") \
     && mv -f -- "$tmp" "$marker"; then :; else rm -f -- "$tmp"; return 1; fi
   printf '%s' "$now"
 }
 
-command_age() {
-  local meta=$1 backend target pid table found
+elapsed_seconds() {
+  awk -v value="$1" 'BEGIN {
+    days = 0
+    if (value ~ /-/) { split(value, dayparts, "-"); days = dayparts[1] + 0; value = dayparts[2] }
+    parts = split(value, clock, ":")
+    if (parts == 2) seconds = clock[1] * 60 + clock[2]
+    else if (parts == 3) seconds = clock[1] * 3600 + clock[2] * 60 + clock[3]
+    else exit 1
+    print seconds + days * 86400
+  }'
+}
+
+pane_process_root() {
+  local meta=$1 backend target session pane info
   backend=$(fm_backend_of_meta "$meta")
-  [ "$backend" = tmux ] || return 1
-  target=$(fm_backend_target_of_meta "$meta")
-  [ -n "$target" ] || return 1
-  pid=$(tmux display-message -p -t "$target" '#{pane_pid}' 2>/dev/null || true)
-  case "$pid" in ''|*[!0-9]*) return 1 ;; esac
-  table=$(ps -axo pid=,ppid=,etime=,comm= 2>/dev/null) || return 1
-  found=$(printf '%s\n' "$table" | awk -v root="$pid" '
-    NF >= 4 { parent[$1] = $2; elapsed[$1] = $3; command[$1] = $4 }
-    END {
-      for (process in parent) {
-        if (process == root || command[process] ~ /(claude|codex)$/) continue
-        current = parent[process]
-        depth = 0
-        while (current != root && current > 1 && current in parent && depth < 32) {
-          current = parent[current]
-          depth++
-        }
-        if (current != root) continue
-        value = elapsed[process]
-        days = 0
-        if (value ~ /-/) { split(value, dayparts, "-"); days = dayparts[1] + 0; value = dayparts[2] }
-        parts = split(value, clock, ":")
-        if (parts == 2) seconds = clock[1] * 60 + clock[2]
-        else if (parts == 3) seconds = clock[1] * 3600 + clock[2] * 60 + clock[3]
-        else continue
-        seconds += days * 86400
-        if (seconds > max) max = seconds
-      }
-      print max + 0
+  case "$backend" in
+    tmux)
+      target=$(fm_backend_target_of_meta "$meta")
+      [ -n "$target" ] || return 1
+      tmux display-message -p -t "$target" '#{pane_pid}' 2>/dev/null
+      ;;
+    herdr)
+      session=$(fm_meta_get "$meta" herdr_session)
+      pane=$(fm_meta_get "$meta" herdr_pane_id)
+      [ -n "$session" ] && [ -n "$pane" ] || return 1
+      fm_backend_source herdr || return 1
+      info=$(fm_backend_herdr_cli "$session" pane process-info --pane "$pane" 2>/dev/null) || return 1
+      printf '%s' "$info" | jq -er --arg pane "$pane" '
+        if .result.type == "pane_process_info" and .result.process_info.pane_id == $pane then
+          .result.process_info.shell_pid | select(type == "number" and . > 1) | floor
+        else empty end
+      ' 2>/dev/null
+      ;;
+    *) return 1 ;;
+  esac
+}
+
+process_descendants() {  # <ps-output> <root-pid>
+  awk -v root="$2" '
+    NF >= 5 {
+      pid[NR] = $1
+      parent[NR] = $2
+      elapsed[NR] = $3
+      comm[NR] = $4
+      args = $5
+      for (i = 6; i <= NF; i++) args = args " " $i
+      command[NR] = args
+      index_of[$1] = NR
     }
-  ') || return 1
-  [ "$found" -gt 0 ] || return 1
-  printf '%s' "$found"
+    END {
+      if (!(root in index_of)) exit 1
+      root_row = index_of[root]
+      descendant[root] = 1
+      depth[root] = 0
+      for (pass = 0; pass < 64; pass++) {
+        changed = 0
+        for (i = 1; i <= NR; i++) {
+          if ((parent[i] in descendant) && !(pid[i] in descendant)) {
+            descendant[pid[i]] = 1
+            depth[pid[i]] = depth[parent[i]] + 1
+            changed = 1
+          }
+        }
+        if (!changed) break
+      }
+      for (i = 1; i <= NR; i++) {
+        if (pid[i] in descendant)
+          printf "%s\t%s\t%s\t%s\t%s\n", pid[i], depth[pid[i]], elapsed[i], comm[i], command[i]
+      }
+    }
+  ' <<< "$1"
+}
+
+process_is_descendant() {  # <ps-output> <child-pid> <ancestor-pid>
+  awk -v child="$2" -v ancestor="$3" '
+    NF >= 2 { parent[$1] = $2 }
+    END {
+      current = child
+      for (depth = 0; depth < 64 && current in parent; depth++) {
+        current = parent[current]
+        if (current == ancestor) exit 0
+      }
+      exit 1
+    }
+  ' <<< "$1"
+}
+
+command_age() {
+  local meta=$1 root table rows harness agent_pid='' agent_age=0 agent_depth=999
+  local pid depth etime comm args argv0 verdict age launch_delta maximum=0
+  root=$(pane_process_root "$meta") || return 1
+  case "$root" in ''|*[!0-9]*) return 1 ;; esac
+  table=$(ps -axo pid=,ppid=,etime=,comm=,args= 2>/dev/null) || return 1
+  rows=$(process_descendants "$table" "$root") || return 1
+  harness=$(fm_meta_get "$meta" harness)
+  while IFS=$'\t' read -r pid depth etime comm args; do
+    [ -n "$pid" ] || continue
+    argv0=${args%% *}
+    verdict=$(fm_agent_process_classify "$comm" "$argv0" "$args" "$pid")
+    [ "$verdict" = agent ] || continue
+    case "$harness:$comm:$argv0:$args" in
+      claude:*claude*|codex:*codex*) ;;
+      claude:*|codex:*) continue ;;
+      *) ;;
+    esac
+    if [ "$depth" -lt "$agent_depth" ]; then
+      agent_pid=$pid
+      agent_depth=$depth
+      agent_age=$(elapsed_seconds "$etime" || echo 0)
+    fi
+  done <<EOF_AGENT
+$rows
+EOF_AGENT
+  [ -n "$agent_pid" ] || return 1
+
+  while IFS=$'\t' read -r pid depth etime comm args; do
+    [ -n "$pid" ] && [ "$depth" -gt "$agent_depth" ] || continue
+    process_is_descendant "$table" "$pid" "$agent_pid" || continue
+    verdict=$(fm_agent_process_classify_name "$comm" "${args%% *}")
+    [ "$verdict" = shell ] || continue
+    age=$(elapsed_seconds "$etime" || echo 0)
+    launch_delta=$((agent_age - age))
+    [ "$launch_delta" -gt 30 ] || continue
+    [ "$age" -gt "$maximum" ] && maximum=$age
+  done <<EOF_COMMANDS
+$rows
+EOF_COMMANDS
+  [ "$maximum" -gt 0 ] || return 1
+  printf '%s' "$maximum"
 }
 
 pr_snapshot() {
   local url=$1 result
-  result=$(gh pr view "$url" --json state,isDraft,reviewDecision,mergeStateStatus,headRefOid 2>/dev/null) || return 1
+  result=$(gh pr view "$url" --json state,isDraft,reviewDecision,mergeStateStatus,headRefOid,reviews 2>/dev/null) || return 1
   printf '%s' "$result"
 }
 
-discover_pr() {  # <worktree>
-  local worktree=$1 branch remote repo url
-  command -v gh >/dev/null 2>&1 || return 1
-  branch=$(git -C "$worktree" branch --show-current 2>/dev/null) || return 1
-  [ -n "$branch" ] || return 1
-  remote=$(git -C "$worktree" remote get-url origin 2>/dev/null) || return 1
-  case "$remote" in
-    git@github.com:*) repo=${remote#git@github.com:} ;;
-    ssh://git@github.com/*) repo=${remote#ssh://git@github.com/} ;;
-    https://github.com/*) repo=${remote#https://github.com/} ;;
-    *) return 1 ;;
-  esac
-  repo=${repo%.git}
-  case "$repo" in */*) ;; *) return 1 ;; esac
-  url=$(gh pr list --repo "$repo" --head "$branch" --state open --json url --jq '.[0].url // empty' 2>/dev/null) || return 1
-  [ -n "$url" ] && printf '%s' "$url"
+latest_status_state() {
+  local file=$1 line
+  [ -f "$file" ] || return 1
+  line=$(tail -n 1 "$file" 2>/dev/null || true)
+  case "$line" in done:*|failed:*|needs-decision:*|blocked:*|paused:*) return 0 ;; esac
+  return 1
 }
 
-scan_task() {
-  local id=$1 meta=$2 kind start hb hb_ts status_ts commit_ts progress_ts age pr url pr_json pr_state pr_draft pr_decision merge_state pr_head head_ts review_since ready_since branch pushed_head pushed_ts cmd_age worktree
+scan_local_task() {
+  local id=$1 meta=$2 kind start hb hb_ts status_file cmd_age
   kind=$(fm_meta_get "$meta" kind)
   case "$kind" in ship|scout) ;; *) return 0 ;; esac
   start=$(task_start "$id" "$meta") || start=$now
-
-  hb="$STATE/$id.heartbeat"
-  hb_ts=0
-  if [ -f "$hb" ] && [ ! -L "$hb" ]; then
-    IFS=$'\t' read -r hb_ts _ < "$hb" || hb_ts=0
-    case "$hb_ts" in ''|*[!0-9]*) hb_ts=0 ;; esac
+  status_file="$STATE/$id.status"
+  if latest_status_state "$status_file"; then
+    clear_rule "$id" heartbeat
+    clear_rule "$id" no-progress
+    clear_rule "$id" long-command
+  else
+    hb="$STATE/$id.heartbeat"
+    hb_ts=0
+    if [ -f "$hb" ] && [ ! -L "$hb" ]; then
+      IFS=$'\t' read -r hb_ts _ < "$hb" || hb_ts=0
+      case "$hb_ts" in ''|*[!0-9]*) hb_ts=0 ;; esac
+    fi
+    if [ "$hb_ts" -eq 0 ]; then hb_ts=$start; fi
+    if [ "$(elapsed "$hb_ts")" -gt "$HEARTBEAT_SECS" ]; then breach "$id" heartbeat; else clear_rule "$id" heartbeat; fi
+    cmd_age=$(command_age "$meta" 2>/dev/null || echo 0)
+    if [ "$cmd_age" -gt "$COMMAND_SECS" ]; then breach "$id" long-command; else clear_rule "$id" long-command; fi
   fi
-  if [ "$hb_ts" -eq 0 ]; then hb_ts=$start; fi
-  age=$(elapsed "$hb_ts")
-  if [ "$age" -gt "$HEARTBEAT_SECS" ]; then breach "$id" heartbeat; else clear_rule "$id" heartbeat; fi
 
-  status_ts=$(last_status_progress "$STATE/$id.status")
-  commit_ts=0
+  if failure_repeats "$status_file"; then breach "$id" repeated-failure; else clear_rule "$id" repeated-failure; fi
+}
+
+scan_network_task() {
+  local id=$1 meta=$2 kind start status_file status_ts commit_ts progress_ts worktree branch pushed_head pushed_ts
+  local url pr_json pr_state pr_draft pr_decision approved_reviews pr_head head_ts review_since ready_since
+  kind=$(fm_meta_get "$meta" kind)
+  case "$kind" in ship|scout) ;; *) return 0 ;; esac
+  start=$(task_start "$id" "$meta") || start=$now
+  status_file="$STATE/$id.status"
   worktree=$(fm_meta_get "$meta" worktree)
+  status_ts=$(last_status_progress "$status_file")
+  commit_ts=0
   if [ -n "$worktree" ] && [ -d "$worktree" ]; then
     commit_ts=$(git -C "$worktree" log -1 --format=%ct 2>/dev/null || echo 0)
     branch=$(git -C "$worktree" branch --show-current 2>/dev/null || true)
@@ -205,33 +306,33 @@ scan_task() {
       pushed_head=$(git -C "$worktree" ls-remote origin "refs/heads/$branch" 2>/dev/null | awk 'NR == 1 {print $1}')
       case "$pushed_head" in
         *[!0-9a-f]*|'') ;;
-      *) pushed_ts=$(since_for_head "$id" push "$pushed_head" || echo 0); [ "$pushed_ts" -le "$commit_ts" ] || commit_ts=$pushed_ts ;;
+        *) pushed_ts=$(since_for_head "$id" push "$pushed_head" || echo 0); [ "$pushed_ts" -le "$commit_ts" ] || commit_ts=$pushed_ts ;;
       esac
     fi
   fi
-  progress_ts=$status_ts
+  progress_ts=$start
+  [ "$status_ts" -le "$progress_ts" ] || progress_ts=$status_ts
   [ "$commit_ts" -le "$progress_ts" ] || progress_ts=$commit_ts
+
   url=$(fm_meta_get "$meta" pr)
-  if [ -z "$url" ] && [ -n "$worktree" ] && [ -d "$worktree" ]; then
-    url=$(discover_pr "$worktree" || true)
-  fi
   pr_json=
   if [ -n "$url" ]; then pr_json=$(pr_snapshot "$url" || true); fi
   pr_state=$(printf '%s' "$pr_json" | jq -r '.state // empty' 2>/dev/null || true)
-  pr_draft=$(printf '%s' "$pr_json" | jq -r '.isDraft // empty' 2>/dev/null || true)
+  pr_draft=$(printf '%s' "$pr_json" | jq -r 'if (.isDraft | type) == "boolean" then .isDraft else empty end' 2>/dev/null || true)
   pr_decision=$(printf '%s' "$pr_json" | jq -r '.reviewDecision // empty' 2>/dev/null || true)
-  merge_state=$(printf '%s' "$pr_json" | jq -r '.mergeStateStatus // empty' 2>/dev/null || true)
+  approved_reviews=$(printf '%s' "$pr_json" | jq -r '[.reviews[]? | select(.state == "APPROVED")] | length' 2>/dev/null || echo 0)
   pr_head=$(printf '%s' "$pr_json" | jq -r '.headRefOid // empty' 2>/dev/null || true)
   if [ -n "$pr_head" ]; then
     head_ts=$(since_for_head "$id" progress "$pr_head" || echo 0)
     [ "$head_ts" -le "$progress_ts" ] || progress_ts=$head_ts
   fi
-  [ "$progress_ts" -gt 0 ] || progress_ts=$start
-  age=$(elapsed "$progress_ts")
-  if [ "$age" -gt "$PROGRESS_SECS" ]; then breach "$id" no-progress; else clear_rule "$id" no-progress; fi
-
-  cmd_age=$(command_age "$meta" 2>/dev/null || echo 0)
-  if [ "$cmd_age" -gt "$COMMAND_SECS" ]; then breach "$id" long-command; else clear_rule "$id" long-command; fi
+  if latest_status_state "$status_file"; then
+    clear_rule "$id" no-progress
+  elif [ "$(elapsed "$progress_ts")" -gt "$PROGRESS_SECS" ]; then
+    breach "$id" no-progress
+  else
+    clear_rule "$id" no-progress
+  fi
 
   if [ "$kind" = ship ]; then
     if { [ -z "$url" ] || { [ -n "$pr_json" ] && [ "$pr_state" != OPEN ]; }; } \
@@ -247,7 +348,7 @@ scan_task() {
   if [ -n "$url" ] && [ -z "$pr_json" ]; then
     : # A failed forge read cannot close a previously observed review episode.
   elif [ "$pr_state" = OPEN ] && [ "$pr_draft" = false ]; then
-    if [ "$pr_decision" = REVIEW_REQUIRED ]; then
+    if [ "$pr_decision" = REVIEW_REQUIRED ] || { [ -z "$pr_decision" ] && [ "$approved_reviews" -eq 0 ]; }; then
       review_since=$(since_for_head "$id" review "$pr_head")
       if [ "$(elapsed "$review_since")" -gt "$REVIEW_SECS" ]; then
         breach "$id" review-wait
@@ -258,7 +359,7 @@ scan_task() {
       clear_rule "$id" review-wait
       rm -f -- "$STATE/.stuck-$id-review-since"
     fi
-    if [ "$merge_state" = CLEAN ] && [ "$pr_decision" = APPROVED ]; then
+    if [ "$pr_state" = OPEN ] && [ "$pr_draft" = false ]; then
       ready_since=$(since_for_head "$id" ready "$pr_head")
       if [ "$(elapsed "$ready_since")" -gt "$READY_PR_SECS" ]; then
         breach "$id" ready-pr-wait
@@ -274,13 +375,35 @@ scan_task() {
     clear_rule "$id" ready-pr-wait
     rm -f -- "$STATE/.stuck-$id-review-since" "$STATE/.stuck-$id-ready-since"
   fi
-
-  if failure_repeats "$STATE/$id.status"; then breach "$id" repeated-failure; else clear_rule "$id" repeated-failure; fi
 }
 
+metas=()
 for meta in "$STATE"/*.meta; do
   [ -f "$meta" ] && [ ! -L "$meta" ] || continue
   id=${meta##*/}; id=${id%.meta}
   fm_task_id_creation_valid "$id" || continue
-  scan_task "$id" "$meta"
+  metas+=("$meta")
+  scan_local_task "$id" "$meta"
+done
+
+meta_count=${#metas[@]}
+[ "$meta_count" -gt 0 ] || exit 0
+cursor_file="$STATE/.stuck-board-cursor"
+cursor=0
+if [ -f "$cursor_file" ] && [ ! -L "$cursor_file" ]; then
+  IFS= read -r cursor < "$cursor_file" || cursor=0
+  case "$cursor" in ''|*[!0-9]*) cursor=0 ;; esac
+fi
+cursor=$((cursor % meta_count))
+next_cursor=$(((cursor + 1) % meta_count))
+cursor_tmp=$(mktemp "$STATE/.stuck-board-cursor.XXXXXX") || fail 'could not prepare the network fairness cursor'
+if (umask 077; printf '%s\n' "$next_cursor" > "$cursor_tmp" && chmod 0600 "$cursor_tmp") \
+  && mv -f -- "$cursor_tmp" "$cursor_file"; then :; else rm -f -- "$cursor_tmp"; fail 'could not publish the network fairness cursor'; fi
+offset=0
+while [ "$offset" -lt "$meta_count" ]; do
+  index=$(((cursor + offset) % meta_count))
+  meta=${metas[$index]}
+  id=${meta##*/}; id=${id%.meta}
+  scan_network_task "$id" "$meta"
+  offset=$((offset + 1))
 done

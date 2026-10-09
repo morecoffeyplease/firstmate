@@ -37,9 +37,14 @@ failure_repeats=2
 ready_pr_seconds=86400
 ```
 
-`progress_seconds` measures time since the latest status-log update, local commit, or recorded pull-request update.
-The child-command threshold uses the recorded tmux pane process tree.
-Pull-request rules read the URL recorded in task metadata and require the GitHub CLI to be authenticated for GitHub pull requests.
+`progress_seconds` measures time since the latest status-log update, local commit, pushed head, or recorded pull-request head update, with the lane start as its earliest baseline.
+The child-command threshold uses the recorded tmux pane or Herdr pane process tree and counts command shells started under the worker harness after its startup period.
+MCP server processes and treehouse wrapper ancestors do not count as worker commands, and done, failed, needs-decision, blocked, and paused lanes do not trigger heartbeat, no-progress, or long-command rules.
+Pull-request rules remain active for terminal lanes and read the URL recorded in task metadata.
+An empty review decision is treated as waiting when the open pull request has no approved review, and every open non-draft pull request is subject to the ready-pull-request timer.
+GitHub pull-request rules require the GitHub CLI to be authenticated.
+When a forge read fails, the check keeps the existing pull-request timer observations and retries on a later watcher poll.
+The network portion rotates its starting lane between polls so a slow forge call cannot indefinitely starve later lanes.
 `bin/fm-stuck-board.sh` owns the signal rules, config parsing, and breach episodes, while the helper headers own exact commands and output.
 
 `bin/fm-spawn.sh` owns the base task-metadata fields it emits, while the runtime-backend section below owns backend-specific fields and selector interpretation.

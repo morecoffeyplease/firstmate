@@ -106,7 +106,7 @@ data/                personal fleet records; LOCAL, gitignored as a whole
 projects/            cloned repos; gitignored; read-only except under hard rule 1's concrete captain-approved project operation exception
 state/               runtime records and signals; gitignored
   <id>.status        appended by crewmates: "<state>: <note>" wake-event lines, not current-state truth
-  <id>.heartbeat <id>.started .stuck-<id>-<rule> .last-stuck-board  separate per-task worker heartbeat and lane-start records, once-per-episode stuck-rule markers, and the watcher's scan cadence; bin/fm-task-heartbeat.sh and bin/fm-stuck-board.sh own their formats and lifecycle
+  <id>.heartbeat <id>.started .stuck-<id>-<rule> .stuck-<id>-{push,progress,review,ready}-since .last-stuck-board .stuck-board-cursor .stuck-board-error  separate per-task worker heartbeat and lane-start records, once-per-episode rule markers and signal timers, plus the watcher's scan cadence, network fairness cursor, and deduplicated check-error episode; bin/fm-task-heartbeat.sh, bin/fm-stuck-board.sh, and bin/fm-watch.sh own their formats and lifecycle
   <id>.turn-ended    touched by turn-end hooks
   <id>.progress      touched for observed native-harness activity inside one Pi turn; bin/fm-busy-event.sh owns its generation binding and bin/fm-watch.sh reads it beside turn-ended for the busy-age bound only, never as a completed turn
   <id>.grok-turnend-token   firstmate-owned grok hook registry token for the task; removed by teardown

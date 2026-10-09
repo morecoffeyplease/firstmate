@@ -2208,19 +2208,36 @@ while :; do
     stuck_rc=$FM_CHECK_EXIT
     stuck_output=$FM_CHECK_RESULT
     touch "$STATE/.last-stuck-board"
-    if [ "$stuck_rc" -ne 0 ] || [[ "$stuck_output" == stuck-board-error:* ]]; then
-      reason="check: stuck-board: ${stuck_output:-evaluation failed (exit $stuck_rc)}"
-      fm_wake_append check stuck-board-error "$reason" || exit 1
-      wake "$reason"
-    elif [ -n "$stuck_output" ]; then
-      stuck_reason=
-      while IFS= read -r stuck_line; do
-        [ -n "$stuck_line" ] || continue
-        fm_wake_append check "stuck-board:$stuck_line" "$stuck_line" || exit 1
-        stuck_reason="${stuck_reason}${stuck_line}"$'\n'
-      done <<EOF_STUCK
+    stuck_reason=
+    stuck_error=
+    while IFS= read -r stuck_line; do
+      [ -n "$stuck_line" ] || continue
+      case "$stuck_line" in
+        stuck:*)
+          fm_wake_append check "stuck-board:$stuck_line" "$stuck_line" || exit 1
+          stuck_reason="${stuck_reason}${stuck_line}"$'\n'
+          ;;
+        stuck-board-error:*) stuck_error=$stuck_line ;;
+        *) [ -n "$stuck_error" ] || stuck_error=$stuck_line ;;
+      esac
+    done <<EOF_STUCK
 $stuck_output
 EOF_STUCK
+    if [ "$stuck_rc" -ne 0 ] || [ -n "$stuck_error" ]; then
+      stuck_error=${stuck_error:-"evaluation failed (exit $stuck_rc)"}
+      stuck_error_marker="$STATE/.stuck-board-error"
+      old_stuck_error=
+      [ -f "$stuck_error_marker" ] && IFS= read -r old_stuck_error < "$stuck_error_marker" || true
+      if [ "$old_stuck_error" != "$stuck_error" ]; then
+        reason="check: stuck-board: $stuck_error"
+        (umask 077; printf '%s\n' "$stuck_error" > "$stuck_error_marker") || exit 1
+        fm_wake_append check stuck-board-error "$reason" || exit 1
+        stuck_reason="${stuck_reason}${reason}"$'\n'
+      fi
+    else
+      rm -f -- "$STATE/.stuck-board-error"
+    fi
+    if [ -n "$stuck_reason" ]; then
       wake "${stuck_reason%$'\n'}"
     fi
   fi
