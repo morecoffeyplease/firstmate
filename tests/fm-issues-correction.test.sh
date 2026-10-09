@@ -3,6 +3,8 @@
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+# shellcheck source=tests/git-config-helpers.sh
+. "$ROOT/tests/git-config-helpers.sh"
 TMP_ROOT=$(mktemp -d "${TMPDIR:-/tmp}/fm-issues-correction.XXXXXX")
 if [ "${FM_ISSUES_TEST_KEEP:-0}" = 1 ]; then
   printf 'fixture root: %s\n' "$TMP_ROOT"
@@ -78,5 +80,18 @@ projection = issues._make_projection(home, "alpha")
 assert projection["remote_issue_coverage"]["stale_home_summaries"] == 1 and not projection["remote_issue_coverage"]["complete"]
 remote_row = next(row for row in projection["rows"] if row["url"] == issue_url)
 assert remote_row["tasks"][0]["task_state"] == "unknown" and "stale" in remote_row["tasks"][0]["conflicts"][0]
+
+# A lane-specific validated receipt-write error remains unknown even when the
+# first write failed before any start receipt could be retained.
+(home / "config" / "project-lanes.json").write_text(json.dumps({"alpha": {"full": ["/bin/echo", "configured"]}}))
+receipt_task = "receipt-task"
+receipt_data = home / "data" / receipt_task
+receipt_dir = receipt_data / "lane-receipts"
+receipt_dir.mkdir(parents=True)
+(receipt_dir / ".instrumented").write_text("gen-7\n")
+(receipt_dir / ".errors").write_text(f"{int(time.time())} task={receipt_task} generation=gen-7 lane=full atomic receipt write failed\n")
+lane_task = {"id": receipt_task, "spawn_gen": "gen-7", "paths": {"worktree": {"path": str(clone)}}}
+lane = issues.lane_status(home, lane_task, "alpha")
+assert lane["full"]["status"] == "unknown" and lane["full"]["error"] == "atomic receipt write failed", lane
 print("pass: canonical issue identity, ready predicate, multiple wait facts, and UTC/PT timestamp classes")
 PY

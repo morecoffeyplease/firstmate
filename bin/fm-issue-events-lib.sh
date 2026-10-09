@@ -12,6 +12,7 @@ fm_issue_event_append() { # <task-dir> <task-id> <generation> <kind> <fields-jso
   local file lock tmp epoch attempt owner lock_age
   case "$task" in ''|.*|*[!A-Za-z0-9._-]*) return 1 ;; esac
   case "$generation" in ''|*[!A-Za-z0-9._-]*) return 1 ;; esac
+  [ "${#generation}" -le 96 ] || return 1
   case "$kind" in started|done|reopened|held|answered|released|reconciled|blocked-by|unblocked|pr-bound|merge-requested|decision-resolved|status-seen) ;; *) return 1 ;; esac
   case "$class" in event|detected) ;; *) return 1 ;; esac
   [ -d "$dir" ] && [ ! -L "$dir" ] || return 1
@@ -76,7 +77,16 @@ fm_issue_event_validate_file() { # <events.jsonl> <task-id>
   [ "$(wc -c < "$file" | tr -d ' ')" -le "$FM_ISSUE_EVENT_MAX_FILE_BYTES" ] || return 1
   jq -se --arg task "$task" '
     def fields_ok:
-      if .kind == "started" then (.fields.kind | IN("ship","scout"))
+      ((.fields | keys) - (if .kind == "started" then ["kind"]
+        elif .kind == "done" or .kind == "reopened" then ["transition"]
+        elif .kind == "held" or .kind == "answered" or .kind == "released" or .kind == "reconciled" then ["source"]
+        elif .kind == "pr-bound" then ["url","head"]
+        elif .kind == "merge-requested" then ["url","authority"]
+        elif .kind == "decision-resolved" then ["key"]
+        elif .kind == "blocked-by" or .kind == "unblocked" then ["blocker"]
+        else ["state","key","from_epoch","to_epoch"] end) | length == 0)
+      and all(.fields | to_entries[]; (.value | tostring | length) <= 512)
+      and (if .kind == "started" then (.fields.kind | IN("ship","scout"))
       elif .kind == "done" or .kind == "reopened" then (.fields.transition | IN("close","retain"))
       elif .kind == "held" or .kind == "answered" or .kind == "released" or .kind == "reconciled" then (.fields.source | type == "string" and length > 0)
       elif .kind == "pr-bound" then (.fields.url | type == "string" and length > 0) and (.fields.head | type == "string" and length > 0)
@@ -84,7 +94,7 @@ fm_issue_event_validate_file() { # <events.jsonl> <task-id>
       elif .kind == "decision-resolved" then (.fields.key | type == "string" and test("^[A-Za-z0-9._-]{1,80}$"))
       elif .kind == "blocked-by" or .kind == "unblocked" then (.fields.blocker | type == "string" and length > 0)
       elif .kind == "status-seen" then (.fields.state | IN("working","needs-decision","blocked","paused","done","failed","resolved","note","receipt","waiting","busy","running","complete","completed","unknown")) and (.fields.key == null or (.fields.key | type == "string" and test("^[A-Za-z0-9._-]{1,80}$"))) and (.fields.from_epoch == null or (.fields.from_epoch|type)=="number") and (.fields.to_epoch|type)=="number"
-      else false end;
+      else false end);
     all(.[]; .schema == "fm-task-event.v1" and .task == $task
       and (.generation | type == "string" and length > 0 and length <= 96)
       and (.at_epoch | type == "number" and . >= 0)

@@ -47,11 +47,14 @@ set -u
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 FM_ROOT="${FM_ROOT_OVERRIDE:-$(cd "$SCRIPT_DIR/.." && pwd)}"
 FM_HOME="${FM_HOME:-${FM_ROOT_OVERRIDE:-$FM_ROOT}}"
+STATE="${FM_STATE_OVERRIDE:-$FM_HOME/state}"
 DATA="${FM_DATA_OVERRIDE:-$FM_HOME/data}"
 # shellcheck source=bin/fm-tasks-axi-lib.sh disable=SC1091
 . "$SCRIPT_DIR/fm-tasks-axi-lib.sh"
 # shellcheck source=bin/fm-backlog-transition-lib.sh disable=SC1091
 . "$SCRIPT_DIR/fm-backlog-transition-lib.sh"
+# shellcheck source=bin/fm-issue-events-lib.sh disable=SC1091
+. "$SCRIPT_DIR/fm-issue-events-lib.sh"
 
 usage() {
   awk '
@@ -109,6 +112,15 @@ done
 
 command -v tasks-axi >/dev/null 2>&1 || fail "tasks-axi is not on PATH; run bin/fm-bootstrap.sh for the install command"
 
+if ! DATA=$(fm_backlog_data_absolute "$DATA"); then
+  fail "data directory cannot be resolved: ${FM_BACKLOG_TRANSITION_ERROR:-$DATA}"
+fi
+if [ -d "$STATE" ] && [ ! -L "$STATE" ]; then
+  STATE=$(CDPATH='' cd -- "$STATE" 2>/dev/null && pwd -P) || STATE=
+else
+  STATE=
+fi
+
 FM_BACKLOG_TRANSITION_ERROR=
 if ! fm_backlog_tasks_axi_addressing "$DATA"; then
   fail "${FM_BACKLOG_TRANSITION_ERROR:-data directory cannot be resolved: $DATA}"
@@ -124,4 +136,37 @@ else
 fi
 
 cd "$FM_BACKLOG_AXI_ROOT" || fail "cannot enter the backlog root $FM_BACKLOG_AXI_ROOT"
-exec tasks-axi ${ARGS[@]+"${ARGS[@]}"}
+tasks-axi ${ARGS[@]+"${ARGS[@]}"}
+command_status=$?
+
+# Blocker writes made through this supported home-local entrypoint have one
+# deterministic owner. Record only the exact block/unblock form that tasks-axi
+# accepted, and keep journal failures best-effort so they never change its
+# output or result.
+if [ "$command_status" -eq 0 ] && { [ "${ARGS[0]:-}" = block ] || [ "${ARGS[0]:-}" = unblock ]; }; then
+  task=${ARGS[1]:-}
+  blocker=
+  for ((index=2; index<${#ARGS[@]}; index++)); do
+    if [ "${ARGS[$index]}" = --by ] && [ "$((index + 1))" -lt "${#ARGS[@]}" ]; then
+      blocker=${ARGS[$((index + 1))]}
+      break
+    fi
+  done
+  case "$task$blocker" in ''|*[!A-Za-z0-9._-]*) task= ;; esac
+  if [ -n "$task" ] && [ -n "$blocker" ]; then
+    meta="$STATE/$task.meta"
+    if [ -n "$STATE" ] && [ -n "$DATA" ] && [ -f "$meta" ] && [ ! -L "$meta" ]; then
+      generation=$(grep '^spawn_gen=' "$meta" | tail -1 | cut -d= -f2- || true)
+      if [ -n "$generation" ]; then
+        task_dir="$DATA/$task"
+        if [ -d "$task_dir" ] && [ ! -L "$task_dir" ]; then
+          event_kind=blocked-by
+          [ "${ARGS[0]}" != unblock ] || event_kind=unblocked
+          fm_issue_event_append "$task_dir" "$task" "$generation" "$event_kind" \
+            "$(jq -cn --arg blocker "$blocker" '{blocker:$blocker}')" || true
+        fi
+      fi
+    fi
+  fi
+fi
+exit "$command_status"

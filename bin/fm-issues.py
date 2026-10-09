@@ -26,7 +26,7 @@ from fm_project_lanes import read_project_lanes
 
 ROOT = Path(__file__).resolve().parent.parent
 SCHEMA = "fm-issues.v1"
-FP_SCHEMA = "fm-issues-fingerprint.v1"
+FP_SCHEMA = "fm-issues-fingerprint.v2"
 MAX_CATALOG_AGE = 3600
 MAX_OBSERVATION_BRACKET = 86400
 COLLECT_LOCK = threading.Lock()
@@ -424,13 +424,6 @@ def safe_integer(value: object) -> int:
 
 
 def fingerprint_task(task: dict) -> dict:
-    event = task.get("event")
-    event_value = None
-    if event:
-        fields = event.get("fields", {})
-        momentary = event.get("kind") == "status-seen" and fields.get("state") in ("working", "busy", "running")
-        if not momentary:
-            event_value = {"class": event.get("class"), "kind": event.get("kind"), "fields": {key: value for key, value in fields.items() if key not in ("from_epoch", "to_epoch")}}
     return {
         "id": task.get("id"),
         "generation": task.get("generation"),
@@ -440,7 +433,6 @@ def fingerprint_task(task: dict) -> dict:
         "waiting": task.get("waiting"),
         "next_step": task.get("next_step"),
         "backlog_state": (task.get("backlog") or {}).get("state"),
-        "blocked_by": (task.get("backlog") or {}).get("blocked_by"),
         "unresolved_blocker_ids": sorted((task.get("backlog") or {}).get("unresolved_blocker_ids") or []),
         "hold_reason": (task.get("backlog") or {}).get("hold_reason"),
         "open_decisions": task.get("hints", {}).get("open_decisions", []),
@@ -448,7 +440,6 @@ def fingerprint_task(task: dict) -> dict:
         "prs": sorted((fingerprint_pr(pr) for pr in task.get("prs", [])), key=lambda pr: pr.get("url") or ""),
         "verification": {lane: task.get("verification", {}).get(lane, {}).get("status") for lane in ("focused", "full", "verify")},
         "ready_for_approval": task.get("ready_for_approval"),
-        "event": event_value,
     }
 
 
@@ -495,6 +486,27 @@ def lane_status(home: Path, task: dict, project: str) -> dict[str, dict]:
             pass
     records: dict[str, list[dict]] = {lane: [] for lane in ("focused", "full", "verify")}
     malformed: dict[str, bool] = {lane: False for lane in records}
+    receipt_errors: dict[str, list[tuple[int, str]]] = {lane: [] for lane in records}
+    error_path = receipt_dir / ".errors"
+    try:
+        if error_path.is_symlink() or (error_path.exists() and (not error_path.is_file() or error_path.stat().st_size > 65536)):
+            receipt_errors = {lane: [(0, "receipt error journal is unsafe")] for lane in records}
+        elif error_path.exists():
+            for line in error_path.read_text(encoding="utf-8").splitlines():
+                match = re.match(r"^(\d+) task=([A-Za-z0-9._-]+) generation=([A-Za-z0-9._-]+) lane=(focused|full|verify) (.{1,300})$", line)
+                if match:
+                    if match.group(2) == task_id and match.group(3) == generation:
+                        receipt_errors[match.group(4)].append((int(match.group(1)), match.group(5)))
+                    continue
+                legacy = re.match(r"^(\d+) (.{1,300})$", line)
+                if legacy:
+                    for lane in records:
+                        receipt_errors[lane].append((int(legacy.group(1)), legacy.group(2)))
+                else:
+                    receipt_errors = {lane: [(0, "receipt error journal is malformed")] for lane in records}
+                    break
+    except (OSError, UnicodeError):
+        receipt_errors = {lane: [(0, "receipt error journal cannot be read")] for lane in records}
     expected_repo, _repo_error = canonical_repo(home, project)
     for lane in records:
         for path in receipt_dir.glob(f"{lane}-*.json"):
@@ -538,6 +550,10 @@ def lane_status(home: Path, task: dict, project: str) -> dict[str, dict]:
         if malformed[lane]:
             result[lane] = {"status": "unknown", "basis": "a malformed or mismatched receipt prevents qualification"}
             continue
+        relevant_errors = [(stamp, message) for stamp, message in receipt_errors[lane] if not chosen or stamp >= chosen.get("started_epoch", 0)]
+        if relevant_errors:
+            result[lane] = {"status": "unknown", "basis": "a validated receipt write failed", "error": relevant_errors[-1][1]}
+            continue
         if not chosen:
             continue
         if chosen.get("generation") != generation:
@@ -563,21 +579,7 @@ def lane_status(home: Path, task: dict, project: str) -> dict[str, dict]:
             state = "passed"
         else:
             state = "stale (passed on an older head)"
-        error_path = receipt_dir / ".errors"
-        error = None
-        try:
-            if error_path.is_symlink() or (error_path.exists() and (not error_path.is_file() or error_path.stat().st_size > 65536)):
-                error = "receipt error journal is unsafe"
-            elif error_path.exists():
-                for line in error_path.read_text(encoding="utf-8").splitlines():
-                    match = re.match(r"^(\d+) (.{1,300})$", line)
-                    if not match:
-                        error = "receipt error journal is malformed"
-                        break
-                    if int(match.group(1)) >= chosen["started_epoch"]:
-                        error = match.group(2)
-        except (OSError, UnicodeError):
-            error = "receipt error journal cannot be read"
+        error = next((message for stamp, message in reversed(receipt_errors[lane]) if stamp >= chosen["started_epoch"]), None)
         if error:
             state = "unknown"
         order = chosen["started_order_ns"]
@@ -601,55 +603,24 @@ def task_event_fact(home: Path, task_id: str | None, generation: str | None) -> 
     path = home / "data" / task_id / "events.jsonl"
     if path.is_symlink() or not path.is_file() or path.stat().st_size > 4_194_304:
         return None
-    latest = None
-    events = []
-    allowed = {
-        "started": {"kind"}, "done": {"transition"}, "reopened": {"transition"},
-        "held": {"source"}, "answered": {"source"}, "released": {"source"},
-        "reconciled": {"source"}, "blocked-by": {"blocker"}, "unblocked": {"blocker"},
-        "pr-bound": {"url", "head"}, "merge-requested": {"url", "authority"},
-        "decision-resolved": {"key"},
-        "status-seen": {"state", "key", "from_epoch", "to_epoch"},
-    }
     try:
-        for line in path.read_text(encoding="utf-8").splitlines():
-            item = json.loads(line)
-            if (
-                not isinstance(item, dict) or item.get("schema") != "fm-task-event.v1"
-                or item.get("task") != task_id or not isinstance(item.get("generation"), str)
-                or item.get("class") not in ("event", "detected")
-                or not isinstance(item.get("at_epoch"), int) or item["at_epoch"] < 0
-                or not isinstance(item.get("kind"), str) or item["kind"] not in allowed
-                or not isinstance(item.get("fields"), dict)
-                or set(item["fields"]) - allowed[item["kind"]]
-                or any(not isinstance(value, (str, int, type(None))) for value in item["fields"].values())
-            ):
-                return None
-            fields = item["fields"]
-            required = {"started": {"kind"}, "done": {"transition"}, "reopened": {"transition"},
-                        "held": {"source"}, "answered": {"source"}, "released": {"source"},
-                        "reconciled": {"source"}, "blocked-by": {"blocker"}, "unblocked": {"blocker"},
-                        "pr-bound": {"url", "head"}, "merge-requested": {"url", "authority"},
-                        "decision-resolved": {"key"}, "status-seen": {"state", "to_epoch"}}
-            if not required[item["kind"]].issubset(fields):
-                return None
-            if item["kind"] == "started" and fields["kind"] not in ("ship", "scout"):
-                return None
-            if item["kind"] in ("done", "reopened") and fields["transition"] not in ("close", "retain"):
-                return None
-            if item["kind"] == "merge-requested" and fields["authority"] not in ("yolo", "away-grant", "attended"):
-                return None
-            if item["kind"] == "decision-resolved" and (not isinstance(fields["key"], str) or not re.fullmatch(r"[A-Za-z0-9._-]{1,80}", fields["key"])):
-                return None
-            if item.get("generation") != generation:
-                continue
-            events.append(item)
-            latest = item
-    except (OSError, ValueError, TypeError):
+        validated = subprocess.run(
+            ["/bin/bash", "-c", 'source "$1" && fm_issue_event_validate_file "$2" "$3"', "fm-event-validate", str(ROOT / "bin" / "fm-issue-events-lib.sh"), str(path), task_id],
+            capture_output=True,
+            timeout=5,
+        )
+        if validated.returncode != 0:
+            return None
+        events = [
+            item for item in (json.loads(line) for line in path.read_text(encoding="utf-8").splitlines())
+            if item.get("generation") == generation
+        ]
+    except (OSError, subprocess.SubprocessError, ValueError, TypeError):
         return None
-    if latest is not None:
-        latest = dict(latest)
-        latest["history"] = events
+    if not events:
+        return None
+    latest = dict(events[-1])
+    latest["history"] = events
     return latest
 
 
@@ -696,7 +667,7 @@ def _make_projection(home: Path, project: str, refresh: bool = False) -> dict:
             atomic_json(snapshot_file, checked)
     snap = checked.get("snapshot") if isinstance(checked, dict) else None
     candidates = []
-    remote_issue_coverage = {"registered_homes": 0, "shown_home_summaries": 0, "unknown_home_summaries": 0, "stale_home_summaries": 0, "visible_task_records": 0, "omitted_task_records": 0, "complete": False}
+    remote_issue_coverage = {"registered_homes": 0, "shown_home_summaries": 0, "unknown_home_summaries": 0, "stale_home_summaries": 0, "visible_task_records": 0, "omitted_task_records": 0, "omitted_scope_unknown": False, "complete": False}
     if isinstance(snap, dict):
         secondmate_current = snap.get("secondmate_current") or {}
         remote_records = secondmate_current.get("records", []) if isinstance(secondmate_current, dict) else []
@@ -714,10 +685,24 @@ def _make_projection(home: Path, project: str, refresh: bool = False) -> dict:
             summary_freshness = (secondmate.get("freshness") or {}).get("status")
             inventory_proven = isinstance((secondmate.get("counts") or {}).get("issue_tasks"), int)
             issue_tasks = secondmate.get("issue_tasks", []) if isinstance(secondmate.get("issue_tasks", []), list) else []
-            remote_issue_coverage["visible_task_records"] += len(issue_tasks)
-            remote_issue_coverage["omitted_task_records"] += sum(item.get("count", 0) for item in secondmate.get("omitted", []) if item.get("surface") == "issue_tasks" and isinstance(item.get("count"), int))
+            relevant_tasks = [item for item in issue_tasks if isinstance(item, dict) and (item.get("backlog") or {}).get("repo") == project and canonical_issue_urls((item.get("backlog") or {}).get("links", []), repo)]
+            remote_issue_coverage["visible_task_records"] += len(relevant_tasks)
+            omissions_by_project = secondmate.get("omitted_issue_tasks_by_project")
+            if isinstance(omissions_by_project, list):
+                remote_issue_coverage["omitted_task_records"] += sum(item.get("count", 0) for item in omissions_by_project if isinstance(item, dict) and item.get("project") == project and isinstance(item.get("count"), int))
+                unknown_scope_count = secondmate.get("omitted_issue_tasks_scope_unknown")
+                if isinstance(unknown_scope_count, int) and unknown_scope_count > 0:
+                    remote_issue_coverage["omitted_scope_unknown"] = True
+                    remote_issue_coverage["complete"] = False
+            else:
+                unscoped_omitted = sum(item.get("count", 0) for item in secondmate.get("omitted", []) if item.get("surface") == "issue_tasks" and isinstance(item.get("count"), int))
+                if unscoped_omitted:
+                    remote_issue_coverage["omitted_scope_unknown"] = True
+                    remote_issue_coverage["complete"] = False
             if not valid_summary or not inventory_proven:
                 remote_issue_coverage["unknown_home_summaries"] += 1
+                remote_issue_coverage["complete"] = False
+            if remote_issue_coverage["omitted_task_records"] > 0:
                 remote_issue_coverage["complete"] = False
             if summary_freshness != "fresh":
                 remote_issue_coverage["stale_home_summaries"] += 1
@@ -772,7 +757,8 @@ def _make_projection(home: Path, project: str, refresh: bool = False) -> dict:
                     candidates.append({"id": row.get("id"), "generation": None, "kind": row.get("kind"), "task_state": "done", "backlog": row, "issues": canonical_issue_urls(row.get("links", []), repo), "prs": ([{"url": row.get("pr_url"), "state": "merged" if (row.get("completion") or {}).get("verb") == "merged" else "unknown", "association": "backlog artifact"}] if row.get("pr_url") else []), "stage": stage_name, "waiting": None, "next_step": "Completed" if stage_name == "Completed" else "Closed without delivery", "verification": {lane: {"status": "not instrumented"} for lane in ("focused", "full", "verify")}, "ready_for_approval": "not ready", "source_accepted": "not recorded", "canonical_journeys": "not recorded", "event": None})
                     continue
                 orphan = row.get("state") == "in_flight"
-                candidates.append({"id": row.get("id"), "generation": None, "kind": row.get("kind"), "task_state": "unknown" if orphan else "queued", "backlog": row, "issues": canonical_issue_urls(row.get("links", []), repo), "prs": [], "stage": "Unknown" if orphan else "Queued", "waiting": row.get("blocked_by") and "prerequisite" or None, "next_step": "Next step not recorded" if orphan else (f"Queued behind {row.get('blocked_by')}" if row.get("blocked_by") else "Queued"), "conflicts": ["backlog is in flight but task metadata is missing"] if orphan else [], "verification": {lane: {"status": "not instrumented"} for lane in ("focused", "full", "verify")}, "ready_for_approval": "not ready", "source_accepted": "not recorded", "canonical_journeys": "not recorded", "event": None})
+                unresolved = sorted(set(row.get("unresolved_blocker_ids") or []))
+                candidates.append({"id": row.get("id"), "generation": None, "kind": row.get("kind"), "task_state": "unknown" if orphan else "queued", "backlog": row, "issues": canonical_issue_urls(row.get("links", []), repo), "prs": [], "stage": "Unknown" if orphan else "Queued", "waiting": "prerequisite" if unresolved and not orphan else None, "next_step": "Next step not recorded" if orphan else (f"Queued behind {', '.join(unresolved)}" if unresolved else "Queued"), "conflicts": ["backlog is in flight but task metadata is missing"] if orphan else [], "verification": {lane: {"status": "not instrumented"} for lane in ("focused", "full", "verify")}, "ready_for_approval": "not ready", "source_accepted": "not recorded", "canonical_journeys": "not recorded", "event": None})
         secondmates = remote_records
         for secondmate in secondmates:
             home_id = secondmate.get("id") or "registered-home"
@@ -805,6 +791,8 @@ def _make_projection(home: Path, project: str, refresh: bool = False) -> dict:
                 summary_fresh = (secondmate.get("freshness") or {}).get("status") == "fresh"
                 if not summary_valid or not summary_fresh:
                     current_state = {**current_state, "reported_state": current_state.get("state"), "state": "unknown", "source": "untrusted partial home summary"}
+                decisions = [item for item in secondmate.get("decisions_open", []) if isinstance(item, dict) and item.get("id") == source_id and item.get("verb") in ("needs-decision", "captain-hold")]
+                remote_event = remote.get("event") if isinstance(remote.get("event"), dict) else None
                 task_row = {
                     "id": task_id,
                     "task_id": source_id,
@@ -815,13 +803,13 @@ def _make_projection(home: Path, project: str, refresh: bool = False) -> dict:
                     "activity_source": current_state.get("source", "unknown"),
                     "activity_detail": current_state.get("detail"),
                     "current_state": current_state,
-                    "hints": {},
+                    "hints": {"open_decisions": decisions, "pending_decision": any(item.get("verb") in ("needs-decision", "captain-hold") for item in decisions), "blocked_event": current_state.get("state") in ("blocked", "parked")},
                     "source_head": None,
                     "backlog": backlog,
                     "issues": issue_urls,
                     "prs": linked_prs,
                     "verification": {lane: {"status": "unknown", "basis": "remote lane receipts are not included in the validated home summary"} for lane in ("focused", "full", "verify")},
-                    "event": None,
+                    "event": remote_event,
                     "merge_requests": [],
                     "source_accepted": "not recorded",
                     "canonical_journeys": "not recorded",
@@ -853,15 +841,15 @@ def _make_projection(home: Path, project: str, refresh: bool = False) -> dict:
             visibility = "not visible to this login (forge returned 403/404)" if identity.get("status") == "not-visible-to-login" else "known identity observation unknown" if identity.get("status") == "unknown" else "known identity not present in observed catalog coverage"
             rows.append({"url": url, "number": None, "title": None, "forge_state": "unknown", "visibility": visibility, "identity_check": identity, "tasks": linked, "stage": "Unknown", "changed": {"class": "unknown"}})
             continue
-        def actionable_rank(task: dict) -> tuple[int, int]:
+        def actionable_rank(task: dict) -> tuple[int, str]:
             if task.get("waiting") == "your decision":
-                return (0, 0)
-            if task.get("waiting") in ("blocked", "failed") or task.get("task_state") == "failed":
-                return (1, 0)
+                return (0, task.get("id") or "")
+            if task.get("conflicts") or task.get("waiting") in ("prerequisite", "blocked", "failed") or task.get("task_state") == "failed" or any(pr.get("failed_checks", 0) for pr in task.get("prs", [])):
+                return (1, task.get("id") or "")
             if task.get("stage") == "Ready for approval":
-                return (2, 0)
-            order = {"Investigating": 3, "Implementing": 4, "In review": 5, "Merging": 6, "Queued": 7, "Completed": 8}
-            return (order.get(task.get("stage"), 1), 0)
+                return (2, task.get("id") or "")
+            order = {"Queued": 3, "Investigating": 4, "Implementing": 5, "Revising": 6, "In review": 7, "Merging": 8, "Completed": 9, "Closed without delivery": 10}
+            return (order.get(task.get("stage"), 1), task.get("id") or "")
         chosen_task = min(linked, key=actionable_rank) if linked else None
         chosen = chosen_task["stage"] if chosen_task else ("Unstarted" if issue["state"] == "open" else "Closed without delivery")
         conflicts = [conflict for task in linked for conflict in task.get("conflicts", [])]
@@ -898,19 +886,20 @@ def _make_projection(home: Path, project: str, refresh: bool = False) -> dict:
         linked = row.get("tasks", [])
         if not linked:
             continue
-        def rank(task: dict) -> tuple[int, int]:
-            if task.get("waiting") == "your decision": return (0, 0)
-            if task.get("conflicts") or task.get("waiting") in ("blocked", "failed") or task.get("task_state") == "failed": return (1, 0)
-            if task.get("stage") == "Ready for approval": return (2, 0)
-            return ({"Investigating": (3, 0), "Implementing": (4, 0), "Revising": (5, 0), "In review": (6, 0), "Merging": (7, 0), "Queued": (8, 0), "Completed": (9, 0), "Closed without delivery": (10, 0)}.get(task.get("stage"), (1, 0)))
+        def rank(task: dict) -> tuple[int, str]:
+            if task.get("waiting") == "your decision": return (0, task.get("id") or "")
+            if task.get("conflicts") or task.get("waiting") in ("prerequisite", "blocked", "failed") or task.get("task_state") == "failed" or any(pr.get("failed_checks", 0) for pr in task.get("prs", [])): return (1, task.get("id") or "")
+            if task.get("stage") == "Ready for approval": return (2, task.get("id") or "")
+            order = {"Queued": 3, "Investigating": 4, "Implementing": 5, "Revising": 6, "In review": 7, "Merging": 8, "Completed": 9, "Closed without delivery": 10}
+            return (order.get(task.get("stage"), 1), task.get("id") or "")
         chosen_task = min(linked, key=rank)
         row["stage"] = chosen_task.get("stage", "Unknown")
         row["next_step"] = chosen_task.get("next_step")
     relevant_rows = [{"url": row["url"], "state": row.get("forge_state"), "title": row.get("title"), "stage": row.get("stage"), "conflicts": sorted(row.get("conflicts", [])), "tasks": [fingerprint_task(task) for task in row.get("tasks", [])]} for row in rows]
     relevant_rows.sort(key=lambda value: value["url"])
     fingerprint = hashlib.sha256(json.dumps({"schema": FP_SCHEMA, "rows": relevant_rows, "unlinked_tasks": [fingerprint_task(task) for task in unlinked]}, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
-    previous_fp = previous.get("fingerprint") if isinstance(previous, dict) else None
-    previous_seen = previous.get("observed_epoch") if isinstance(previous, dict) else None
+    previous_fp = previous.get("fingerprint") if isinstance(previous, dict) and previous.get("schema") == FP_SCHEMA else None
+    previous_seen = previous.get("observed_epoch") if isinstance(previous, dict) and previous.get("schema") == FP_SCHEMA else None
     changed = {"class": "unknown"}
     if previous_fp and previous_fp != fingerprint and previous_seen and now - int(previous_seen) <= MAX_OBSERVATION_BRACKET:
         changed = {"class": "detected", "from_epoch": int(previous_seen), "to_epoch": now}
@@ -1021,6 +1010,16 @@ def list_summary_requests(home: Path, project: str | None = None) -> list[dict]:
             if int(value.get("expires_epoch", 0)) <= utc_now():
                 results = {name: ("expired" if result == "pending" else result) for name, result in results.items()}
             value["results"] = results
+            reasons = value.get("result_reasons", {})
+            routes = value.get("routes", {})
+            correlations = value.get("correlations", {})
+            value["project_results"] = [
+                {"project": name, "state": results.get(name, "unknown"),
+                 "reason": reasons.get(name) if isinstance(reasons, dict) else None,
+                 "route": (routes.get(name) or {}).get("route") if isinstance(routes, dict) and isinstance(routes.get(name), dict) else routes.get(name) if isinstance(routes, dict) else None,
+                 "correlation": correlations.get(name) if isinstance(correlations, dict) else None}
+                for name in value.get("projects", []) if project is None or name == project
+            ]
             states = list(results.values())
             value["state"] = ("pending" if "pending" in states else
                               "failed" if "failed" in states else
@@ -1057,6 +1056,101 @@ def supervisor_availability(home: Path) -> str:
         return "unavailable"
     except (PermissionError, OSError):
         return "unknown"
+
+
+def summary_route_candidates(home: Path, selected: list[str]) -> dict[str, dict]:
+    registry = home / "data" / "secondmates.md"
+    if not registry.exists() and not registry.is_symlink():
+        return {name: {"route": "main-home", "target": None, "state": "pending"} for name in selected}
+    script = '''
+source "$1/fm-secondmate-registry-lib.sh" || exit 2
+source "$1/fm-backend.sh" || exit 2
+source "$1/fm-repo-concurrency-lib.sh" || exit 2
+home=$2
+registry=$3
+shift 3
+if ! secondmate_registry_validate_bindings "$registry" secondmate_registry_path_key; then
+  printf 'ERROR\\tsecondmate registry validation failed\\n'
+  exit 0
+fi
+for project in "$@"; do
+  identity=$(fm_repo_scope_canonical_origin_identity "$home/projects/$project" 2>/dev/null || true)
+  matches=()
+  while IFS= read -r line || [ -n "$line" ]; do
+    case "$line" in "- "*) ;; *) continue ;; esac
+    secondmate_registry_parse_line "$line" || continue
+    id=$SECONDMATE_REGISTRY_ID
+    project_names=",${SECONDMATE_REGISTRY_PROJECTS//[[:space:]]/},"
+    case "$project_names" in *,"$project",*) ;; *) continue ;; esac
+    if [ "$SECONDMATE_REGISTRY_REMOTE" -eq 1 ] || [ -n "$SECONDMATE_REGISTRY_REPO_IDENTITIES" ]; then
+      [ -n "$identity" ] || continue
+      identity_rows=",${SECONDMATE_REGISTRY_REPO_IDENTITIES//[[:space:]]/},"
+      case "$identity_rows" in *,"$project=sha256:$identity",*) ;; *) continue ;; esac
+    fi
+    meta="$home/state/$id.meta"
+    [ -f "$meta" ] && [ ! -L "$meta" ] || continue
+    [ "$(fm_meta_get "$meta" kind 2>/dev/null || true)" = secondmate ] || continue
+    matches+=("$id")
+  done < "$registry"
+  if [ "${#matches[@]}" -eq 1 ]; then
+    printf '%s\\tsecondmate\\t%s\\t\\n' "$project" "${matches[0]}"
+  elif [ "${#matches[@]}" -gt 1 ]; then
+    printf '%s\\tunavailable\\t\\tproject maps to multiple registered secondmate routes\\n' "$project"
+  else
+    printf '%s\\tmain-home\\t\\t\\n' "$project"
+  fi
+done
+'''
+    try:
+        result = subprocess.run(
+            ["/bin/bash", "-c", script, "fm-summary-routes", str(ROOT / "bin"), str(home), str(registry), *selected],
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        return {name: {"route": "unavailable", "target": None, "state": "unavailable", "reason": str(exc)[:300]} for name in selected}
+    if result.returncode != 0:
+        reason = result.stderr[-300:] or "secondmate registry could not be validated"
+        return {name: {"route": "unavailable", "target": None, "state": "unavailable", "reason": reason} for name in selected}
+    routes = {}
+    for line in result.stdout.splitlines():
+        fields = line.split("\t", 3)
+        if len(fields) == 4 and fields[0] in selected:
+            route, target, reason = fields[1:]
+            routes[fields[0]] = {"route": route, "target": target or None, "state": "unavailable" if route == "unavailable" else "pending", **({"reason": reason} if reason else {})}
+    return {name: routes.get(name, {"route": "unavailable", "target": None, "state": "unavailable", "reason": "project route was not returned by registry validation"}) for name in selected}
+
+
+def summary_pending_correlation(home: Path, target: str, request_id: str, project: str) -> str | None:
+    marker = f"request={request_id} project={project}"
+    script = '''
+source "$1/fm-pending-reply-lib.sh" || exit 2
+state=$2
+task=$3
+marker=$4
+dir=$(fm_pending_reply_dir "$state")
+[ -d "$dir" ] && [ ! -L "$dir" ] || exit 0
+found=
+for record in "$dir"/*; do
+  [ -f "$record" ] && [ ! -L "$record" ] || continue
+  [ "$(fm_pending_reply_get "$record" task_id)" = "$task" ] || continue
+  summary=$(fm_pending_reply_get "$record" request_summary)
+  case "$summary" in *"$marker"*) found=$(fm_pending_reply_get "$record" corr_id) ;; esac
+done
+case "$found" in [a-f0-9][a-f0-9][a-f0-9][a-f0-9][a-f0-9][a-f0-9][a-f0-9][a-f0-9][a-f0-9][a-f0-9][a-f0-9][a-f0-9][a-f0-9][a-f0-9][a-f0-9][a-f0-9]) printf '%s\\n' "$found" ;; *) exit 0 ;; esac
+'''
+    try:
+        result = subprocess.run(
+            ["/bin/bash", "-c", script, "fm-summary-correlation", str(ROOT / "bin"), str(home / "state"), target, marker],
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+        value = result.stdout.strip()
+        return value if result.returncode == 0 and re.fullmatch(r"[a-f0-9]{16}", value) else None
+    except (OSError, subprocess.SubprocessError):
+        return None
 
 
 def summary_command(home: Path, argv: list[str]) -> int:
@@ -1119,11 +1213,16 @@ def summary_command(home: Path, argv: list[str]) -> int:
             print(json.dumps({"status": "pending", "requests": attached, "deduplicated": True, "supervisor_availability": availability}))
             return 0
         ident = f"{now}-{secrets.token_hex(6)}"
-        record = {"schema": "fm-status-summary-request.v1", "id": ident, "requested_epoch": now, "requested_at": iso_utc(now), "projects": selected, "basis_fingerprints": {name: projections[name]["fingerprint"] for name in selected}, "state": "pending", "results": {name: "pending" for name in selected}, "expires_epoch": now + 1800, "supervisor_availability": supervisor_availability(home), "route": "main-home inbox; use marked fm-send and pending-reply correlation for registered project homes"}
+        routes = summary_route_candidates(home, selected)
+        initial_results = {name: routes[name]["state"] for name in selected}
+        initial_state = "unavailable" if all(value == "unavailable" for value in initial_results.values()) else "pending"
+        record = {"schema": "fm-status-summary-request.v1", "id": ident, "requested_epoch": now, "requested_at": iso_utc(now), "projects": selected, "basis_fingerprints": {name: projections[name]["fingerprint"] for name in selected}, "state": initial_state, "results": initial_results, "result_reasons": {name: routes[name]["reason"] for name in selected if routes[name].get("reason")}, "routes": routes, "correlations": {}, "expires_epoch": now + 1800, "supervisor_availability": supervisor_availability(home)}
         atomic_json(reqdir / f"{ident}.json", record)
         note = [str(ROOT / "bin" / "fm-inbox.sh"), "note", f"Request Manual Update id={ident} projects={','.join(selected)}"]
         env = os.environ.copy()
         env["FM_HOME"] = str(home)
+        env.pop("FM_STATE_OVERRIDE", None)
+        env.pop("FM_DATA_OVERRIDE", None)
         sent = subprocess.run(note, env=env, cwd=ROOT, capture_output=True, text=True, timeout=10)
         if sent.returncode:
             record["error"] = sent.stderr[-500:] or "inbox notification failed"
@@ -1133,7 +1232,36 @@ def summary_command(home: Path, argv: list[str]) -> int:
             atomic_json(reqdir / f"{ident}.json", record)
             print(json.dumps({"status": "failed", "request": ident, "error": record["error"]}))
             return 1
-        print(json.dumps({"status": "pending", "request": ident, "projects": selected, "attached": attached, "supervisor_availability": availability}))
+        for name in selected:
+            route = routes[name]
+            target = route.get("target")
+            if route.get("route") != "secondmate" or not target or record["results"].get(name) != "pending":
+                continue
+            marker = f"request={ident} project={name}"
+            message = f"{marker} Request Manual Update. At composition start, read the current structured projection and use its fingerprint, observation time, and evidence as the summary basis. Please provide a concise written project summary through the correlated parent status channel."
+            try:
+                routed = subprocess.run([str(ROOT / "bin" / "fm-send.sh"), target, message], env=env, cwd=ROOT, capture_output=True, text=True, timeout=30)
+            except (OSError, subprocess.SubprocessError) as exc:
+                routed = None
+                reason = str(exc)[:300]
+            else:
+                reason = (routed.stderr or routed.stdout)[-500:] if routed.returncode else ""
+            if routed is None or routed.returncode != 0:
+                record["results"][name] = "failed"
+                record.setdefault("result_reasons", {})[name] = reason or "marked request delivery failed"
+                continue
+            correlation = summary_pending_correlation(home, target, ident, name)
+            if correlation:
+                record.setdefault("correlations", {})[name] = correlation
+            else:
+                record["results"][name] = "unavailable"
+                record.setdefault("result_reasons", {})[name] = "marked request was sent but its pending-reply correlation could not be verified"
+        result_values = list(record["results"].values())
+        record["state"] = ("pending" if "pending" in result_values else
+                            "failed" if "failed" in result_values else
+                            "unavailable" if "unavailable" in result_values else "written")
+        atomic_json(reqdir / f"{ident}.json", record)
+        print(json.dumps({"status": record["state"], "request": ident, "projects": selected, "attached": attached, "supervisor_availability": availability, "results": record["results"]}))
         return 0
     if args.command == "put":
         path = reqdir / f"{args.request_id}.json"
@@ -1166,10 +1294,11 @@ def summary_command(home: Path, argv: list[str]) -> int:
         history.append(summary)
         atomic_json(summary_path, {"schema": "fm-status-summaries.v1", "project": args.project, "summaries": history[-20:]})
         record.setdefault("results", {})[args.project] = summary["state"]
-        if all(value in ("written", "outdated") for value in record["results"].values()):
-            record["state"] = "outdated" if any(value == "outdated" for value in record["results"].values()) else "written"
-        else:
-            record["state"] = "pending"
+        values = list(record["results"].values())
+        record["state"] = ("pending" if "pending" in values else
+                            "failed" if "failed" in values else
+                            "unavailable" if "unavailable" in values else
+                            "outdated" if "outdated" in values else "written")
         atomic_json(path, record)
         print(json.dumps({"status": summary["state"], "project": args.project}))
         return 0
@@ -1213,9 +1342,9 @@ function detail(task){const box=document.createElement('details'),summary=docume
 function verification(row){const box=document.createElement('div');for(const task of row.tasks||[])box.append(detail(task));if(!row.tasks?.length)box.textContent='No recorded Firstmate work';return box}
 function changed(value){if(value?.class==='event')return `${time(value.at_epoch)} (event)`;if(value?.class==='detected')return `between ${time(value.from_epoch)} and ${time(value.to_epoch)} (detected)`;return 'unknown'}
 function renderRow(row){const tr=document.createElement('tr'),issue=document.createElement('td'),link=document.createElement('a'),stage=document.createElement('td'),next=document.createElement('td'),prs=document.createElement('td'),verify=document.createElement('td'),when=document.createElement('td');link.href=row.url;link.textContent=row.number?`#${row.number} ${row.title}`:row.url;issue.append(link);const count=document.createElement('small');count.textContent=`${row.task_count||0} tasks / ${row.pr_count||0} PRs`;stage.append(text(row.stage+'\n'),count);next.textContent=row.next_step||'Next step not recorded';if(row.conflicts?.length){const conflict=document.createElement('div');conflict.className='conflict';conflict.textContent=row.conflicts.join('; ');next.append(conflict)}for(const task of row.tasks||[])for(const pr of task.prs||[]){const a=document.createElement('a');a.href=pr.url;a.textContent=`${pr.url} (${pr.state||'unknown'})`;prs.append(a,text('\n'))}if(!row.pr_count)prs.textContent='None';verify.append(verification(row));when.textContent=changed(row.changed);tr.append(issue,stage,next,prs,verify,when);return tr}
-async function load(force=false){const url='/api/status?project='+encodeURIComponent(selected)+(force?'&refresh=1':'');try{const response=await fetch(url),data=await response.json();if(!response.ok)throw Error(data.error||'collection unavailable');projects=data.projects||[];el('project').replaceChildren();for(const name of projects){const option=document.createElement('option');option.value=name;option.textContent=name;option.selected=name===selected;el('project').append(option)}const p=data.projection;if(!p)throw Error(data.error||'status unavailable');const cat=p.catalog,observed=cat.observed_known??0,coverage=cat.complete&&!cat.stale?`complete (${observed} observed of ${cat.total} total)`:`partial or unavailable (${cat.known} cached; ${observed} observed; total unknown)`,remote=p.remote_issue_coverage||{},remoteCoverage=`Remote summaries ${remote.shown_home_summaries||0}/${remote.registered_homes||0}; ${remote.visible_task_records||0} task records visible, ${remote.omitted_task_records||0} omitted, ${remote.unknown_home_summaries||0} unknown, ${remote.stale_home_summaries||0} stale${remote.complete?'':' (partial)'}`;el('status').className='muted';el('status').textContent=`${p.repository||'Repository unavailable'}; catalog ${coverage}; last checked ${time(p.last_checked_epoch)}. ${remoteCoverage}. Supervisor ${p.supervisor.session_lock_present?'session lock held':'no session lock'}; watcher beat ${time(p.supervisor.watcher_beat_epoch)}. ${cat.error||p.snapshot.error||''}`;el('rows').replaceChildren(...p.rows.map(renderRow));el('unlinked').replaceChildren(...p.unlinked_tasks.map(task=>{const li=document.createElement('li');li.textContent=`${task.id}: ${task.stage}; ${task.next_step||'Next step not recorded'}`;li.append(verification({tasks:[task]}));return li}));const fingerprintKey='fm-issues-fingerprint:'+selected,prior=localStorage.getItem(fingerprintKey);el('changed').textContent=prior&&prior!==p.fingerprint?'Project status changed since you last looked.':'';localStorage.setItem(fingerprintKey,p.fingerprint);renderSummary(p.summary);renderRequests(p.summary_requests)}catch(error){el('status').className='error';el('status').textContent='Unavailable: '+error.message}}
+async function load(force=false){const url='/api/status?project='+encodeURIComponent(selected)+(force?'&refresh=1':'');try{const response=await fetch(url),data=await response.json();if(!response.ok)throw Error(data.error||'collection unavailable');projects=data.projects||[];el('project').replaceChildren();for(const name of projects){const option=document.createElement('option');option.value=name;option.textContent=name;option.selected=name===selected;el('project').append(option)}const p=data.projection;if(!p)throw Error(data.error||'status unavailable');const cat=p.catalog,observed=cat.observed_known??0,coverage=cat.complete&&!cat.stale?`complete (${observed} observed of ${cat.total} total)`:`partial or unavailable (${cat.known} cached; ${observed} observed; total unknown)`,remote=p.remote_issue_coverage||{},omitted=remote.omitted_scope_unknown?'omitted count unknown':`${remote.omitted_task_records||0} omitted`,remoteCoverage=`Remote summaries ${remote.shown_home_summaries||0}/${remote.registered_homes||0}; ${remote.visible_task_records||0} selected-project issue task records visible, ${omitted}, ${remote.unknown_home_summaries||0} unknown, ${remote.stale_home_summaries||0} stale${remote.complete?'':' (partial)'}`;el('status').className='muted';el('status').textContent=`${p.repository||'Repository unavailable'}; catalog ${coverage}; last checked ${time(p.last_checked_epoch)}. ${remoteCoverage}. Supervisor ${p.supervisor.session_lock_present?'session lock held':'no session lock'}; watcher beat ${time(p.supervisor.watcher_beat_epoch)}. ${cat.error||p.snapshot.error||''}`;el('rows').replaceChildren(...p.rows.map(renderRow));el('unlinked').replaceChildren(...p.unlinked_tasks.map(task=>{const li=document.createElement('li');li.textContent=`${task.id}: ${task.stage}; ${task.next_step||'Next step not recorded'}`;li.append(verification({tasks:[task]}));return li}));const fingerprintKey='fm-issues-fingerprint:'+selected,prior=localStorage.getItem(fingerprintKey);el('changed').textContent=prior&&prior!==p.fingerprint?'Project status changed since you last looked.':'';localStorage.setItem(fingerprintKey,p.fingerprint);renderSummary(p.summary);renderRequests(p.summary_requests)}catch(error){el('status').className='error';el('status').textContent='Unavailable: '+error.message}}
 function renderSummary(summary){const root=el('summary');root.replaceChildren();if(!summary)return;const evidence=summary.evidence||{},basis=`Basis ${summary.basis_fingerprint||'unknown'} observed ${time(summary.basis_observed_epoch)}; repository ${evidence.repository||'unknown'}; snapshot ${time(evidence.snapshot_collected_epoch)}; catalog ${time(evidence.catalog_checked_epoch)}`;if(summary.state==='written'){root.textContent=`Written summary by ${summary.author}, based on status as of ${time(summary.basis_observed_epoch)}, written ${time(summary.written_epoch)}:\n${basis}\n${summary.text}`;return}if(summary.state==='outdated'){const details=document.createElement('details'),title=document.createElement('summary'),body=document.createElement('p'),basisLine=document.createElement('small');title.textContent=`Summary outdated since ${time(summary.invalidated_epoch)}; historical text retained`;basisLine.textContent=basis;body.textContent=summary.text;details.append(title,basisLine,body);root.append(details)}}
-function renderRequests(requests){if(!requests.length)return;const states=requests.map(item=>`${item.id}: ${item.display_state||item.state}; supervisor ${item.supervisor_availability||'unknown'}${item.error?` (${item.error})`:''}`).join('; ');el('changed').textContent+=(el('changed').textContent?' ':'')+`Manual update requests: ${states}.`}
+function renderRequests(requests){if(!requests.length)return;const states=requests.map(item=>{const projects=(item.project_results||[]).map(result=>`${result.project} ${result.state}${result.route?` via ${result.route}`:''}${result.correlation?` (${result.correlation})`:''}${result.reason?`: ${result.reason}`:''}`).join(', ');return `${item.id}: ${item.display_state||item.state}; supervisor ${item.supervisor_availability||'unknown'}${projects?`; ${projects}`:''}${item.error?` (${item.error})`:''}`}).join('; ');el('changed').textContent+=(el('changed').textContent?' ':'')+`Manual update requests: ${states}.`}
 el('project').addEventListener('change',event=>{selected=event.target.value;localStorage.setItem('fm-issues-project',selected);load()});el('refresh').onclick=()=>load(true);el('request').onclick=async()=>{try{const response=await fetch('/api/summary-requests',{method:'POST',headers:{'Content-Type':'application/json','X-FM-Token':token},body:JSON.stringify({projects})}),result=await response.json();el('status').textContent=result.status==='pending'?`Manual update request ${result.request||Object.values(result.requests||{})[0]||'already queued'}; supervisor ${result.supervisor_availability||'unknown'}.`:result.error||result.status}catch(error){el('status').textContent='Request failed: '+error.message}};load();setInterval(()=>{if(!document.hidden)load()},15000);
 </script></html>"""
     return page.replace("__TOKEN__", json.dumps(token)).replace("__PROJECT__", json.dumps(project)).encode()

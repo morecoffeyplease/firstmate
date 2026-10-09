@@ -10,6 +10,7 @@ import secrets
 import signal
 import subprocess
 import sys
+import threading
 import time
 from pathlib import Path
 
@@ -107,12 +108,13 @@ def bound_home(receipt_dir: str, task: str) -> Path | None:
         return None
 
 
-def write_error(directory: Path, message: str) -> None:
+def write_error(directory: Path, task: str, generation: str, lane: str, message: str) -> None:
     try:
         directory.mkdir(parents=True, exist_ok=True)
         path = directory / ".errors"
+        safe_message = " ".join(message.split())[:300]
         with path.open("a", encoding="utf-8") as stream:
-            stream.write(f"{now()} {message[:300]}\n")
+            stream.write(f"{now()} task={task} generation={generation} lane={lane} {safe_message}\n")
     except OSError:
         pass
 
@@ -177,21 +179,48 @@ def main(argv: list[str]) -> int:
             atomic_json(receipt_path, receipt)
         except OSError as exc:
             if validated_receipt_dir:
-                write_error(receipt_dir, str(exc))
+                write_error(receipt_dir, task, generation, lane, str(exc))
             receipt_path = None
     child = None
     received: list[int] = []
+    sigint_stop = threading.Event()
+    sigint_thread: threading.Thread | None = None
+    sigint_mask = None
+    sigint_ignored = signal.getsignal(signal.SIGINT) == signal.SIG_IGN
     def forward(signum: int, _frame: object) -> None:
         received.append(signum)
-        # A terminal sends SIGINT to the whole foreground process group, including
-        # the child. Forwarding it here would deliver Ctrl-C twice.
-        if signum != signal.SIGINT and child is not None and child.poll() is None:
+        if child is not None and child.poll() is None:
             try:
                 child.send_signal(signum)
             except OSError:
                 pass
+
+    def child_unblock_sigint() -> None:
+        signal.pthread_sigmask(signal.SIG_UNBLOCK, {signal.SIGINT})
+
+    def wait_for_sigint() -> None:
+        while not sigint_stop.is_set():
+            try:
+                info = signal.sigtimedwait({signal.SIGINT}, 0.1)
+            except InterruptedError:
+                continue
+            if info is None:
+                continue
+            received.append(signal.SIGINT)
+            # TTY-generated SIGINT reaches the whole foreground process group,
+            # including the child. A user-originated signal to this wrapper only
+            # must be forwarded so the child receives the same cancellation.
+            if info.si_pid and child is not None and child.poll() is None:
+                try:
+                    child.send_signal(signal.SIGINT)
+                except OSError:
+                    pass
+
     previous_handlers = {}
-    for sig in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP):
+    if not sigint_ignored and hasattr(signal, "pthread_sigmask") and hasattr(signal, "sigtimedwait"):
+        sigint_mask = signal.pthread_sigmask(signal.SIG_BLOCK, {signal.SIGINT})
+    signals_to_handle = (signal.SIGTERM, signal.SIGHUP) if sigint_mask is not None or sigint_ignored else (signal.SIGINT, signal.SIGTERM, signal.SIGHUP)
+    for sig in signals_to_handle:
         inherited = signal.getsignal(sig)
         if inherited == signal.SIG_IGN:
             continue
@@ -199,7 +228,10 @@ def main(argv: list[str]) -> int:
     return_code = 127
     child_signal = None
     try:
-        child = subprocess.Popen(command)
+        child = subprocess.Popen(command, preexec_fn=child_unblock_sigint if sigint_mask is not None else None)
+        if sigint_mask is not None:
+            sigint_thread = threading.Thread(target=wait_for_sigint, name="fm-lane-sigint", daemon=True)
+            sigint_thread.start()
         return_code = child.wait()
         if return_code < 0:
             child_signal = -return_code
@@ -208,6 +240,11 @@ def main(argv: list[str]) -> int:
         print(f"fm-lane-run: {exc}", file=sys.stderr)
         return_code = 127
     finally:
+        sigint_stop.set()
+        if sigint_thread is not None:
+            sigint_thread.join(timeout=1)
+        if sigint_mask is not None:
+            signal.pthread_sigmask(signal.SIG_SETMASK, sigint_mask)
         for sig, handler in previous_handlers.items():
             signal.signal(sig, handler)
     end_head, end_dirty, end_dirty_hash = source_identity()
@@ -235,7 +272,7 @@ def main(argv: list[str]) -> int:
             for _ended, candidate in completed[:-MAX_RECEIPTS_PER_LANE]:
                 candidate.unlink(missing_ok=True)
         except OSError as exc:
-            write_error(validated_receipt_dir or receipt_dir, str(exc))
+            write_error(validated_receipt_dir or receipt_dir, task, generation, lane, str(exc))
     if child_signal is not None:
         signal.signal(child_signal, signal.SIG_DFL)
         os.kill(os.getpid(), child_signal)

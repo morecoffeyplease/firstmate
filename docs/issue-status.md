@@ -20,6 +20,7 @@ When collection fails, the last good snapshot is marked stale with the latest er
 The time column distinguishes forge event times, bounded local observation times, and unknown history.
 Times are stored as UTC epochs and displayed in America/Los_Angeles with PST or PDT.
 Polling does not advance a status-change time.
+Owner scripts record typed task lifecycle events in `data/<task>/events.jsonl`, including blocker changes made through `bin/fm-tasks-axi.sh` and status changes first seen by the watcher.
 
 The verification details show CI evidence from the forge and local focused, full, and verify receipts from `bin/fm-lane-run.sh`.
 Local lanes without task launch instrumentation or a wrapped run remain not instrumented or not run, and unwrapped commands are invisible.
@@ -27,8 +28,9 @@ Configure full and verify argument arrays in `config/project-lanes.json`; see [p
 Source acceptance and canonical journey evidence stay unknown until an identified authority records typed evidence.
 
 **Request Manual Update** queues one durable request through the main-home inbox for every selected registered project.
-The main-home writer owns routing and uses marked `fm-send` messages with pending-reply correlation for registered project homes.
-Each project is deduplicated independently while its request is pending, and requests expire after 30 minutes.
+The main-home writer resolves project homes through the validated secondmate registry, using exact registered project routes and durable remote repository identities, then sends marked `fm-send` requests with pending-reply correlation to matching secondmates.
+Projects without a registered secondmate route stay assigned to the main-home inbox, and ambiguous or invalid routes are shown as unavailable.
+Each project's route, correlation, result, and failure reason is shown separately, requests deduplicate independently, and requests expire after 30 minutes.
 When composition begins, the summary author reads that project's current fingerprint and observation time from the structured projection.
 The author writes the text with `fm-status-summary put`; the command compares the supplied basis fingerprint with current status and marks a changed basis outdated immediately.
 A later meaningful project fingerprint change also hides or collapses the summary while retaining its labeled historical text.

@@ -3,6 +3,8 @@
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+# shellcheck source=tests/git-config-helpers.sh
+. "$ROOT/tests/git-config-helpers.sh"
 TMP_ROOT=$(mktemp -d "${TMPDIR:-/tmp}/fm-issues.XXXXXX")
 if [ "${FM_ISSUES_TEST_KEEP:-0}" = 1 ]; then
   printf 'fixture home: %s/home\n' "$TMP_ROOT"
@@ -18,6 +20,7 @@ import re
 import signal
 import pty
 import select
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -62,7 +65,7 @@ tasks = [
     {"id": "task-a", "kind": "ship", "project": "alpha", "spawn_gen": "gen-1", "current_state": {"state": "working"}, "backlog": {"repo": "alpha", "state": "in_flight", "links": [issue1]}, "pr": {"url": "https://github.com/acme/widget/pull/11", "head": "abc"}, "paths": {"worktree": {"path": str(worktree)}}},
     {"id": "task-b", "kind": "ship", "project": "alpha", "spawn_gen": "gen-b", "current_state": {"state": "working"}, "backlog": {"repo": "alpha", "state": "in_flight", "links": [issue1]}, "pr": {"url": "https://github.com/acme/widget/pull/12", "head": "def"}, "paths": {"worktree": {"path": str(worktree)}}},
 ]
-snapshot = {"schema": "fm-fleet-snapshot.v1", "tasks": tasks, "backlog": {"records": [{"id": "queued-a", "kind": "ship", "repo": "alpha", "state": "queued", "links": [issue2], "blocked_by": "task-a"}]}, "contributions": {"rows": []}}
+snapshot = {"schema": "fm-fleet-snapshot.v1", "tasks": tasks, "backlog": {"records": [{"id": "queued-a", "kind": "ship", "repo": "alpha", "state": "queued", "links": [issue2], "blocked_by": "task-a", "blocked_by_ids": ["task-a"], "unresolved_blocker_ids": ["task-a"]}]}, "contributions": {"rows": []}}
 (home / "state" / "issue-status" / "fleet.json").write_text(json.dumps({"schema": "fm-issue-fleet-cache.v1", "collected_epoch": int(time.time()), "snapshot": snapshot, "error": None}))
 repo_key = hashlib.sha256(b"acme/widget").hexdigest()
 issues_payload = [
@@ -76,8 +79,8 @@ cat_path.write_text(json.dumps({"schema": "fm-issue-catalog.v1", "repo": "acme/w
 
 fakebin = tmp / "fakebin"
 fakebin.mkdir()
-(fakebin / "gh-axi").write_text("#!/bin/sh\nprintf '%s\\n' \"$*\" > \"$FM_FAKE_GH_ARGS\"\nif [ -n \"${FM_FAKE_GH_FAIL:-}\" ]; then echo offline >&2; exit 7; fi\ncat \"$FM_FAKE_ISSUES\"\n")
-(fakebin / "gh-axi").chmod(0o755)
+(fakebin / "gh").write_text("#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"$FM_FAKE_GH_ARGS\"\nif [ -n \"${FM_FAKE_GH_FAIL:-}\" ]; then echo offline >&2; exit 7; fi\ncase \"$2\" in\n  'repos/acme/widget/issues?state=all&per_page=100') cat \"$FM_FAKE_ISSUES\" ;;\n  repos/acme/widget/issues/1) printf '%s\\n' '{\"html_url\":\"https://github.com/acme/widget/issues/1\"}' ;;\n  repos/acme/widget/issues/2) printf '%s\\n' '{\"html_url\":\"https://github.com/acme/widget/issues/2\"}' ;;\n  repos/acme/widget/issues/3) printf '%s\\n' '{\"html_url\":\"https://github.com/acme/widget/issues/3\"}' ;;\n  *) echo \"unexpected canonical forge call: $*\" >&2; exit 91 ;;\nesac\n")
+(fakebin / "gh").chmod(0o755)
 issues_file = tmp / "issues.ndjson"
 def write_issues():
     issues_file.write_text("".join(json.dumps({"number": item["number"], "title": item["title"], "html_url": item["url"], "state": item["state"], "updated_at": item["updated_at"]}) + "\n" for item in issues_payload))
@@ -94,7 +97,7 @@ first = projection()
 assert len(first["rows"]) == 3, "catalog omitted an old closed issue from the full inventory"
 by_url = {row["url"]: row for row in first["rows"]}
 assert by_url[issue1]["task_count"] == 2 and by_url[issue1]["pr_count"] == 2, "multiple tasks and PRs did not aggregate"
-assert by_url[issue1]["stage"] == "Implementing", "active task stage did not derive from structured state"
+assert by_url[issue1]["stage"] == "Unknown", "unobserved linked PR evidence must remain unknown"
 assert by_url[issue2]["stage"] == "Queued" and "task-a" in by_url[issue2]["next_step"], "queued prerequisite was lost"
 assert by_url[issue3]["stage"] == "Closed without delivery", "closed unowned issue was omitted"
 cache = json.loads(cat_path.read_text())
@@ -102,7 +105,7 @@ cache["last_attempt_epoch"] = 0
 cat_path.write_text(json.dumps(cache))
 second = projection(("--refresh",))
 assert first["fingerprint"] == second["fingerprint"], f"repoll/check ages changed the relevant fingerprint: {first['fingerprint']} -> {second['fingerprint']}; catalog={second['catalog']!r}; first={first['rows']!r}; second={second['rows']!r}"
-assert "--paginate" in (tmp / "gh-args").read_text(), "catalog reader did not request all paginated issue inventory"
+assert "--paginate" in (tmp / "gh-args").read_text(), "canonical forge reader did not request all paginated issue inventory"
 snapshot["tasks"].reverse()
 (home / "state" / "issue-status" / "fleet.json").write_text(json.dumps({"schema": "fm-issue-fleet-cache.v1", "collected_epoch": int(time.time()), "snapshot": snapshot, "error": None}))
 reordered = projection()
@@ -175,7 +178,7 @@ full_value["argv"] = ["/bin/echo", "filtered-configured-argv"]
 full_receipt.write_text(json.dumps(full_value))
 filtered = projection()
 task_a = next(task for row in filtered["rows"] for task in row["tasks"] if task["id"] == "task-a")
-assert task_a["verification"]["full"]["status"] == "not run" and task_a["verification"]["focused"]["status"] == "reclassified focused run", "filtered full lane receipt counted as configured full evidence"
+assert task_a["verification"]["full"]["status"] == "not run" and task_a["verification"]["focused"]["status"] == "reclassified focused run; outcome passed", "filtered full lane receipt did not preserve its focused outcome"
 (home / "data" / "task-a" / "lane-receipts" / ".instrumented").write_text("wrong-generation\n")
 conflicted = projection()
 task_a = next(task for row in conflicted["rows"] for task in row["tasks"] if task["id"] == "task-a")
@@ -244,6 +247,29 @@ listed = json.loads(subprocess.check_output([sys.executable, str(root / "bin" / 
 assert next(item for item in listed if item["id"] == req4["request"])["state"] == "expired", "pending request expiry was not exposed"
 expired_put = subprocess.run(put[:4] + [req4["request"], "alpha"] + put[6:], cwd=root, env=env, text=True, capture_output=True)
 assert expired_put.returncode == 1 and json.loads(expired_put.stdout)["status"] == "expired", "expired request accepted a late summary"
+
+# The supported home-local backlog route stamps task blocker changes without
+# changing the underlying tasks-axi command result.
+if shutil.which("tasks-axi"):
+    blocker_home = tmp / "blocker-home"
+    blocker_code = tmp / "blocker-code"
+    (blocker_home / "data").mkdir(parents=True)
+    (blocker_home / "state").mkdir()
+    (blocker_home / "config").mkdir()
+    (blocker_code / "data").mkdir(parents=True)
+    (blocker_home / "data" / "backlog.md").write_text("## In flight\n\n## Queued\n\n## Done\n")
+    (blocker_code / ".tasks.toml").write_bytes((root / ".tasks.toml").read_bytes())
+    (blocker_code / "data" / "backlog.md").symlink_to(blocker_home / "data" / "backlog.md")
+    event_task = "event-task"
+    (blocker_home / "state" / f"{event_task}.meta").write_text("spawn_gen=gen-blocker\n")
+    (blocker_home / "data" / event_task).mkdir()
+    wrapper = root / "bin" / "fm-tasks-axi.sh"
+    wrapper_env = {**os.environ, "FM_HOME": str(blocker_home), "FM_ROOT_OVERRIDE": str(blocker_code)}
+    for command in (["add", "blocker-task", "Blocker"], ["add", event_task, "Blocked task"], ["block", event_task, "--by", "blocker-task"], ["unblock", event_task, "--by", "blocker-task"]):
+        subprocess.run([str(wrapper), *command], cwd=blocker_code, env=wrapper_env, check=True, capture_output=True, text=True)
+    events = [json.loads(line) for line in (blocker_home / "data" / event_task / "events.jsonl").read_text().splitlines()]
+    assert [(item["kind"], item["fields"]["blocker"]) for item in events] == [("blocked-by", "blocker-task"), ("unblocked", "blocker-task")], events
+    assert all(item["generation"] == "gen-blocker" for item in events), events
 
 # Loopback POST rejects missing origin/token and accepts the exact launch token/origin.
 server_env = {**env, "BROWSER": "/usr/bin/true"}
