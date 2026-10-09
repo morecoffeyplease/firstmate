@@ -107,6 +107,13 @@ local_fact = owner_task_fact(common_fact, "main-home", "same", [])
 descendant_fact = owner_task_fact({**common_fact, "evidence_freshness": "fresh"}, "child", "same", [])
 assert (local_fact["stage"], local_fact["waiting"], local_fact["next_step"], local_fact["ready_for_approval"]) == (descendant_fact["stage"], descendant_fact["waiting"], descendant_fact["next_step"], descendant_fact["ready_for_approval"])
 assert local_fact["fact_schema"] == descendant_fact["fact_schema"] == "fm-issue-task-fact.v1"
+assert (local_fact["owner_home_id"], local_fact["owner_task_id"], local_fact["owner_fact_valid"]) == ("main-home", "same", True)
+assert (descendant_fact["owner_home_id"], descendant_fact["owner_task_id"], descendant_fact["owner_fact_valid"]) == ("child", "same", True)
+conflicting_owner_fact = owner_task_fact({**common_fact, "owner_home_id": "unregistered"}, "child", "same", [])
+assert conflicting_owner_fact["owner_fact_valid"] is False and conflicting_owner_fact["evidence_freshness"] == "unknown"
+malformed_owner_fact = owner_task_fact({**common_fact, "event_history": [{"schema": "fm-task-event.v1", "task": "foreign", "generation": "gen-1", "class": "event", "at_epoch": 10}]}, "child", "same", [])
+assert malformed_owner_fact["owner_fact_valid"] is False and malformed_owner_fact["evidence_freshness"] == "unknown"
+assert malformed_owner_fact["event"] is None and malformed_owner_fact["conflicts"]
 assert choose_change([{"class": "event", "at_epoch": 123}], {"from_epoch": 100, "to_epoch": 150}) == {"class": "event", "at_epoch": 123}
 assert choose_change([], {"from_epoch": 100, "to_epoch": 150}) == {"class": "detected", "from_epoch": 100, "to_epoch": 150}
 assert choose_change([], {"from_epoch": 100, "to_epoch": 90000}) == {"class": "unknown"}
@@ -115,6 +122,11 @@ transition_b = {"schema": "fm-task-event.v1", "generation": "gen-1", "class": "e
 watermark_a = transition_watermark([], [{**common_fact, "generation": "gen-1", "event_history": [transition_a]}])
 watermark_aba = transition_watermark([], [{**common_fact, "generation": "gen-1", "event_history": [transition_a, transition_b, {**transition_a, "at_epoch": 30}]}])
 assert watermark_a != watermark_aba, "retained owner transitions must distinguish an A-B-A history"
+completed_history = [{**common_fact, "generation": None, "event_history": [
+    {"schema": "fm-task-event.v1", "task": "same", "generation": "gen-1", "class": "event", "at_epoch": 10, "kind": "started", "fields": {}},
+    {"schema": "fm-task-event.v1", "task": "same", "generation": "gen-1", "class": "event", "at_epoch": 20, "kind": "completed", "fields": {}},
+]}]
+assert transition_watermark([], completed_history) != transition_watermark([], [{**completed_history[0], "event_history": []}]), "completed backlog rows without current generation must retain lifecycle watermark"
 from fm_lane_receipts import classify_finished_receipt
 finished = {"generation": "gen-1", "signal": None, "received_signal": None, "exit_code": 0, "dirty_before": False, "dirty_after": False, "head_before": "a" * 40, "head_after": "a" * 40}
 assert classify_finished_receipt(finished, "gen-1", "a" * 40) == "passed"

@@ -10,6 +10,12 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 case "${1:-}" in
 append)
   shift
+  [ "$#" -ge 5 ] || exit 2
+  exec python3 "$SCRIPT_DIR/fm_issue_event_guard.py" append "$1" "$2" \
+    "$SCRIPT_DIR/fm-issue-event.sh" append-locked "$1" "$2" "${@:3}"
+  ;;
+append-locked)
+  shift
   fm_issue_event_append "$@"
   ;;
 validate)

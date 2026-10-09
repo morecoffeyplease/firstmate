@@ -22,6 +22,8 @@ The time column distinguishes forge event times, bounded local observation times
 Times are stored as UTC epochs and displayed in America/Los_Angeles with PST or PDT.
 Polling does not advance a status-change time.
 Owner scripts record typed task lifecycle events in `data/<task>/events.jsonl`, including blocker changes made through `bin/fm-tasks-axi.sh` and status changes first seen by the watcher.
+The shared `state/.issue-events.lock` serializes event appends with fresh summary-basis capture and publication, and each successful append invalidates cached projections.
+Completed task event histories remain available after endpoint teardown so a summary cannot revive after an A-B-A transition.
 
 The verification details show CI evidence from the forge and local focused, full, and verify receipts from `bin/fm-lane-run.sh`.
 Local lanes without task launch instrumentation or a wrapped run remain not instrumented or not run, and unwrapped commands are invisible.
@@ -29,13 +31,15 @@ Configure full and verify argument arrays in `config/project-lanes.json`; see [p
 Source acceptance and canonical journey evidence stay unknown until an identified authority records typed evidence.
 
 **Request Manual Update** durably records one request for every selected registered project and adds a typed note to the main-home inbox.
-The browser handler does not route or send messages.
-At the inbox wake, the main-home owner runs `fm-issues.sh summary dispatch <request-id>` to resolve validated project routes, send marked requests to registered secondmates, and record their durable pending-reply correlations.
-The dispatch command retains uncertain sends for retry with their existing correlation, and projects without a registered secondmate remain assigned to the main-home owner.
-For a main-home project, the firstmate author composes the summary directly and writes it with the request's project identity.
+The browser handler only records the request and inbox note.
+The inbox wake directs the main-home owner to run `fm-issues.sh summary service <request-id>`, which dispatches marked requests to validated registered secondmates, retries uncertain sends with their existing correlation, collects typed replies, and returns composition-start bases for main-home projects.
+Projects without a registered secondmate remain assigned to the main-home owner.
+For a main-home project, the firstmate author composes the summary from the returned projection and writes it with that project's basis receipt.
+For a secondmate project, the author runs `fm-issues.sh summary basis <request-id> --project <project>` before composing, then `summary reply` to publish the bounded typed summary on the correlated parent channel.
+The main-home service validates that correlation before it stores the reply through the same basis comparison and summary publication path as `summary put`.
 Each project's route, correlation, result, and failure reason is shown separately, requests deduplicate independently, and requests expire after 30 minutes.
-When composition begins, the summary author reads that project's current fingerprint and observation time from `fm-issues.sh --project <project> --json`.
-The author writes the text with `fm-issues.sh summary put`, supplying the current fingerprint, transition watermark, and observation time read when composition begins; the command compares both status and retained owner transitions with current evidence and marks a changed basis outdated immediately.
+When composition begins, the summary author reads that project's current fingerprint, transition watermark, and observation time from the `summary service` or `summary basis` output.
+The author writes the text with `fm-issues.sh summary put`, supplying that exact basis receipt; the command compares both status and retained owner transitions with current evidence while holding the shared event lock and marks a changed basis outdated immediately.
 A later meaningful project fingerprint change or retained lifecycle transition also hides or collapses the summary while retaining its labeled historical text, including a status that changes away and back between projections.
 Each summary records its author, basis fingerprint, basis observation time, written time, repository, catalog check, and snapshot observation used for the basis comparison, and its text is never parsed into automatic status fields.
 Requests expose pending, written, outdated, failed, unavailable, and expired states together with supervisor availability.
@@ -43,3 +47,4 @@ Routine collection and rendering never call an AI model.
 
 The browser's one write endpoint requires its per-launch token and exact loopback Origin and Host.
 The endpoint accepts only a selected list of currently registered project names.
+It cannot select an arbitrary task route or invoke a general write command.

@@ -479,6 +479,8 @@ The registry is inherited into secondmate homes under the [`secondmate-provision
 Each project may define `full` and `verify` as nonempty argument arrays, for example `{"buttertrip-mvp":{"full":["npm","test"],"verify":["npm","run","verify"]}}`.
 The `focused` lane takes an explicit command and argument array at invocation time.
 `bin/fm-lane-run.sh` uses direct argument arrays and preserves its caller's working directory, environment, input, output streams, exit status, and signal result.
+With a foreground TTY, the child temporarily owns terminal foreground process-group control so terminal signals reach it directly, and the wrapper restores the caller's foreground group when it exits.
+Without a TTY, the child owns a separate process group and wrapper-observed signals reach the complete command group.
 Launch briefs include the exact wrapped full and verify commands for a configured project.
 Unwrapped commands remain invisible to the Issues projection.
 The project lane configuration is inherited into secondmate homes with the other primary-authoritative local config.

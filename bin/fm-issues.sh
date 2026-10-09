@@ -3,10 +3,15 @@
 #
 # Usage: fm-issues.sh [--project <registered-name>] [--terminal|--json] [--refresh]
 #        fm-issues.sh summary request --project <registered-name>...
-#        fm-issues.sh summary put <request-id> <project> --basis-fingerprint <sha256> \
-#          --basis-transition-watermark <sha256> --basis-observed-at <epoch> --author <home> --text-file <path>
 #        fm-issues.sh summary route <request-id> <project> --target <task-id> --correlation <id>
 #        fm-issues.sh summary dispatch <request-id>
+#        fm-issues.sh summary service <request-id>
+#        fm-issues.sh summary basis <request-id> --project <registered-name>
+#        fm-issues.sh summary reply <request-id> <correlation> <project> --text-file <path>
+#        fm-issues.sh summary collect <request-id>
+#        fm-issues.sh summary put <request-id> <project> --basis-fingerprint <sha256> \
+#          --basis-transition-watermark <sha256> --basis-observed-at <epoch> --author <home> --text-file <path>
+#        fm-issues.sh summary resolve <request-id> <project> <failed|unavailable> --reason <reason>
 #        fm-issues.sh summary list
 #
 # The browser service binds only to loopback. Routine table collection is

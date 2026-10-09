@@ -1000,6 +1000,14 @@ secondmate_home_summary_json() {  # <backlog-json-file> <tasks-json-file> <produ
       jq -c --arg generation "$task_generation" 'select(.generation == $generation)' "$event_path" >> "$issue_events_file" || return 1
     fi
   done < <(jq -r '.[] | select((.id | type) == "string" and (.spawn_gen | type) == "string") | [.id,.spawn_gen] | @tsv' "$2")
+  while IFS= read -r task_id; do
+    [ -n "$task_id" ] || continue
+    case "$task_id" in *[!A-Za-z0-9._-]*) continue ;; esac
+    event_path="$DATA/$task_id/events.jsonl"
+    if fm_issue_event_validate_file "$event_path" "$task_id"; then
+      jq -sc '.[-32:][]' "$event_path" >> "$issue_events_file" || return 1
+    fi
+  done < <(jq -r --argjson limit "$queued_n" '.records[:$limit][]? | select(.state == "done" and (.id | type) == "string") | .id' "$1")
   jq -n \
     --arg generated "$SNAPSHOT_NOW" \
     --argjson generated_epoch "$SNAPSHOT_EPOCH" \
@@ -1029,7 +1037,7 @@ secondmate_home_summary_json() {  # <backlog-json-file> <tasks-json-file> <produ
           | if $epoch == null then [1, 0, .key] else [0, -$epoch, .key] end)
       | map(.value);
     def event_history_for($id; $generation):
-      [$issue_events[]? | select(.task == $id and .generation == $generation)] | .[-32:];
+      [$issue_events[]? | select(.task == $id and ($generation == null or .generation == $generation))] | .[-32:];
     ([ $backlog.records[]?
        | select((.state == "in_flight" or .state == "queued") and (.structured | not)) ]) as $unstructured_current
     | ([ $backlog.records[]? | select(.state == "in_flight" and .structured) ]) as $owned_in_flight
@@ -1117,8 +1125,10 @@ secondmate_home_summary_json() {  # <backlog-json-file> <tasks-json-file> <produ
               unresolved_blocker_ids:((if ($work.unresolved_blocker_ids | type) == "array" then $work.unresolved_blocker_ids else [] end) | map(trunc(120))[:30]),
               hold_reason:((($work.hold_reason // null) | if . == null then null else trunc(160) end)),
               hold_kind:((($work.hold_kind // null) | if . == null then null else trunc(40) end)),
-              hold_bucket:($work.hold_bucket // null)},
-            event:(event_history_for($work.id; ($task.spawn_gen // null)) | last // null),
+              hold_bucket:($work.hold_bucket // null),
+              completion:{verb:($work.completion.verb // null)},
+              artifact_present:(([$work.pr_url,$work.report_path,$work.local_note] | any(. != null and . != "")))},
+            event:(if $task.spawn_gen then event_history_for($work.id; $task.spawn_gen) | last // null else null end),
             event_history:event_history_for($work.id; ($task.spawn_gen // null))} ]
        + [ $tasks[]
            | select(.kind != "secondmate")
@@ -1130,7 +1140,7 @@ secondmate_home_summary_json() {  # <backlog-json-file> <tasks-json-file> <produ
               hints:(.hints // {}),
               backlog:{state:null,kind,repo:(.project // null),links:[],pr_url:(.pr.url // null),pr_head:(.pr.head // null),
                 unresolved_blocker_ids:[],hold_reason:null,hold_kind:null,hold_bucket:null},
-              event:(event_history_for(.id; (.spawn_gen // null)) | last // null),
+              event:(if .spawn_gen then event_history_for(.id; .spawn_gen) | last // null else null end),
               event_history:event_history_for(.id; (.spawn_gen // null))} ]) as $issue_tasks_all
     | ([ $issue_tasks_all[] | .backlog.repo | select(type == "string" and length > 0) ] | unique) as $issue_projects
     | ($issue_tasks_all | length) as $issue_task_total

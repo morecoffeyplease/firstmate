@@ -25,6 +25,7 @@ from pathlib import Path
 from zoneinfo import ZoneInfo
 from fm_project_lanes import read_project_lanes
 from fm_lane_receipts import classify_finished_receipt, repository_identity, valid_receipt
+from fm_issue_event_guard import issue_event_lock
 from fm_issues_derive import (
     FINGERPRINT_SCHEMA as FP_SCHEMA,
     fingerprint_pr as derive_fingerprint_pr,
@@ -46,6 +47,15 @@ MAX_CATALOG_AGE = 3600
 MAX_PROJECTION_AGE = 60
 MAX_OBSERVATION_BRACKET = 86400
 COLLECT_LOCK = threading.Lock()
+
+
+@contextlib.contextmanager
+def issue_events_locked(home: Path):
+    fd = issue_event_lock(home)
+    try:
+        yield
+    finally:
+        os.close(fd)
 
 
 def utc_now() -> int:
@@ -460,7 +470,12 @@ def lane_status(home: Path, task: dict, project: str, configured: dict[str, list
             current_head = subprocess.run(["git", "-C", worktree, "rev-parse", "HEAD"], capture_output=True, text=True, timeout=3).stdout.strip()
         except (OSError, subprocess.SubprocessError):
             pass
-    current_dirty = task.get("source_dirty") if "source_dirty" in task else worktree_dirty(worktree)
+    if "source_dirty" in task:
+        current_dirty = task.get("source_dirty")
+    elif isinstance(task.get("source"), dict) and "dirty" in task["source"]:
+        current_dirty = task["source"].get("dirty")
+    else:
+        current_dirty = worktree_dirty(worktree)
     records: dict[str, list[dict]] = {lane: [] for lane in ("focused", "full", "verify")}
     malformed: dict[str, bool] = {lane: False for lane in records}
     receipt_errors: dict[str, list[tuple[int, str]]] = {lane: [] for lane in records}
@@ -549,12 +564,13 @@ def lane_status(home: Path, task: dict, project: str, configured: dict[str, list
     return result
 
 
-def task_event_fact(home: Path, task_id: str | None, generation: str | None) -> dict | None:
-    if not task_id or not generation:
-        return None
+def task_event_history(home: Path, task_id: str | None,
+                      generation: str | None = None) -> list[dict]:
+    if not task_id or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,63}", task_id):
+        return []
     path = home / "data" / task_id / "events.jsonl"
     if path.is_symlink() or not path.is_file() or path.stat().st_size > 4_194_304:
-        return None
+        return []
     try:
         validated = subprocess.run(
             ["/bin/bash", "-c", 'source "$1" && fm_issue_event_validate_file "$2" "$3"', "fm-event-validate", str(ROOT / "bin" / "fm-issue-events-lib.sh"), str(path), task_id],
@@ -562,30 +578,23 @@ def task_event_fact(home: Path, task_id: str | None, generation: str | None) -> 
             timeout=5,
         )
         if validated.returncode != 0:
-            return None
-        events = [
-            item for item in (json.loads(line) for line in path.read_text(encoding="utf-8").splitlines())
-            if item.get("generation") == generation
-        ]
+            return []
+        events = [item for item in (json.loads(line) for line in path.read_text(encoding="utf-8").splitlines())
+                  if generation is None or item.get("generation") == generation]
     except (OSError, subprocess.SubprocessError, ValueError, TypeError):
+        return []
+    return events
+
+
+def task_event_fact(home: Path, task_id: str | None, generation: str | None) -> dict | None:
+    if not generation:
         return None
+    events = task_event_history(home, task_id, generation)
     if not events:
         return None
     latest = dict(events[-1])
     latest["history"] = events
     return latest
-
-
-def worktree_head(task: dict) -> str | None:
-    path = (task.get("paths") or {}).get("worktree", {}).get("path")
-    if not isinstance(path, str) or not path:
-        return None
-    try:
-        result = subprocess.run(["git", "-C", path, "rev-parse", "HEAD"], capture_output=True, text=True, timeout=3)
-        value = result.stdout.strip()
-        return value if result.returncode == 0 and re.fullmatch(r"[a-fA-F0-9]{40,64}", value) else None
-    except (OSError, subprocess.SubprocessError):
-        return None
 
 
 def _make_projection(home: Path, project: str, refresh: bool = False) -> dict:
@@ -680,32 +689,27 @@ def _make_projection(home: Path, project: str, refresh: bool = False) -> dict:
             event = task_event_fact(home, task_id, generation)
             event_history = event.get("history", []) if isinstance(event, dict) else []
             latest_event = {key: value for key, value in event.items() if key != "history"} if isinstance(event, dict) else None
-            source_head = worktree_head(task)
-            verification = lane_status(home, task, project, configured_lanes, source_head)
-            task_row = {"id": task_id, "generation": generation, "kind": task.get("kind"), "task_state": task.get("current_state", {}).get("state", "unknown"), "activity_source": task.get("current_state", {}).get("source", "unknown"), "activity_detail": task.get("current_state", {}).get("detail"), "current_state": task.get("current_state", {}), "hints": task.get("hints", {}), "source_head": source_head, "backlog": backlog, "issues": task_links(task, repo), "prs": linked, "verification": verification, "event": latest_event, "event_history": event_history, "merge_requests": [{"url": item.get("fields", {}).get("url"), "at_epoch": item.get("at_epoch")} for item in event_history if item.get("kind") == "merge-requested"]}
+            source_fact = task.get("source") if isinstance(task.get("source"), dict) else {}
+            source_head = source_fact.get("head")
+            if not isinstance(source_head, str) or not re.fullmatch(r"[A-Fa-f0-9]{40,64}", source_head):
+                source_head = None
+            source_dirty = source_fact.get("dirty") if isinstance(source_fact.get("dirty"), bool) else None
+            verification = lane_status(home, {**task, "source_dirty": source_dirty}, project, configured_lanes, source_head)
+            task_row = {"id": task_id, "generation": generation, "kind": task.get("kind"), "task_state": task.get("current_state", {}).get("state", "unknown"), "activity_source": task.get("current_state", {}).get("source", "unknown"), "activity_detail": task.get("current_state", {}).get("detail"), "current_state": task.get("current_state", {}), "hints": task.get("hints", {}), "source_head": source_head, "source_dirty": source_dirty, "backlog": backlog, "issues": task_links(task, repo), "prs": linked, "verification": verification, "event": latest_event, "event_history": event_history, "merge_requests": [{"url": item.get("fields", {}).get("url"), "at_epoch": item.get("at_epoch")} for item in event_history if item.get("kind") == "merge-requested"]}
             if backlog and backlog.get("state") == "in_flight" and any(pr.get("state") == "merged" for pr in linked):
                 task_row["conflicts"] = ["forge PR is merged while local task remains in flight"]
             if raw_pr_url and not pr_url:
                 task_row.setdefault("conflicts", []).append("task PR URL has an unsupported identity")
-            task_row["stage"], task_row["waiting"] = stage(task_row, linked, backlog)
-            task_row["next_step"] = next_step(task_row)
-            task_row["ready_for_approval"] = ready_state(task_row, configured_lanes)
-            if task_row["ready_for_approval"] == "ready for approval":
-                task_row["stage"] = "Ready for approval"
-                task_row["next_step"] = "Ready for your approval"
             task_row["source_accepted"] = "not recorded"
             task_row["canonical_journeys"] = "not recorded"
             candidates.append(task_row)
         for row in (snap.get("backlog") or {}).get("records", []):
             if row.get("repo") == project and row.get("state") in ("queued", "in_flight", "done") and not any(item["id"] == row.get("id") for item in candidates):
                 if row.get("state") == "done":
-                    artifact = row.get("pr_url") or row.get("report_path") or row.get("local_note")
-                    stage_name = "Completed" if artifact and (row.get("completion") or {}).get("verb") in ("merged", "reported", "done") else "Closed without delivery"
-                    candidates.append({"id": row.get("id"), "generation": None, "kind": row.get("kind"), "task_state": "done", "backlog": row, "issues": canonical_issue_urls(row.get("links", []), repo), "prs": ([{"url": row.get("pr_url"), "state": "merged" if (row.get("completion") or {}).get("verb") == "merged" else "unknown", "association": "backlog artifact"}] if row.get("pr_url") else []), "stage": stage_name, "waiting": None, "next_step": "Completed" if stage_name == "Completed" else "Closed without delivery", "verification": {lane: {"status": "not instrumented"} for lane in ("focused", "full", "verify")}, "ready_for_approval": "not ready", "source_accepted": "not recorded", "canonical_journeys": "not recorded", "event": None})
+                    candidates.append({"id": row.get("id"), "generation": None, "kind": row.get("kind"), "task_state": "done", "backlog": row, "issues": canonical_issue_urls(row.get("links", []), repo), "prs": ([{"url": row.get("pr_url"), "state": "merged" if (row.get("completion") or {}).get("verb") == "merged" else "unknown", "association": "backlog artifact"}] if row.get("pr_url") else []), "verification": {lane: {"status": "not instrumented"} for lane in ("focused", "full", "verify")}, "source_accepted": "not recorded", "canonical_journeys": "not recorded", "event": None, "event_history": task_event_history(home, row.get("id"))})
                     continue
                 orphan = row.get("state") == "in_flight"
-                unresolved = sorted(set(row.get("unresolved_blocker_ids") or []))
-                candidates.append({"id": row.get("id"), "generation": None, "kind": row.get("kind"), "task_state": "unknown" if orphan else "queued", "backlog": row, "issues": canonical_issue_urls(row.get("links", []), repo), "prs": [], "stage": "Unknown" if orphan else "Queued", "waiting": "prerequisite" if unresolved and not orphan else None, "next_step": "Next step not recorded" if orphan else (f"Queued behind {', '.join(unresolved)}" if unresolved else "Queued"), "conflicts": ["backlog is in flight but task metadata is missing"] if orphan else [], "verification": {lane: {"status": "not instrumented"} for lane in ("focused", "full", "verify")}, "ready_for_approval": "not ready", "source_accepted": "not recorded", "canonical_journeys": "not recorded", "event": None})
+                candidates.append({"id": row.get("id"), "generation": None, "kind": row.get("kind"), "task_state": "unknown" if orphan else "queued", "backlog": row, "issues": canonical_issue_urls(row.get("links", []), repo), "prs": [], "conflicts": ["backlog is in flight but task metadata is missing"] if orphan else [], "verification": {lane: {"status": "not instrumented"} for lane in ("focused", "full", "verify")}, "source_accepted": "not recorded", "canonical_journeys": "not recorded", "event": None})
         secondmates = remote_records
         for secondmate in secondmates:
             home_id = secondmate.get("id") or "registered-home"
@@ -757,9 +761,6 @@ def _make_projection(home: Path, project: str, refresh: bool = False) -> dict:
                     "conflicts": ([] if summary_valid else ["remote home summary is not valid for complete current-state evidence"])
                         + (["task PR URL has an unsupported identity"] if raw_remote_pr_url and not pr_url else []),
                 }
-                task_row["stage"], task_row["waiting"] = stage(task_row, linked_prs, backlog)
-                task_row["next_step"] = next_step(task_row)
-                task_row["ready_for_approval"] = "unknown" if task_row["evidence_freshness"] != "fresh" else ready_state(task_row, configured_lanes)
                 candidates.append(task_row)
     cat = {"schema": "fm-issue-catalog.v1", "repo": None, "checked_epoch": None, "complete": False, "known": 0, "observed_known": 0, "total": None, "issues": [], "error": repo_error, "stale": False}
     if repo:
@@ -930,14 +931,16 @@ def summary_record_for_projection(home: Path, project: str, fingerprint: str, wa
         return summary
 
 
-def make_projection(home: Path, project: str, refresh: bool = False) -> dict:
+def make_projection(home: Path, project: str, refresh: bool = False,
+                    events_locked: bool = False) -> dict:
     state = home / "state"
     if state.is_symlink() or not state.is_dir():
         raise ValueError("operational state directory is unavailable")
     lock_path = state / ".issue-status.lock"
     if lock_path.is_symlink():
         raise ValueError("issue status lock is a symlink")
-    with COLLECT_LOCK:
+    event_guard = contextlib.nullcontext() if events_locked else issue_events_locked(home)
+    with event_guard, COLLECT_LOCK:
         fd = os.open(lock_path, os.O_CREAT | os.O_RDWR, 0o600)
         try:
             import fcntl
@@ -1125,6 +1128,146 @@ case "$found" in [a-f0-9][a-f0-9][a-f0-9][a-f0-9][a-f0-9][a-f0-9][a-f0-9][a-f0-9
         return None
 
 
+def summary_pending_reply_details(home: Path, target: str, request_id: str,
+                                  project: str) -> tuple[str, Path] | None:
+    marker = f"request={request_id} project={project}"
+    script = '''
+source "$1/fm-pending-reply-lib.sh" || exit 2
+state=$2
+task=$3
+marker=$4
+dir=$(fm_pending_reply_dir "$state")
+[ -d "$dir" ] && [ ! -L "$dir" ] || exit 0
+for record in "$dir"/*; do
+  [ -f "$record" ] && [ ! -L "$record" ] || continue
+  [ "$(fm_pending_reply_get "$record" task_id)" = "$task" ] || continue
+  summary=$(fm_pending_reply_get "$record" request_summary)
+  case "$summary" in
+    *"$marker"*)
+      corr=$(fm_pending_reply_get "$record" corr_id)
+      status=$(fm_pending_reply_get "$record" parent_status)
+      case "$corr" in [a-f0-9][a-f0-9][a-f0-9][a-f0-9][a-f0-9][a-f0-9][a-f0-9][a-f0-9][a-f0-9][a-f0-9][a-f0-9][a-f0-9][a-f0-9][a-f0-9][a-f0-9][a-f0-9]) printf '%s\\t%s\\n' "$corr" "$status" ;; esac
+      ;;
+  esac
+done
+'''
+    try:
+        result = subprocess.run(
+            ["/bin/bash", "-c", script, "fm-summary-reply", str(ROOT / "bin"),
+             str(home / "state"), target, marker],
+            capture_output=True, text=True, timeout=5,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    values = [line.split("\t", 1) for line in result.stdout.splitlines() if "\t" in line]
+    if result.returncode != 0 or len(values) != 1:
+        return None
+    correlation, status_raw = values[0]
+    status_path = Path(status_raw)
+    state_path = (home / "state").resolve()
+    try:
+        if not re.fullmatch(r"[a-f0-9]{16}", correlation) or not status_path.resolve().is_relative_to(state_path):
+            return None
+    except (OSError, RuntimeError):
+        return None
+    return correlation, status_path
+
+
+def parse_summary_reply(line: str, project: str, correlation: str) -> dict | None:
+    token = re.fullmatch(rf"done \[corr={re.escape(correlation)}\]: summary-v1 project=([^ ]+) basis=([a-f0-9]{{64}}) "
+                         r"transition=([a-f0-9]{64}) observed=([0-9]{1,12}) "
+                         r"text_b64=([A-Za-z0-9_-]+)(?: \(via-helper\))?", line)
+    if not token or token.group(1) != project:
+        return None
+    import base64
+    try:
+        encoded = token.group(5)
+        raw = base64.urlsafe_b64decode(encoded + "=" * (-len(encoded) % 4))
+        text = raw.decode("utf-8")
+    except (ValueError, UnicodeError):
+        return None
+    if not text.strip() or len(raw) > 16_384:
+        return None
+    return {"fingerprint": token.group(2), "transition_watermark": token.group(3),
+            "observed_epoch": int(token.group(4)), "text": text}
+
+
+def publish_summary(home: Path, request_id: str, project: str, basis_fingerprint: str,
+                    basis_watermark: str, basis_observed: int, author: str,
+                    text: str, correlated_reply: bool = False) -> dict:
+    request_path = home / "state" / "status-summary" / "requests" / f"{request_id}.json"
+    summary_dir = home / "state" / "status-summary" / "summaries"
+    record = read_json(request_path)
+    if not isinstance(record, dict) or record.get("schema") != "fm-status-summary-request.v1" or project not in record.get("projects", []):
+        raise ValueError("unknown request or project")
+    if int(record.get("expires_epoch", 0)) <= utc_now():
+        record.setdefault("results", {})[project] = "expired"
+        atomic_json(request_path, record)
+        return {"status": "expired", "project": project}
+    if record.get("results", {}).get(project) != "pending":
+        return {"status": record.get("results", {}).get(project, "unavailable"), "project": project}
+    route = (record.get("routes", {}).get(project) or {}).get("route")
+    if route not in ("main-home", "secondmate"):
+        raise ValueError("project has no active summary owner route")
+    if route == "secondmate" and not correlated_reply:
+        raise ValueError("secondmate summaries must arrive through the recorded correlated reply")
+    if route == "main-home" and author != "main-home":
+        raise ValueError("main-home summaries must be authored by the main home")
+    if route == "main-home":
+        basis_path = home / "state" / "status-summary-bases" / f"{request_id}-{hashlib.sha256(project.encode()).hexdigest()}.json"
+        basis = read_json(basis_path, 4096)
+        if (not isinstance(basis, dict) or basis.get("schema") != "fm-status-summary-basis.v1"
+                or basis.get("request") != request_id or basis.get("project") != project
+                or basis.get("fingerprint") != basis_fingerprint
+                or basis.get("transition_watermark") != basis_watermark
+                or basis.get("observed_epoch") != basis_observed):
+            raise ValueError("summary basis does not match the main-home composition-start receipt")
+    if (not re.fullmatch(r"[a-f0-9]{64}", basis_fingerprint)
+            or not re.fullmatch(r"[a-f0-9]{64}", basis_watermark)
+            or basis_observed < 0 or not author.strip() or len(author) > 160):
+        raise ValueError("invalid summary basis or author")
+    if not text.strip() or len(text.encode("utf-8")) > 16_384:
+        raise ValueError("summary must be nonempty and at most 16384 bytes")
+    with issue_events_locked(home):
+        current = make_projection(home, project, refresh=True, events_locked=True)
+        with project_summary_lock(home, project):
+            outdated = (current["fingerprint"] != basis_fingerprint
+                        or current["transition_watermark"] != basis_watermark)
+            written_epoch = utc_now()
+            summary = {"schema": "fm-status-summary.v1", "request": request_id, "project": project,
+                       "author": author, "basis_fingerprint": basis_fingerprint,
+                       "basis_transition_watermark": basis_watermark,
+                       "basis_observed_epoch": basis_observed, "written_epoch": written_epoch,
+                       "text": text, "state": "outdated" if outdated else "written",
+                       "current_fingerprint": current["fingerprint"],
+                       "current_transition_watermark": current["transition_watermark"],
+                       "invalidated_epoch": written_epoch if outdated else None,
+                       "invalidated_change": current.get("project_changed") if outdated else None,
+                       "evidence": {"basis_fingerprint": basis_fingerprint,
+                                    "basis_transition_watermark": basis_watermark,
+                                    "basis_observed_epoch": basis_observed,
+                                    "comparison_fingerprint": current["fingerprint"],
+                                    "comparison_transition_watermark": current["transition_watermark"],
+                                    "comparison_observed_epoch": current["generated_epoch"],
+                                    "repository": current["repository"],
+                                    "catalog_checked_epoch": current["last_checked_epoch"],
+                                    "snapshot_collected_epoch": current["snapshot"]["collected_epoch"]}}
+            summary_path = summary_dir / f"{hashlib.sha256(project.encode()).hexdigest()}.json"
+            prior = read_json(summary_path, 1_000_000)
+            history = prior.get("summaries", []) if isinstance(prior, dict) and prior.get("schema") == "fm-status-summaries.v1" and isinstance(prior.get("summaries"), list) else []
+            history.append(summary)
+            atomic_json(summary_path, {"schema": "fm-status-summaries.v1", "project": project,
+                                       "summaries": history[-20:]})
+            record.setdefault("results", {})[project] = summary["state"]
+            values = list(record["results"].values())
+            record["state"] = ("pending" if "pending" in values else "failed" if "failed" in values
+                                else "unavailable" if "unavailable" in values else "expired" if "expired" in values
+                                else "outdated" if "outdated" in values else "written")
+            atomic_json(request_path, record)
+    invalidate_projection_cache(home, project)
+    return {"status": summary["state"], "project": project}
+
+
 def summary_command(home: Path, argv: list[str]) -> int:
     parser = argparse.ArgumentParser(prog="fm-status-summary")
     sub = parser.add_subparsers(dest="command", required=True)
@@ -1137,6 +1280,18 @@ def summary_command(home: Path, argv: list[str]) -> int:
     route.add_argument("--correlation", required=True)
     dispatch = sub.add_parser("dispatch")
     dispatch.add_argument("request_id")
+    basis = sub.add_parser("basis")
+    basis.add_argument("request_id")
+    basis.add_argument("--project", required=True)
+    reply = sub.add_parser("reply")
+    reply.add_argument("request_id")
+    reply.add_argument("correlation")
+    reply.add_argument("project")
+    reply.add_argument("--text-file", required=True)
+    collect = sub.add_parser("collect")
+    collect.add_argument("request_id")
+    service = sub.add_parser("service")
+    service.add_argument("request_id")
     put = sub.add_parser("put")
     put.add_argument("request_id")
     put.add_argument("project")
@@ -1152,9 +1307,71 @@ def summary_command(home: Path, argv: list[str]) -> int:
     resolve.add_argument("--reason", required=True)
     sub.add_parser("list")
     args = parser.parse_args(argv)
-    if args.command in ("put", "resolve", "route", "dispatch") and not re.fullmatch(r"[0-9]{1,12}-[a-f0-9]{12}", args.request_id):
+    if args.command in ("put", "resolve", "route", "dispatch", "collect", "service", "basis", "reply") and not re.fullmatch(r"[0-9]{1,12}-[a-f0-9]{12}", args.request_id):
         print("error: invalid summary request identity", file=sys.stderr)
         return 2
+    if args.command == "basis":
+        if args.project not in projects(home):
+            print("error: basis requires a registered project", file=sys.stderr)
+            return 2
+        basis_dir = home / "state" / "status-summary-bases"
+        if basis_dir.is_symlink():
+            print("error: summary basis state is a symlink", file=sys.stderr)
+            return 2
+        basis_dir.mkdir(parents=True, exist_ok=True)
+        basis_path = basis_dir / f"{args.request_id}-{hashlib.sha256(args.project.encode()).hexdigest()}.json"
+        basis = read_json(basis_path, 4096)
+        if (not isinstance(basis, dict) or basis.get("schema") != "fm-status-summary-basis.v1"
+                or basis.get("request") != args.request_id or basis.get("project") != args.project):
+            projection = make_projection(home, args.project, refresh=True)
+            basis = {"schema": "fm-status-summary-basis.v1", "request": args.request_id,
+                     "project": args.project, "fingerprint": projection["fingerprint"],
+                     "transition_watermark": projection["transition_watermark"],
+                     "observed_epoch": projection["generated_epoch"]}
+            atomic_json(basis_path, basis)
+        else:
+            projection = make_projection(home, args.project)
+        files = sorted((path for path in basis_dir.glob("*.json") if path.is_file() and not path.is_symlink()),
+                       key=lambda path: path.stat().st_mtime)
+        for path in files[:-20]:
+            path.unlink(missing_ok=True)
+        print(json.dumps({**basis, "projection": projection}, sort_keys=True))
+        return 0
+    if args.command == "reply":
+        if args.project not in projects(home) or not re.fullmatch(r"[a-f0-9]{16}", args.correlation):
+            print("error: invalid correlated summary reply identity", file=sys.stderr)
+            return 2
+        basis_path = home / "state" / "status-summary-bases" / f"{args.request_id}-{hashlib.sha256(args.project.encode()).hexdigest()}.json"
+        basis = read_json(basis_path, 4096)
+        if (not isinstance(basis, dict) or basis.get("schema") != "fm-status-summary-basis.v1"
+                or basis.get("request") != args.request_id or basis.get("project") != args.project
+                or not re.fullmatch(r"[a-f0-9]{64}", basis.get("fingerprint", ""))
+                or not re.fullmatch(r"[a-f0-9]{64}", basis.get("transition_watermark", ""))
+                or not isinstance(basis.get("observed_epoch"), int)):
+            print("error: no valid composition-start basis exists; run summary basis first", file=sys.stderr)
+            return 2
+        try:
+            text = Path(args.text_file).read_text(encoding="utf-8").strip()
+        except (OSError, UnicodeError) as exc:
+            print(f"error: cannot read summary text: {exc}", file=sys.stderr)
+            return 2
+        raw = text.encode("utf-8")
+        if not raw or len(raw) > 300:
+            print("error: correlated summary text must be nonempty and at most 300 UTF-8 bytes", file=sys.stderr)
+            return 2
+        import base64
+        encoded = base64.urlsafe_b64encode(raw).decode("ascii").rstrip("=")
+        note = (f"summary-v1 project={args.project} basis={basis['fingerprint']} "
+                f"transition={basis['transition_watermark']} observed={basis['observed_epoch']} text_b64={encoded}")
+        env = os.environ.copy()
+        env["FM_HOME"] = str(home)
+        result = subprocess.run([str(ROOT / "bin" / "fm-secondmate-report.sh"), "done", args.correlation, note],
+                                env=env, cwd=ROOT, capture_output=True, text=True, timeout=15)
+        if result.returncode:
+            print(result.stderr[-500:] or "error: correlated summary reply could not be published", file=sys.stderr)
+            return result.returncode
+        print(json.dumps({"status": "reply-sent", "project": args.project, "correlation": args.correlation}))
+        return 0
     registered = projects(home)
     root = home / "state" / "status-summary"
     if root.is_symlink():
@@ -1200,7 +1417,13 @@ def summary_command(home: Path, argv: list[str]) -> int:
         atomic_json(reqdir / f"{ident}.json", record)
         for name in selected:
             invalidate_projection_cache(home, name)
-        note = [str(ROOT / "bin" / "fm-inbox.sh"), "note", f"Request Manual Update id={ident} projects={','.join(selected)}"]
+        note = [str(ROOT / "bin" / "fm-inbox.sh"), "note",
+                f"Request Manual Update id={ident} projects={','.join(selected)}. "
+                f"Main-home inbox owner: run {ROOT / 'bin' / 'fm-issues.sh'} summary service {ident}; it routes to "
+                "secondmates, collects correlated replies into put/outdated, and returns composition-start bases for "
+                "main-home projects. Compose each returned main-home project summary, then use summary put with "
+                "that project's fingerprint, transition watermark, observed epoch, --author main-home, and --text-file. "
+                "Use summary resolve with failed or unavailable and --reason when a written summary cannot be produced."]
         env = os.environ.copy()
         env["FM_HOME"] = str(home)
         env.pop("FM_STATE_OVERRIDE", None)
@@ -1216,7 +1439,9 @@ def summary_command(home: Path, argv: list[str]) -> int:
                 invalidate_projection_cache(home, name)
             print(json.dumps({"status": "failed", "request": ident, "error": record["error"]}))
             return 1
-        print(json.dumps({"status": record["state"], "request": ident, "projects": selected, "attached": attached, "supervisor_availability": availability, "results": record["results"]}))
+        print(json.dumps({"status": record["state"], "request": ident, "projects": selected,
+                          "attached": attached, "supervisor_availability": availability,
+                          "results": record["results"]}))
         return 0
     if args.command == "route":
         if not re.fullmatch(r"[A-Za-z0-9._-]{1,120}", args.target) or not re.fullmatch(r"[a-f0-9]{16}", args.correlation):
@@ -1274,8 +1499,13 @@ def summary_command(home: Path, argv: list[str]) -> int:
             target = route["target"]
             marker = f"request={args.request_id} project={name}"
             existing = summary_pending_correlation(home, target, args.request_id, name)
-            message = (f"{marker} Request Manual Update. Read the current structured issue projection when composition begins, "
-                       "then provide a concise written project summary through the correlated parent status channel.")
+            message = (f"{marker} Request Manual Update. Before composing, run "
+                       f"bin/fm-issues.sh summary basis {args.request_id} --project {name} from this home and use that "
+                       "returned projection as the composition basis. Compose a concise summary of this project, save it "
+                       "to a text file of at most 300 UTF-8 bytes, then run "
+                       f"bin/fm-issues.sh summary reply {args.request_id} <corr-id> {name} --text-file <path>. "
+                       "Use the correlation token embedded in this request as <corr-id>; the reply command publishes "
+                       "the typed result on the existing correlated parent channel.")
             env = os.environ.copy()
             env["FM_HOME"] = str(home)
             env.pop("FM_STATE_OVERRIDE", None)
@@ -1311,49 +1541,121 @@ def summary_command(home: Path, argv: list[str]) -> int:
                           "routes": {name: record.get("routes", {}).get(name) for name in selected},
                           "results": {name: record.get("results", {}).get(name) for name in selected}}))
         return 0
+    if args.command == "service":
+        request_path = reqdir / f"{args.request_id}.json"
+        record = read_json(request_path)
+        if not isinstance(record, dict) or record.get("schema") != "fm-status-summary-request.v1":
+            print("error: unknown summary request", file=sys.stderr)
+            return 2
+        fcntl.flock(lock_fd, fcntl.LOCK_UN)
+        command = [sys.executable, str(Path(__file__).resolve()), "--home", str(home), "summary"]
+
+        def run_service_step(*step: str) -> dict:
+            try:
+                result = subprocess.run(command + list(step), cwd=ROOT, capture_output=True,
+                                        text=True, timeout=60)
+            except (OSError, subprocess.SubprocessError) as exc:
+                return {"status": "unavailable", "reason": str(exc)[:300]}
+            if result.returncode not in (0, 1):
+                return {"status": "unavailable", "reason": result.stderr[-300:] or "summary service step failed"}
+            try:
+                value = json.loads(result.stdout)
+                return value if isinstance(value, dict) else {"status": "unknown"}
+            except ValueError:
+                return {"status": "unknown", "reason": "summary service step returned invalid JSON"}
+
+        dispatched = run_service_step("dispatch", args.request_id)
+        collected = run_service_step("collect", args.request_id)
+        record = read_json(request_path)
+        bases = {}
+        if isinstance(record, dict):
+            for project in record.get("projects", []):
+                if (record.get("results", {}).get(project) != "pending"
+                        or (record.get("routes", {}).get(project) or {}).get("route") != "main-home"):
+                    continue
+                bases[project] = run_service_step("basis", args.request_id, "--project", project)
+        record = read_json(request_path) or {}
+        print(json.dumps({"request": args.request_id, "status": record.get("state", "pending"),
+                          "dispatch": dispatched, "collection": collected,
+                          "main_home_composition_bases": bases}, sort_keys=True))
+        return 0
     if args.command == "put":
-        path = reqdir / f"{args.request_id}.json"
-        record = read_json(path)
-        if not isinstance(record, dict) or record.get("schema") != "fm-status-summary-request.v1" or args.project not in record.get("projects", []):
-            print("error: unknown request or project", file=sys.stderr)
+        try:
+            text = Path(args.text_file).read_text(encoding="utf-8")
+            result = publish_summary(home, args.request_id, args.project,
+                                     args.basis_fingerprint, args.basis_transition_watermark,
+                                     args.basis_observed_at, args.author, text)
+        except (OSError, UnicodeError, ValueError) as exc:
+            print(f"error: {exc}", file=sys.stderr)
+            return 2
+        print(json.dumps(result))
+        return 0 if result["status"] in ("written", "outdated") else 1
+    if args.command == "collect":
+        request_path = reqdir / f"{args.request_id}.json"
+        record = read_json(request_path)
+        if not isinstance(record, dict) or record.get("schema") != "fm-status-summary-request.v1":
+            print("error: unknown summary request", file=sys.stderr)
             return 2
         if int(record.get("expires_epoch", 0)) <= utc_now():
+            record["results"] = {name: ("expired" if value == "pending" else value)
+                                 for name, value in record.get("results", {}).items()}
             record["state"] = "expired"
-            atomic_json(path, record)
-            print(json.dumps({"status": "expired", "project": args.project}))
+            atomic_json(request_path, record)
+            print(json.dumps({"status": "expired", "request": args.request_id}))
             return 1
-        if record.get("results", {}).get(args.project) != "pending":
-            print(json.dumps({"status": record.get("results", {}).get(args.project, record.get("state", "unavailable")), "project": args.project}))
-            return 1
-        if (not re.fullmatch(r"[a-f0-9]{64}", args.basis_fingerprint)
-                or not re.fullmatch(r"[a-f0-9]{64}", args.basis_transition_watermark)
-                or args.basis_observed_at < 0 or not args.author.strip() or len(args.author) > 160):
-            print("error: invalid summary basis or author", file=sys.stderr)
-            return 2
-        text = Path(args.text_file).read_text(encoding="utf-8")
-        if not text.strip() or len(text.encode()) > 16_384:
-            print("error: summary must be nonempty and at most 16384 bytes", file=sys.stderr)
-            return 2
-        current = make_projection(home, args.project)
-        with project_summary_lock(home, args.project):
-            outdated = (current["fingerprint"] != args.basis_fingerprint
-                        or current["transition_watermark"] != args.basis_transition_watermark)
-            written_epoch = utc_now()
-            summary = {"schema": "fm-status-summary.v1", "request": args.request_id, "project": args.project, "author": args.author, "basis_fingerprint": args.basis_fingerprint, "basis_transition_watermark": args.basis_transition_watermark, "basis_observed_epoch": args.basis_observed_at, "written_epoch": written_epoch, "text": text, "state": "outdated" if outdated else "written", "current_fingerprint": current["fingerprint"], "current_transition_watermark": current["transition_watermark"], "invalidated_epoch": written_epoch if outdated else None, "invalidated_change": current.get("project_changed") if outdated else None, "evidence": {"basis_fingerprint": args.basis_fingerprint, "basis_transition_watermark": args.basis_transition_watermark, "basis_observed_epoch": args.basis_observed_at, "comparison_fingerprint": current["fingerprint"], "comparison_transition_watermark": current["transition_watermark"], "comparison_observed_epoch": current["generated_epoch"], "repository": current["repository"], "catalog_checked_epoch": current["last_checked_epoch"], "snapshot_collected_epoch": current["snapshot"]["collected_epoch"]}}
-            summary_path = sumdir / f"{hashlib.sha256(args.project.encode()).hexdigest()}.json"
-            prior = read_json(summary_path, 1_000_000)
-            history = prior.get("summaries", []) if isinstance(prior, dict) and prior.get("schema") == "fm-status-summaries.v1" and isinstance(prior.get("summaries"), list) else []
-            history.append(summary)
-            atomic_json(summary_path, {"schema": "fm-status-summaries.v1", "project": args.project, "summaries": history[-20:]})
-            record.setdefault("results", {})[args.project] = summary["state"]
-            values = list(record["results"].values())
-            record["state"] = ("pending" if "pending" in values else
-                                "failed" if "failed" in values else
-                                "unavailable" if "unavailable" in values else
-                                "outdated" if "outdated" in values else "written")
-            atomic_json(path, record)
-        invalidate_projection_cache(home, args.project)
-        print(json.dumps({"status": summary["state"], "project": args.project}))
+        collected = {}
+        for project in record.get("projects", []):
+            if record.get("results", {}).get(project) != "pending":
+                continue
+            route = (record.get("routes") or {}).get(project, {})
+            target = route.get("target") if isinstance(route, dict) else None
+            if not target:
+                continue
+            details = summary_pending_reply_details(home, target, args.request_id, project)
+            if not details:
+                continue
+            correlation, status_path = details
+            if (record.get("correlations") or {}).get(project) != correlation:
+                continue
+            try:
+                lines = status_path.read_text(encoding="utf-8").splitlines()
+            except (OSError, UnicodeError):
+                continue
+            matching = [line for line in lines if f"[corr={correlation}]:" in line]
+            if not matching:
+                continue
+            reply = parse_summary_reply(matching[-1], project, correlation)
+            if not reply:
+                result = {"status": "failed", "project": project,
+                          "reason": "correlated secondmate reply did not contain a valid summary-v1 payload"}
+                record.setdefault("results", {})[project] = "failed"
+                record.setdefault("result_reasons", {})[project] = result["reason"]
+                states = list(record["results"].values())
+                record["state"] = ("pending" if "pending" in states else
+                                    "failed" if "failed" in states else
+                                    "unavailable" if "unavailable" in states else
+                                    "outdated" if "outdated" in states else "written")
+                atomic_json(request_path, record)
+                collected[project] = result
+                continue
+            try:
+                result = publish_summary(home, args.request_id, project, reply["fingerprint"],
+                                         reply["transition_watermark"], reply["observed_epoch"],
+                                         str(target), reply["text"], correlated_reply=True)
+            except (OSError, ValueError) as exc:
+                result = {"status": "failed", "project": project, "reason": str(exc)[:500]}
+                record.setdefault("results", {})[project] = "failed"
+                record.setdefault("result_reasons", {})[project] = result["reason"]
+                states = list(record["results"].values())
+                record["state"] = ("pending" if "pending" in states else
+                                    "failed" if "failed" in states else
+                                    "unavailable" if "unavailable" in states else
+                                    "outdated" if "outdated" in states else "written")
+                atomic_json(request_path, record)
+            collected[project] = result
+            record = read_json(request_path) or record
+        print(json.dumps({"status": record.get("state", "pending"),
+                          "request": args.request_id, "collected": collected}))
         return 0
     if args.command == "resolve":
         path = reqdir / f"{args.request_id}.json"

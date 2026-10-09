@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 from typing import Any
 
 FINGERPRINT_SCHEMA = "fm-issues-fingerprint.v3"
@@ -54,6 +55,11 @@ def stage(task: dict[str, Any], linked_prs: list[dict[str, Any]], backlog: dict[
     if linked_prs:
         return "In review", waiting
     if current == "done" or backlog.get("state") == "done":
+        completion = backlog.get("completion") or {}
+        has_artifact = any(backlog.get(key) for key in ("pr_url", "report_path", "local_note"))
+        has_artifact = has_artifact or backlog.get("artifact_present") is True
+        if has_artifact and completion.get("verb") in ("merged", "reported", "done"):
+            return "Completed", waiting
         return "Closed without delivery", waiting
     if current == "failed":
         return "Unknown", waiting or "failed"
@@ -160,11 +166,69 @@ def complete_task_fact(task: dict[str, Any], configured_lanes: list[str]) -> dic
 
 def owner_task_fact(task: dict[str, Any], owner_home_id: str,
                     owner_task_id: str, configured_lanes: list[str]) -> dict[str, Any]:
-    """Stamp a validated source row before applying common issue semantics."""
+    """Validate owner identity, then apply one reducer to local and transported facts."""
     result = dict(task)
+    supplied_owner_home = result.get("owner_home_id")
+    supplied_owner_task = result.get("owner_task_id")
+    owner_claim_conflict = ((supplied_owner_home is not None and supplied_owner_home != owner_home_id)
+                            or (supplied_owner_task is not None and supplied_owner_task != owner_task_id))
     result["fact_schema"] = "fm-issue-task-fact.v1"
     result["owner_home_id"] = owner_home_id
     result["owner_task_id"] = owner_task_id
+    problems = []
+    if owner_claim_conflict:
+        problems.append("task owner stamp contradicts its registered source")
+    if not isinstance(owner_home_id, str) or not owner_home_id:
+        problems.append("task owner identity is missing")
+    if not isinstance(owner_task_id, str) or not owner_task_id:
+        problems.append("owner task identity is missing")
+    generation = result.get("generation")
+    if generation is not None and (not isinstance(generation, str)
+                                   or not generation
+                                   or len(generation) > 96
+                                   or any(char not in "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789._-" for char in generation)):
+        problems.append("task generation is malformed")
+    history = result.get("event_history", [])
+    if not isinstance(history, list):
+        problems.append("owner event history is malformed")
+        history = []
+    elif len(history) > 32:
+        problems.append("owner event history exceeds the bounded fact limit")
+        history = history[-32:]
+    else:
+        for event in history:
+            if (not isinstance(event, dict)
+                    or event.get("schema") != "fm-task-event.v1"
+                    or event.get("task") != owner_task_id
+                    or (generation is not None and event.get("generation") != generation)
+                    or event.get("class") not in ("event", "detected")
+                    or not isinstance(event.get("at_epoch"), int)
+                    or event.get("at_epoch", -1) < 0
+                    or not isinstance(event.get("kind"), str)
+                    or not isinstance(event.get("fields"), dict)
+                    or len(json.dumps(event, ensure_ascii=False).encode("utf-8")) > 16_384):
+                problems.append("owner event history contains a foreign or malformed fact")
+                history = []
+                break
+    result["event_history"] = history
+    event = result.get("event")
+    if event is not None and (not isinstance(event, dict) or event not in history):
+        problems.append("current owner event is not present in its validated history")
+    source_head = result.get("source_head")
+    if source_head is not None and (not isinstance(source_head, str)
+                                    or not re.fullmatch(r"[A-Fa-f0-9]{40,64}", source_head)):
+        problems.append("owner source head is malformed")
+    source_dirty = result.get("source_dirty")
+    if source_dirty is not None and not isinstance(source_dirty, bool):
+        problems.append("owner source cleanliness is malformed")
+    if problems:
+        result["evidence_freshness"] = "unknown"
+        prior_conflicts = result.get("conflicts")
+        if not isinstance(prior_conflicts, list):
+            prior_conflicts = []
+        result["conflicts"] = list(dict.fromkeys([*prior_conflicts, *problems]))
+        result["event"] = None
+    result["owner_fact_valid"] = not problems
     return complete_task_fact(result, configured_lanes)
 
 
@@ -234,7 +298,9 @@ def transition_watermark(rows: list[dict[str, Any]], unlinked: list[dict[str, An
         if not isinstance(history, list):
             continue
         for event in history:
-            if not isinstance(event, dict) or event.get("generation") != task.get("generation"):
+            if (not isinstance(event, dict)
+                    or (task.get("generation") is not None
+                        and event.get("generation") != task.get("generation"))):
                 continue
             if event.get("class") not in ("event", "detected"):
                 continue

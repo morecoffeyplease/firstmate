@@ -219,13 +219,59 @@ def main(argv: list[str]) -> int:
     sigint_thread: threading.Thread | None = None
     sigint_mask = None
     sigint_ignored = signal.getsignal(signal.SIGINT) == signal.SIG_IGN
-    def forward(signum: int, _frame: object) -> None:
-        received.append(signum)
-        if child is not None and child.poll() is None:
+    tty_attached = any(os.isatty(fd) for fd in (0, 1, 2))
+    tty_foreground_fd = None
+    if tty_attached and os.name == "posix":
+        for descriptor in (0, 1, 2):
+            if not os.isatty(descriptor):
+                continue
             try:
-                child.send_signal(signum)
+                if os.tcgetpgrp(descriptor) == os.getpgrp():
+                    tty_foreground_fd = descriptor
+                    break
             except OSError:
-                pass
+                continue
+    child_group_isolated = not tty_attached and os.name == "posix"
+    signal_codes = {b"I": signal.SIGINT, b"T": signal.SIGTERM, b"H": signal.SIGHUP}
+    witness_signal_read = witness_stop_write = None
+    signal_witness = None
+    witness_thread: threading.Thread | None = None
+    witness_ready_read = None
+
+    def record_received(signum: int) -> None:
+        if signum not in received:
+            received.append(signum)
+
+    def read_witness_signals() -> None:
+        while witness_signal_read is not None:
+            try:
+                code = os.read(witness_signal_read, 1)
+            except OSError:
+                return
+            if not code:
+                return
+            signum = signal_codes.get(code)
+            if signum is not None:
+                record_received(signum)
+
+    def deliver_to_child(signum: int) -> None:
+        if child is None or child.poll() is not None:
+            return
+        try:
+            if child_group_isolated:
+                os.killpg(child.pid, signum)
+            else:
+                child.send_signal(signum)
+        except OSError:
+            pass
+
+    def forward(signum: int, _frame: object) -> None:
+        record_received(signum)
+        if tty_attached and not child_group_isolated and signum == signal.SIGINT:
+            # A terminal signal already reached the command in the shared
+            # process group, so do not deliver it twice.
+            return
+        deliver_to_child(signum)
 
     def child_unblock_sigint() -> None:
         signal.pthread_sigmask(signal.SIG_UNBLOCK, {signal.SIGINT})
@@ -238,15 +284,13 @@ def main(argv: list[str]) -> int:
                 continue
             if info is None:
                 continue
-            received.append(signal.SIGINT)
-            # TTY-generated SIGINT reaches the whole foreground process group,
-            # including the child. A user-originated signal to this wrapper only
-            # must be forwarded so the child receives the same cancellation.
-            if info.si_pid and child is not None and child.poll() is None:
-                try:
-                    child.send_signal(signal.SIGINT)
-                except OSError:
-                    pass
+            record_received(signal.SIGINT)
+            # With an attached TTY, terminal SIGINT reaches the shared process
+            # group directly. Without a TTY, the child owns a new process group
+            # and this wrapper forwards to that entire group. No sender-PID
+            # inference is needed.
+            if child_group_isolated:
+                deliver_to_child(signal.SIGINT)
 
     previous_handlers = {}
     if not sigint_ignored and hasattr(signal, "pthread_sigmask") and hasattr(signal, "sigtimedwait"):
@@ -259,8 +303,86 @@ def main(argv: list[str]) -> int:
         previous_handlers[sig] = signal.signal(sig, forward)
     return_code = 127
     child_signal = None
+    tty_original_group = None
+    tty_handoff_active = False
+    witness_ready = False
+    gate_read = gate_write = None
     try:
-        child = subprocess.Popen(command, preexec_fn=child_unblock_sigint if sigint_mask is not None else None)
+        if tty_foreground_fd is not None:
+            gate_read, gate_write = os.pipe()
+            helper = Path(__file__).with_name("fm-lane-exec.py")
+            child = subprocess.Popen(
+                [sys.executable, str(helper), str(gate_read), str(os.getpgrp()),
+                 "unblock" if sigint_mask is not None else "keep", *command],
+                pass_fds=(gate_read,), preexec_fn=os.setpgrp,
+            )
+            os.close(gate_read)
+            gate_read = None
+            child_group_isolated = True
+            witness_signal_read, signal_write = os.pipe()
+            stop_read, witness_stop_write = os.pipe()
+            witness_ready_read, ready_write = os.pipe()
+            witness_path = Path(__file__).with_name("fm-lane-signal-witness.py")
+            try:
+                try:
+                    signal_witness = subprocess.Popen(
+                        [sys.executable, str(witness_path), str(signal_write), str(stop_read), str(ready_write)],
+                        pass_fds=(signal_write, stop_read, ready_write),
+                        preexec_fn=lambda: os.setpgid(0, child.pid),
+                    )
+                except OSError:
+                    signal_witness = None
+            finally:
+                os.close(signal_write)
+                os.close(stop_read)
+                os.close(ready_write)
+            if signal_witness is not None:
+                if os.read(witness_ready_read, 1) == b"R":
+                    witness_ready = True
+                    witness_thread = threading.Thread(target=read_witness_signals, name="fm-lane-signal-witness", daemon=True)
+                    witness_thread.start()
+                else:
+                    signal_witness.wait()
+                    signal_witness = None
+                    os.close(witness_signal_read)
+                    os.close(witness_stop_write)
+                    witness_signal_read = witness_stop_write = None
+            os.close(witness_ready_read)
+            witness_ready_read = None
+            tty_original_group = os.getpgrp()
+            previous_ttou = signal.getsignal(signal.SIGTTOU)
+            signal.signal(signal.SIGTTOU, signal.SIG_IGN)
+            try:
+                if witness_ready:
+                    os.tcsetpgrp(tty_foreground_fd, child.pid)
+                    tty_handoff_active = True
+                    child_group_isolated = True
+                else:
+                    child_group_isolated = False
+            except OSError:
+                tty_handoff_active = False
+                child_group_isolated = False
+                if witness_stop_write is not None:
+                    try:
+                        os.write(witness_stop_write, b"S")
+                    except OSError:
+                        pass
+                    os.close(witness_stop_write)
+                    witness_stop_write = None
+                if signal_witness is not None:
+                    signal_witness.wait()
+                    signal_witness = None
+            finally:
+                signal.signal(signal.SIGTTOU, previous_ttou)
+            os.write(gate_write, b"I" if tty_handoff_active else b"S")
+            os.close(gate_write)
+            gate_write = None
+        else:
+            child = subprocess.Popen(
+                command,
+                preexec_fn=child_unblock_sigint if sigint_mask is not None else None,
+                start_new_session=not tty_attached and os.name == "posix",
+            )
         if sigint_mask is not None:
             sigint_thread = threading.Thread(target=wait_for_sigint, name="fm-lane-sigint", daemon=True)
             sigint_thread.start()
@@ -272,6 +394,27 @@ def main(argv: list[str]) -> int:
         print(f"fm-lane-run: {exc}", file=sys.stderr)
         return_code = 127
     finally:
+        if witness_stop_write is not None:
+            try:
+                os.write(witness_stop_write, b"S")
+            except OSError:
+                pass
+            os.close(witness_stop_write)
+            witness_stop_write = None
+        if signal_witness is not None:
+            signal_witness.wait()
+            signal_witness = None
+        if witness_signal_read is not None:
+            os.close(witness_signal_read)
+            witness_signal_read = None
+        if witness_thread is not None:
+            witness_thread.join(timeout=1)
+        if witness_ready_read is not None:
+            os.close(witness_ready_read)
+        if gate_read is not None:
+            os.close(gate_read)
+        if gate_write is not None:
+            os.close(gate_write)
         sigint_stop.set()
         if sigint_thread is not None:
             sigint_thread.join(timeout=1)
@@ -279,6 +422,15 @@ def main(argv: list[str]) -> int:
             signal.pthread_sigmask(signal.SIG_SETMASK, sigint_mask)
         for sig, handler in previous_handlers.items():
             signal.signal(sig, handler)
+        if tty_handoff_active and tty_foreground_fd is not None and tty_original_group is not None:
+            previous_ttou = signal.getsignal(signal.SIGTTOU)
+            signal.signal(signal.SIGTTOU, signal.SIG_IGN)
+            try:
+                os.tcsetpgrp(tty_foreground_fd, tty_original_group)
+            except OSError:
+                pass
+            finally:
+                signal.signal(signal.SIGTTOU, previous_ttou)
     end_head, end_dirty, end_dirty_hash = source_identity()
     finish = {"phase": "finish", "ended_epoch": now(), "exit_code": return_code if child_signal is None else None, "signal": child_signal, "received_signal": received[0] if received else None, "head_after": end_head, "dirty_after": end_dirty, "dirty_source_hash_after": end_dirty_hash}
     if artifact:
