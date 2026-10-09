@@ -53,6 +53,8 @@ assert first["status"] == "pending" and set(first["projects"]) == set(projects)
 request_path = home / "state" / "status-summary" / "requests" / f"{first['request']}.json"
 request_record = json.loads(request_path.read_text())
 assert request_record["routes"] == {name: {"route": "main-home", "target": None, "state": "pending"} for name in projects}
+dispatched = run("dispatch", first["request"])
+assert dispatched["status"] == "pending" and all(item["route"] == "main-home" for item in dispatched["routes"].values())
 dedup = run("request", "--project", "alpha", "--project", "beta")
 assert dedup["deduplicated"] is True and dedup["requests"]["alpha"] == first["request"] and dedup["requests"]["beta"] == first["request"]
 listed = run("list")

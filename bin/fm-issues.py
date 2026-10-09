@@ -1135,6 +1135,8 @@ def summary_command(home: Path, argv: list[str]) -> int:
     route.add_argument("project")
     route.add_argument("--target", required=True)
     route.add_argument("--correlation", required=True)
+    dispatch = sub.add_parser("dispatch")
+    dispatch.add_argument("request_id")
     put = sub.add_parser("put")
     put.add_argument("request_id")
     put.add_argument("project")
@@ -1150,7 +1152,7 @@ def summary_command(home: Path, argv: list[str]) -> int:
     resolve.add_argument("--reason", required=True)
     sub.add_parser("list")
     args = parser.parse_args(argv)
-    if args.command in ("put", "resolve", "route") and not re.fullmatch(r"[0-9]{1,12}-[a-f0-9]{12}", args.request_id):
+    if args.command in ("put", "resolve", "route", "dispatch") and not re.fullmatch(r"[0-9]{1,12}-[a-f0-9]{12}", args.request_id):
         print("error: invalid summary request identity", file=sys.stderr)
         return 2
     registered = projects(home)
@@ -1188,9 +1190,13 @@ def summary_command(home: Path, argv: list[str]) -> int:
             print(json.dumps({"status": "pending", "requests": attached, "deduplicated": True, "supervisor_availability": availability}))
             return 0
         ident = f"{now}-{secrets.token_hex(6)}"
-        initial_results = {name: "pending" for name in selected}
-        routes = {name: {"route": "awaiting-main-home", "target": None, "state": "pending"} for name in selected}
-        record = {"schema": "fm-status-summary-request.v1", "id": ident, "requested_epoch": now, "requested_at": iso_utc(now), "projects": selected, "basis_fingerprints": {}, "state": "pending", "results": initial_results, "result_reasons": {}, "routes": routes, "correlations": {}, "expires_epoch": now + 1800, "supervisor_availability": supervisor_availability(home)}
+        routes = project_routes(home, selected)
+        initial_results = {name: ("unavailable" if routes[name].get("state") == "unavailable" else "pending")
+                           for name in selected}
+        initial_reasons = {name: routes[name].get("reason") for name in selected
+                           if routes[name].get("reason")}
+        request_state = "pending" if "pending" in initial_results.values() else "unavailable"
+        record = {"schema": "fm-status-summary-request.v1", "id": ident, "requested_epoch": now, "requested_at": iso_utc(now), "projects": selected, "basis_fingerprints": {}, "state": request_state, "results": initial_results, "result_reasons": initial_reasons, "routes": routes, "correlations": {}, "expires_epoch": now + 1800, "supervisor_availability": supervisor_availability(home)}
         atomic_json(reqdir / f"{ident}.json", record)
         for name in selected:
             invalidate_projection_cache(home, name)
@@ -1237,6 +1243,73 @@ def summary_command(home: Path, argv: list[str]) -> int:
         atomic_json(path, record)
         invalidate_projection_cache(home, args.project)
         print(json.dumps({"status": "pending", "project": args.project, "correlation": args.correlation}))
+        return 0
+    if args.command == "dispatch":
+        path = reqdir / f"{args.request_id}.json"
+        record = read_json(path)
+        if not isinstance(record, dict) or record.get("schema") != "fm-status-summary-request.v1":
+            print("error: unknown summary request", file=sys.stderr)
+            return 2
+        if int(record.get("expires_epoch", 0)) <= utc_now():
+            record["results"] = {name: ("expired" if state == "pending" else state)
+                                 for name, state in record.get("results", {}).items()}
+            record["state"] = "expired"
+            atomic_json(path, record)
+            print(json.dumps({"status": "expired", "request": args.request_id}))
+            return 1
+        selected = [name for name in record.get("projects", [])
+                    if record.get("results", {}).get(name) == "pending"]
+        routes = project_routes(home, selected)
+        for name in selected:
+            route = routes.get(name, {})
+            if route.get("route") == "main-home":
+                record.setdefault("routes", {})[name] = {"route": "main-home", "target": None, "state": "pending"}
+                continue
+            if route.get("route") != "secondmate" or not route.get("target"):
+                reason = route.get("reason", "registered project route is unavailable")
+                record.setdefault("routes", {})[name] = {"route": "unavailable", "target": None, "state": "unavailable", "reason": reason}
+                record.setdefault("results", {})[name] = "unavailable"
+                record.setdefault("result_reasons", {})[name] = reason
+                continue
+            target = route["target"]
+            marker = f"request={args.request_id} project={name}"
+            existing = summary_pending_correlation(home, target, args.request_id, name)
+            message = (f"{marker} Request Manual Update. Read the current structured issue projection when composition begins, "
+                       "then provide a concise written project summary through the correlated parent status channel.")
+            env = os.environ.copy()
+            env["FM_HOME"] = str(home)
+            env.pop("FM_STATE_OVERRIDE", None)
+            env.pop("FM_DATA_OVERRIDE", None)
+            if existing:
+                env["FM_PENDING_REPLY_EXISTING_CORR"] = existing
+            try:
+                sent = subprocess.run([str(ROOT / "bin" / "fm-send.sh"), target, message],
+                                      env=env, cwd=ROOT, capture_output=True, text=True, timeout=30)
+                correlation = summary_pending_correlation(home, target, args.request_id, name)
+                if correlation:
+                    prior = record.setdefault("correlations", {}).get(name)
+                    if prior and prior != correlation:
+                        raise ValueError("request already owns a different pending-reply correlation")
+                    record.setdefault("correlations", {})[name] = correlation
+                    record.setdefault("routes", {})[name] = {"route": "secondmate", "target": target, "state": "pending"}
+                    if sent.returncode != 0:
+                        record.setdefault("result_reasons", {})[name] = "send outcome is uncertain; durable correlation retained for recovery"
+                else:
+                    record.setdefault("routes", {})[name] = {"route": "secondmate", "target": target, "state": "pending"}
+                    record.setdefault("result_reasons", {})[name] = (sent.stderr[-500:] or "send returned without a durable correlated reply")
+            except (OSError, subprocess.SubprocessError, ValueError) as exc:
+                record.setdefault("routes", {})[name] = {"route": "secondmate", "target": target, "state": "pending"}
+                record.setdefault("result_reasons", {})[name] = str(exc)[:500]
+        values = record.get("results", {}).values()
+        record["state"] = ("pending" if "pending" in values else "failed" if "failed" in values
+                            else "unavailable" if "unavailable" in values else "outdated" if "outdated" in values
+                            else "written")
+        atomic_json(path, record)
+        for name in selected:
+            invalidate_projection_cache(home, name)
+        print(json.dumps({"status": record["state"], "request": args.request_id,
+                          "routes": {name: record.get("routes", {}).get(name) for name in selected},
+                          "results": {name: record.get("results", {}).get(name) for name in selected}}))
         return 0
     if args.command == "put":
         path = reqdir / f"{args.request_id}.json"

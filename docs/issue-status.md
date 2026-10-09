@@ -30,9 +30,9 @@ Source acceptance and canonical journey evidence stay unknown until an identifie
 
 **Request Manual Update** durably records one request for every selected registered project and adds a typed note to the main-home inbox.
 The browser handler does not route or send messages.
-At the inbox wake, the main-home owner resolves each project through the validated registry and sends `request=<request-id> project=<project> Request Manual Update. At composition start, read the current structured projection and use its fingerprint, observation time, and evidence as the summary basis. Please provide a concise written project summary through the correlated parent status channel.` through `fm-send`.
-After the send creates its durable pending-reply record, the main-home owner records its target and correlation with `fm-issues.sh summary route <request-id> <project> --target <task-id> --correlation <correlation-id>`; this command verifies the correlation against that record.
-Requests without a matching registered secondmate remain assigned to the main-home inbox.
+At the inbox wake, the main-home owner runs `fm-issues.sh summary dispatch <request-id>` to resolve validated project routes, send marked requests to registered secondmates, and record their durable pending-reply correlations.
+The dispatch command retains uncertain sends for retry with their existing correlation, and projects without a registered secondmate remain assigned to the main-home owner.
+For a main-home project, the firstmate author composes the summary directly and writes it with the request's project identity.
 Each project's route, correlation, result, and failure reason is shown separately, requests deduplicate independently, and requests expire after 30 minutes.
 When composition begins, the summary author reads that project's current fingerprint and observation time from `fm-issues.sh --project <project> --json`.
 The author writes the text with `fm-issues.sh summary put`, supplying the current fingerprint, transition watermark, and observation time read when composition begins; the command compares both status and retained owner transitions with current evidence and marks a changed basis outdated immediately.
