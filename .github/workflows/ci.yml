@@ -23,11 +23,15 @@ concurrency:
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
-  lint:
-    name: Lint
+  lint-shards:
+    name: Lint shard ${{ matrix.shard }}
     runs-on: ubuntu-latest
-    # Hang tripwire only: lint executions measured at 14-16 minutes in the
-    # September 12 starvation report, so this leaves deliberate margin.
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: ["1/4", "2/4", "3/4", "4/4"]
+    # Each isolated runner performs full ShellCheck analysis for one stable
+    # partition. Keep the hang tripwire unchanged at 25 minutes.
     timeout-minutes: 25
     steps:
       - uses: actions/checkout@v6
@@ -48,9 +52,14 @@ jobs:
       - name: Run bin/fm-lint.sh with runner profiling
         run: |
           set -u
-          profile="$RUNNER_TEMP/fm-lint-profile"
+          profile="$RUNNER_TEMP/fm-lint-profile-${{ strategy.job-index }}"
           mkdir -p "$profile"
           capture_runner_state() {
+            printf 'runner_name\t%s\n' "$RUNNER_NAME"
+            printf 'runner_os\t%s\n' "$RUNNER_OS"
+            printf 'runner_arch\t%s\n' "$RUNNER_ARCH"
+            printf 'checkout_sha\t%s\n' "$(git rev-parse HEAD)"
+            printf 'shard_selection\t%s\n' '${{ matrix.shard }}'
             printf 'timestamp_utc\t%s\n' "$(date -u +%FT%TZ)"
             for metric in memory.current memory.peak memory.events; do
               if [ -r "/sys/fs/cgroup/$metric" ]; then
@@ -103,14 +112,31 @@ jobs:
           }
           trap 'exit 143' TERM
           trap finish_profile EXIT
-          FM_LINT_TELEMETRY="$profile/summary.tsv" bin/fm-lint.sh
+          FM_LINT_TELEMETRY="$profile/summary.tsv" bin/fm-lint.sh --shard '${{ matrix.shard }}'
       - name: Upload lint runner profile
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: fm-lint-runner-profile
-          path: ${{ runner.temp }}/fm-lint-profile
+          name: fm-lint-runner-profile-${{ strategy.job-index }}
+          path: ${{ runner.temp }}/fm-lint-profile-${{ strategy.job-index }}
           if-no-files-found: warn
+
+  lint:
+    name: Lint
+    if: always()
+    needs: lint-shards
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Require all four lint shards
+        env:
+          SHARDS_RESULT: ${{ needs.lint-shards.result }}
+        run: |
+          if [ "$SHARDS_RESULT" != success ]; then
+            printf 'Lint shards must all succeed; matrix result was %s.\n' "$SHARDS_RESULT" >&2
+            exit 1
+          fi
+          printf 'All four full-analysis lint shards passed.\n'
 
   # Deterministic proof that portable parallel shards + portable serial + Herdr
   # equal the complete tests/*.test.sh inventory with no missing or duplicates,
