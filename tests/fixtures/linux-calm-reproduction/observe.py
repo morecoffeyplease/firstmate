@@ -55,6 +55,7 @@ OBSERVER = br"""  fm_observer_receipt() {
   fm_observer_receipt "$FM_EVIDENCE_DIR/default-alternate.exit" default-alternate-exit "$rc" || fail "observer could not retain alternate capture exit"
   if ! grep -Fq -- "CALM_E2E_OUTPUT" "$default_snapshot"; then
     fm_viewport_polls=0
+    fm_viewport_budget_ticks=0
     fm_viewport_index=0
     fm_viewport_page_count=0
     fm_viewport_top=unknown
@@ -62,43 +63,168 @@ OBSERVER = br"""  fm_observer_receipt() {
     fm_viewport_marker=absent
     fm_viewport_outcome=UNKNOWN
     fm_viewport_candidate="$FM_EVIDENCE_DIR/viewport-poll.txt"
+    fm_viewport_tail="$FM_EVIDENCE_DIR/viewport-current-tail.txt"
     fm_viewport_stable="$FM_EVIDENCE_DIR/viewport-stable.txt"
     fm_observer_receipt "$FM_EVIDENCE_DIR/viewport-diagnostic.started" viewport-diagnostic-started started || true
-    fm_viewport_wait() {
-      local previous=$1 destination=$2 allow_unchanged=$3 poll_limit=$4 polls=0 stable=0 changed=0 rc
-      while (( fm_viewport_polls < poll_limit )); do
-        ((fm_viewport_polls += 1))
+    fm_viewport_compare() {
+      local rc
+      if cmp -s -- "$1" "$2"; then
+        return 0
+      else
+        rc=$?
+      fi
+      case "$rc" in
+        1) return 1 ;;
+        *) return 2 ;;
+      esac
+    }
+    fm_viewport_usable() {
+      local rc
+      [[ -s "$1" ]] || return 1
+      if grep -Eq '[^[:space:]]' "$1"; then
+        return 0
+      else
+        rc=$?
+      fi
+      case "$rc" in
+        1) return 1 ;;
+        *) return 2 ;;
+      esac
+    }
+    fm_viewport_capture() {
+      local destination=$1 label=$2 poll_limit=$3 rc
+      if (( fm_viewport_budget_ticks >= poll_limit )); then
+        fm_observer_receipt "$destination.capture.exit" "$label-capture-exit" shared-budget-exhausted || true
+        return 1
+      fi
+      ((fm_viewport_budget_ticks += 1))
+      ((fm_viewport_polls += 1))
+      if timeout --signal=TERM --kill-after=1s 2s tmux -L "$TMUX_SOCKET" capture-pane -p -t "$TMUX_SESSION" > "$fm_viewport_candidate" 2> "$destination.stderr"; then
+        rc=0
+      else
+        rc=$?
+        fm_observer_receipt "$destination.capture.exit" "$label-capture-exit" "$rc" || true
+        return 1
+      fi
+      fm_observer_receipt "$destination.capture.exit" "$label-capture-exit" 0 || return 1
+      sleep 0.05
+      return 0
+    }
+    fm_viewport_send_key() {
+      local key=$1 receipt=$2 limit=$3 rc key_cost=5
+      if (( fm_viewport_budget_ticks > limit - key_cost )); then
+        fm_observer_receipt "$receipt" viewport-key-exit shared-budget-exhausted || true
+        return 1
+      fi
+      ((fm_viewport_budget_ticks += key_cost))
+      if timeout --signal=TERM --kill-after=0.05s 0.25s tmux -L "$TMUX_SOCKET" send-keys -t "$TMUX_SESSION" "$key" 2> "${receipt%.exit}.stderr"; then
+        rc=0
+      else
+        rc=$?
+      fi
+      fm_observer_receipt "$receipt" viewport-key-exit "$rc" || true
+      [[ "$rc" == 0 ]]
+    }
+    fm_viewport_wait_navigation() {
+      local previous=$1 destination=$2 poll_limit=$3 polls=0 stable=0 stable_valid=0 usable_rc compare_rc
+      while (( fm_viewport_budget_ticks < poll_limit )); do
         ((polls += 1))
-        if timeout --signal=TERM --kill-after=1s 2s tmux -L "$TMUX_SOCKET" capture-pane -p -t "$TMUX_SESSION" > "$fm_viewport_candidate" 2> "$destination.stderr"; then
-          rc=0
+        if ! fm_viewport_capture "$destination" viewport-frame "$poll_limit"; then return 1; fi
+        if fm_viewport_usable "$fm_viewport_candidate"; then
+          :
         else
-          rc=$?
-          fm_observer_receipt "$destination.capture.exit" viewport-capture-exit "$rc" || true
+          usable_rc=$?
+          stable=0
+          stable_valid=0
+          if [[ "$usable_rc" != 1 ]]; then
+            fm_observer_receipt "$destination.capture.usable" viewport-capture-usable comparison-error || true
+            return 1
+          fi
+          continue
+        fi
+        if fm_viewport_compare "$fm_viewport_candidate" "$previous"; then
+          stable=0
+          stable_valid=0
+          continue
+        else
+          compare_rc=$?
+        fi
+        if [[ "$compare_rc" != 1 ]]; then
+          fm_observer_receipt "$destination.capture.compare" viewport-capture-compare comparison-error || true
           return 1
         fi
-        if ! cmp -s -- "$fm_viewport_candidate" "$previous"; then changed=1; fi
-        if (( changed == 1 || allow_unchanged == 1 )); then
-          if [[ -f "$fm_viewport_stable" ]] && cmp -s -- "$fm_viewport_candidate" "$fm_viewport_stable"; then
+        if (( stable_valid == 1 )); then
+          if fm_viewport_compare "$fm_viewport_candidate" "$fm_viewport_stable"; then
             ((stable += 1))
           else
+            compare_rc=$?
+            if [[ "$compare_rc" != 1 ]]; then
+              fm_observer_receipt "$destination.stable.compare" viewport-stable-compare comparison-error || true
+              return 1
+            fi
             if ! cp -- "$fm_viewport_candidate" "$fm_viewport_stable"; then return 1; fi
             stable=1
           fi
-          if (( stable >= 2 )); then
-            if ! cp -- "$fm_viewport_candidate" "$destination"; then return 1; fi
-            fm_observer_receipt "$destination.capture.exit" viewport-capture-exit 0 || return 1
-            fm_observer_receipt "$destination.stable-polls" viewport-stable-polls "$polls" || return 1
-            return 0
-          fi
+        else
+          if ! cp -- "$fm_viewport_candidate" "$fm_viewport_stable"; then return 1; fi
+          stable=1
+          stable_valid=1
         fi
-        sleep 0.05
+        if (( stable >= 2 )); then
+          if ! cp -- "$fm_viewport_candidate" "$destination"; then return 1; fi
+          fm_observer_receipt "$destination.capture.exit" viewport-frame-capture-exit 0 || return 1
+          fm_observer_receipt "$destination.stable-polls" viewport-frame-stable-polls "$polls" || return 1
+          return 0
+        fi
       done
-      fm_observer_receipt "$destination.capture.exit" viewport-capture-exit poll-budget-exhausted || true
+      fm_observer_receipt "$destination.capture.exit" viewport-frame-capture-exit shared-budget-exhausted || true
       return 1
     }
-    if tmux -L "$TMUX_SOCKET" send-keys -t "$TMUX_SESSION" C-Home 2> "$FM_EVIDENCE_DIR/viewport-ctrl-home.stderr"; then
-      fm_observer_receipt "$FM_EVIDENCE_DIR/viewport-ctrl-home.exit" viewport-ctrl-home-exit 0 || true
-      if fm_viewport_wait "$default_snapshot" "$FM_EVIDENCE_DIR/viewport-frame-00-top.txt" 0 112; then
+    fm_viewport_wait_restore() {
+      local expected=$1 destination=$2 poll_limit=$3 polls=0 stable=0 usable_rc compare_rc
+      while (( fm_viewport_budget_ticks < poll_limit )); do
+        ((polls += 1))
+        if ! fm_viewport_capture "$destination" viewport-restore "$poll_limit"; then return 1; fi
+        if fm_viewport_usable "$fm_viewport_candidate"; then
+          :
+        else
+          usable_rc=$?
+          stable=0
+          if [[ "$usable_rc" != 1 ]]; then
+            fm_observer_receipt "$destination.capture.usable" viewport-restore-usable comparison-error || true
+            return 1
+          fi
+          continue
+        fi
+        if fm_viewport_compare "$fm_viewport_candidate" "$expected"; then
+          ((stable += 1))
+        else
+          compare_rc=$?
+          stable=0
+          if [[ "$compare_rc" != 1 ]]; then
+            fm_observer_receipt "$destination.capture.compare" viewport-restore-compare comparison-error || true
+            return 1
+          fi
+          continue
+        fi
+        if (( stable >= 2 )); then
+          if ! cp -- "$fm_viewport_candidate" "$destination"; then return 1; fi
+          fm_observer_receipt "$destination.capture.exit" viewport-restore-capture-exit 0 || return 1
+          fm_observer_receipt "$destination.tail-matching-polls" viewport-tail-matching-polls "$polls" || return 1
+          return 0
+        fi
+      done
+      fm_observer_receipt "$destination.capture.exit" viewport-restore-capture-exit shared-budget-exhausted || true
+      return 1
+    }
+    if fm_viewport_capture "$fm_viewport_tail" viewport-tail-baseline 112 && fm_viewport_usable "$fm_viewport_candidate" && grep -Fq -- "The deterministic tool example is complete." "$fm_viewport_candidate" && cp -- "$fm_viewport_candidate" "$fm_viewport_tail"; then
+      fm_observer_receipt "$FM_EVIDENCE_DIR/viewport-tail-baseline.status" viewport-tail-baseline-status captured-current-tail || true
+    else
+      fm_viewport_tail=
+      fm_observer_receipt "$FM_EVIDENCE_DIR/viewport-tail-baseline.status" viewport-tail-baseline-status UNKNOWN || true
+    fi
+    if [[ -n "$fm_viewport_tail" ]] && fm_viewport_send_key C-Home "$FM_EVIDENCE_DIR/viewport-ctrl-home.exit" 112; then
+      if fm_viewport_wait_navigation "$fm_viewport_tail" "$FM_EVIDENCE_DIR/viewport-frame-00-top.txt" 112; then
         fm_viewport_index=1
         if grep -Fq -- "Show a deterministic tool example." "$FM_EVIDENCE_DIR/viewport-frame-00-top.txt"; then
           fm_viewport_top=visible
@@ -106,23 +232,17 @@ OBSERVER = br"""  fm_observer_receipt() {
         if grep -Fq -- "CALM_E2E_OUTPUT" "$FM_EVIDENCE_DIR/viewport-frame-00-top.txt"; then
           fm_viewport_marker=viewport-frame-00-top.txt
         fi
-        while (( fm_viewport_index <= 16 && fm_viewport_polls < 112 )) && [[ "$fm_viewport_top" == visible && "$fm_viewport_bottom" != visible ]]; do
+        while (( fm_viewport_index <= 16 && fm_viewport_budget_ticks < 112 )) && [[ "$fm_viewport_top" == visible && "$fm_viewport_bottom" != visible ]]; do
           local_frame=$(printf '%02d' "$fm_viewport_index")
           previous_frame=$(printf '%02d' "$((fm_viewport_index - 1))")
-          if grep -Fq -- "The deterministic tool example is complete." "$FM_EVIDENCE_DIR/viewport-frame-${previous_frame}-"*.txt 2>/dev/null; then
+          previous_path="$FM_EVIDENCE_DIR/viewport-frame-${previous_frame}-$( [[ "$previous_frame" == 00 ]] && printf top || printf page ).txt"
+          if grep -Fq -- "The deterministic tool example is complete." "$previous_path"; then
             fm_viewport_bottom=visible
             break
           fi
-          if tmux -L "$TMUX_SOCKET" send-keys -t "$TMUX_SESSION" NPage 2> "$FM_EVIDENCE_DIR/viewport-npage-${local_frame}.stderr"; then
-            fm_observer_receipt "$FM_EVIDENCE_DIR/viewport-npage-${local_frame}.exit" viewport-npage-exit 0 || true
-          else
-            rc=$?
-            fm_observer_receipt "$FM_EVIDENCE_DIR/viewport-npage-${local_frame}.exit" viewport-npage-exit "$rc" || true
-            break
-          fi
-          previous_path="$FM_EVIDENCE_DIR/viewport-frame-${previous_frame}-$( [[ "$previous_frame" == 00 ]] && printf top || printf page ).txt"
+          if ! fm_viewport_send_key NPage "$FM_EVIDENCE_DIR/viewport-npage-${local_frame}.exit" 112; then break; fi
           current_path="$FM_EVIDENCE_DIR/viewport-frame-${local_frame}-page.txt"
-          if ! fm_viewport_wait "$previous_path" "$current_path" 0 112; then break; fi
+          if ! fm_viewport_wait_navigation "$previous_path" "$current_path" 112; then break; fi
           fm_viewport_page_count=$((fm_viewport_page_count + 1))
           fm_viewport_index=$((fm_viewport_index + 1))
           if grep -Fq -- "CALM_E2E_OUTPUT" "$current_path" && [[ "$fm_viewport_marker" == absent ]]; then
@@ -133,9 +253,6 @@ OBSERVER = br"""  fm_observer_receipt() {
           fi
         done
       fi
-    else
-      rc=$?
-      fm_observer_receipt "$FM_EVIDENCE_DIR/viewport-ctrl-home.exit" viewport-ctrl-home-exit "$rc" || true
     fi
     if [[ "$fm_viewport_top" == visible && "$fm_viewport_bottom" == visible ]]; then
       if [[ "$fm_viewport_marker" == absent ]]; then
@@ -144,22 +261,18 @@ OBSERVER = br"""  fm_observer_receipt() {
         fm_viewport_outcome=complete-traversal-marker-visible
       fi
     fi
-    fm_observer_receipt "$FM_EVIDENCE_DIR/viewport-traversal.status" viewport-traversal-status "outcome=$fm_viewport_outcome top=$fm_viewport_top bottom=$fm_viewport_bottom marker=$fm_viewport_marker pages=$fm_viewport_page_count polls=$fm_viewport_polls" || true
-    if tmux -L "$TMUX_SOCKET" send-keys -t "$TMUX_SESSION" C-End 2> "$FM_EVIDENCE_DIR/viewport-ctrl-end.stderr"; then
-      fm_observer_receipt "$FM_EVIDENCE_DIR/viewport-ctrl-end.exit" viewport-ctrl-end-exit 0 || true
-      if fm_viewport_wait "$default_snapshot" "$FM_EVIDENCE_DIR/viewport-restored-tail.txt" 1 120 && cmp -s -- "$default_snapshot" "$FM_EVIDENCE_DIR/viewport-restored-tail.txt"; then
-        fm_observer_receipt "$FM_EVIDENCE_DIR/viewport-restored-tail.status" viewport-restored-tail-status byte-identical-to-original-default-snapshot || true
-      else
-        fm_observer_receipt "$FM_EVIDENCE_DIR/viewport-restored-tail.status" viewport-restored-tail-status UNKNOWN || true
-        fm_viewport_outcome=UNKNOWN
-      fi
+    fm_observer_receipt "$FM_EVIDENCE_DIR/viewport-traversal.status" viewport-traversal-status "outcome=$fm_viewport_outcome top=$fm_viewport_top bottom=$fm_viewport_bottom marker=$fm_viewport_marker pages=$fm_viewport_page_count polls=$fm_viewport_polls budget_ticks=$fm_viewport_budget_ticks" || true
+    fm_viewport_restore_key=failed
+    if fm_viewport_send_key C-End "$FM_EVIDENCE_DIR/viewport-ctrl-end.exit" 120; then
+      fm_viewport_restore_key=sent
+    fi
+    if [[ -n "$fm_viewport_tail" ]] && fm_viewport_wait_restore "$fm_viewport_tail" "$FM_EVIDENCE_DIR/viewport-restored-tail.txt" 120 && [[ "$fm_viewport_restore_key" == sent ]]; then
+      fm_observer_receipt "$FM_EVIDENCE_DIR/viewport-restored-tail.status" viewport-restored-tail-status byte-identical-to-initial-current-viewport || true
     else
-      rc=$?
-      fm_observer_receipt "$FM_EVIDENCE_DIR/viewport-ctrl-end.exit" viewport-ctrl-end-exit "$rc" || true
       fm_observer_receipt "$FM_EVIDENCE_DIR/viewport-restored-tail.status" viewport-restored-tail-status UNKNOWN || true
       fm_viewport_outcome=UNKNOWN
     fi
-    fm_observer_receipt "$FM_EVIDENCE_DIR/viewport-diagnostic.status" viewport-diagnostic-status "outcome=$fm_viewport_outcome top=$fm_viewport_top bottom=$fm_viewport_bottom marker=$fm_viewport_marker pages=$fm_viewport_page_count polls=$fm_viewport_polls" || true
+    fm_observer_receipt "$FM_EVIDENCE_DIR/viewport-diagnostic.status" viewport-diagnostic-status "outcome=$fm_viewport_outcome top=$fm_viewport_top bottom=$fm_viewport_bottom marker=$fm_viewport_marker pages=$fm_viewport_page_count polls=$fm_viewport_polls budget_ticks=$fm_viewport_budget_ticks" || true
     rm -f -- "$fm_viewport_candidate" "$fm_viewport_stable"
   fi
   fm_observer_receipt "$FM_EVIDENCE_DIR/default-checkpoint.reached" default-checkpoint-reached reached || fail "observer could not retain checkpoint completion"
