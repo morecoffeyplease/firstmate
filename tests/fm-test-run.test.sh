@@ -459,6 +459,51 @@ test_changed_bin_reference_selects_per_script_not_per_family() {
   pass "a bin reference selects the referencing scripts, and consumers still select their curated families"
 }
 
+test_changed_issue_status_python_helpers_select_their_contracts() {
+  local tmp repo helper listed
+  tmp=$(mktemp -d "${TMPDIR:-/tmp}/fm-test-run-python-helper.XXXXXX")
+  repo="$tmp/repo"
+  init_changed_fixture_repo "$repo"
+  mkdir -p "$repo/bin"
+  : >"$repo/bin/fm-lane-exec.py"
+  : >"$repo/bin/fm-lane-signal-witness.py"
+  : >"$repo/bin/fm_issue_event_guard.py"
+  : >"$repo/bin/fm_issues_derive.py"
+  : >"$repo/bin/fm_lane_receipts.py"
+  : >"$repo/bin/fm_project_lanes.py"
+  : >"$repo/tests/fm-lane-runner-contract.test.sh"
+  : >"$repo/tests/fm-issues.test.sh"
+  : >"$repo/tests/fm-issues-correction.test.sh"
+  : >"$repo/tests/fm-issues-summary-routing.test.sh"
+  : >"$repo/tests/fm-brief-lane-receipts.test.sh"
+  git -C "$repo" add bin tests
+  git -C "$repo" -c user.name=test -c user.email=test@example.invalid commit -qm python-helper-baseline
+
+  for helper in fm-lane-exec.py fm-lane-signal-witness.py; do
+    printf '\n' >>"$repo/bin/$helper"
+    listed=$(cd "$repo" && bin/fm-test-run.sh --list --changed --base HEAD)
+    assert_contains "$listed" "tests/fm-lane-runner-contract.test.sh" \
+      "$helper selects its wrapper contract test"
+    git -C "$repo" add "bin/$helper"
+    git -C "$repo" -c user.name=test -c user.email=test@example.invalid commit -qm "change $helper"
+  done
+
+  for helper in fm_issue_event_guard.py fm_issues_derive.py fm_lane_receipts.py fm_project_lanes.py; do
+    printf '\n' >>"$repo/bin/$helper"
+    listed=$(cd "$repo" && bin/fm-test-run.sh --list --changed --base HEAD)
+    for script in fm-issues.test.sh fm-issues-correction.test.sh \
+      fm-issues-summary-routing.test.sh fm-lane-runner-contract.test.sh \
+      fm-brief-lane-receipts.test.sh; do
+      assert_contains "$listed" "tests/$script" "$helper selects $script"
+    done
+    git -C "$repo" add "bin/$helper"
+    git -C "$repo" -c user.name=test -c user.email=test@example.invalid commit -qm "change $helper"
+  done
+
+  rm -rf "$tmp"
+  pass "changed selection maps issue status Python helpers to their contract tests"
+}
+
 # Exercise begin/end markers from real fixture processes to prove the automatic
 # changed-suite default and its explicit serial override.
 test_changed_uses_bounded_automatic_concurrency() {
@@ -1745,6 +1790,7 @@ test_changed_runner_surfaces_select_their_family
 test_shell_line_ending_policy_selects_runner_contract
 test_changed_dependency_selection_and_unmapped_failure
 test_changed_bin_reference_selects_per_script_not_per_family
+test_changed_issue_status_python_helpers_select_their_contracts
 test_changed_uses_bounded_automatic_concurrency
 test_windows_posix_mode_emulation_does_not_fail_parallel_runs
 test_script_list_uses_bounded_automatic_concurrency

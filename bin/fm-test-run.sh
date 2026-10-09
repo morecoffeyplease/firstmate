@@ -709,7 +709,10 @@ tests/fm-extension-binding.test.sh 7398
 tests/fm-fleet-snapshot-view.test.sh 8547
 tests/fm-fleet-sync.test.sh 37749
 tests/fm-gitignore-config.test.sh 62
+tests/fm-issues-correction.test.sh 581
+tests/fm-issues-summary-routing.test.sh 4954
 tests/fm-issues.test.sh 4205
+tests/fm-lane-runner-contract.test.sh 3036
 tests/fm-gotmp.test.sh 1310
 tests/fm-grok-continuity-live-e2e.test.sh 20
 tests/fm-grok-stop-live-e2e.test.sh 21
@@ -1345,6 +1348,20 @@ families_for_changed_path() {
       # pure-contract-unit script. It runs each candidate directly, never
       # through run_script_bounded, so it cannot regress fixture Git isolation.
       printf '%s\n' pure-contract-unit
+      ;;
+    bin/fm-lane-exec.py|bin/fm-lane-signal-witness.py)
+      # The wrapper dispatches this Python child by path, so source-name
+      # scanning cannot discover the runner contract test that exercises it.
+      printf '%s\n' "__script__:fm-lane-runner-contract.test.sh"
+      ;;
+    bin/fm_issue_event_guard.py|bin/fm_issues_derive.py|bin/fm_lane_receipts.py|bin/fm_project_lanes.py)
+      # These Python modules are imported indirectly by the issue, summary,
+      # launch, and receipt entrypoints below, so filename scanning misses them.
+      printf '%s\n' "__script__:fm-issues.test.sh"
+      printf '%s\n' "__script__:fm-issues-correction.test.sh"
+      printf '%s\n' "__script__:fm-issues-summary-routing.test.sh"
+      printf '%s\n' "__script__:fm-lane-runner-contract.test.sh"
+      printf '%s\n' "__script__:fm-brief-lane-receipts.test.sh"
       ;;
     bin/backends/herdr*|bin/fm-herdr-lab.sh|tests/herdr-test-safety.sh|tests/herdr-client-pair-fixture.sh)
       printf '%s\n' real-herdr-gated
