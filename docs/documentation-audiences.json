@@ -357,6 +357,10 @@
       "audience": "maintainer-verification"
     },
     {
+      "path": "docs/fm-lint-shards.md",
+      "audience": "maintainer-verification"
+    },
+    {
       "path": "docs/fm-test-portable-shards.md",
       "audience": "maintainer-verification"
     },
