@@ -166,18 +166,18 @@ assert subprocess.run([str(wrapper), "full"], cwd=worktree, env=receipt_env, cap
 time.sleep(1.05)
 observed = projection()
 task_a = next(task for row in observed["rows"] for task in row["tasks"] if task["id"] == "task-a")
-assert task_a["verification"]["focused"]["status"] == "passed" and task_a["verification"]["full"]["status"] == "passed" and task_a["verification"]["verify"]["status"] == "not run", "current focused/full receipt qualification was incorrect"
+assert task_a["verification"]["focused"]["status"] == "passed" and task_a["verification"]["full"]["status"] == "passed" and task_a["verification"]["verify"]["status"] == "not run", f"current focused/full receipt qualification was incorrect: {task_a['verification']!r}"
 task_b = next(task for row in observed["rows"] for task in row["tasks"] if task["id"] == "task-b")
 assert task_b["verification"]["full"]["status"] == "not instrumented", "legacy task without launch receipt binding was given a run status"
 full_receipt = max((path for path in (home / "data" / "task-a" / "lane-receipts").glob("full-*.json") if json.loads(path.read_text()).get("phase") == "finish"), key=lambda path: json.loads(path.read_text())["started_epoch"])
 full_value = json.loads(full_receipt.read_text())
 full_value["argv"] = ["/bin/echo", "filtered-configured-argv"]
 full_receipt.write_text(json.dumps(full_value))
-filtered = projection()
+filtered = projection(("--refresh",))
 task_a = next(task for row in filtered["rows"] for task in row["tasks"] if task["id"] == "task-a")
 assert task_a["verification"]["full"]["status"] == "not run" and task_a["verification"]["focused"]["status"] == "reclassified focused run; outcome passed", "filtered full lane receipt did not preserve its focused outcome"
 (home / "data" / "task-a" / "lane-receipts" / ".instrumented").write_text("wrong-generation\n")
-conflicted = projection()
+conflicted = projection(("--refresh",))
 task_a = next(task for row in conflicted["rows"] for task in row["tasks"] if task["id"] == "task-a")
 assert task_a["verification"]["full"]["status"] == "unknown", "launch generation conflict was silently treated as not instrumented"
 (home / "data" / "task-a" / "lane-receipts" / ".instrumented").write_text("gen-1\n")
@@ -221,17 +221,18 @@ request_file = next((home / "state" / "status-summary" / "requests").glob("*.jso
 record = json.loads(request_file.read_text())
 textfile = tmp / "summary.txt"
 textfile.write_text("Fixture project summary.\n")
-basis = projection()
-put = [sys.executable, str(root / "bin" / "fm-issues.py"), "summary", "put", record["id"], "alpha", "--basis-fingerprint", basis["fingerprint"], "--basis-transition-watermark", basis["transition_watermark"], "--basis-observed-at", str(basis["generated_epoch"]), "--author", "fixture-worker", "--text-file", str(textfile)]
+basis = json.loads(subprocess.check_output([sys.executable, str(root / "bin" / "fm-issues.py"), "summary", "basis", record["id"], "--project", "alpha"], cwd=root, env=env, text=True))
+put = [sys.executable, str(root / "bin" / "fm-issues.py"), "summary", "put", record["id"], "alpha", "--basis-fingerprint", basis["fingerprint"], "--basis-transition-watermark", basis["transition_watermark"], "--basis-observed-at", str(basis["observed_epoch"]), "--author", "main-home", "--text-file", str(textfile)]
 written = json.loads(subprocess.check_output(put, cwd=root, env=env, text=True))
 assert written["status"] == "written", "summary with unchanged basis did not publish"
 req3 = json.loads(subprocess.check_output(request_cmd, cwd=root, env=env, text=True))
 assert req3["status"] == "pending", "completed request could not be retried as a fresh bounded request"
 request_file = home / "state" / "status-summary" / "requests" / f"{req3['request']}.json"
 record = json.loads(request_file.read_text())
+next_basis = json.loads(subprocess.check_output([sys.executable, str(root / "bin" / "fm-issues.py"), "summary", "basis", record["id"], "--project", "alpha"], cwd=root, env=env, text=True))
 snapshot["tasks"][0]["current_state"]["state"] = "paused"
 (home / "state" / "issue-status" / "fleet.json").write_text(json.dumps({"schema": "fm-issue-fleet-cache.v1", "collected_epoch": int(time.time()), "snapshot": snapshot, "error": None}))
-put = [sys.executable, str(root / "bin" / "fm-issues.py"), "summary", "put", record["id"], "alpha", "--basis-fingerprint", basis["fingerprint"], "--basis-transition-watermark", basis["transition_watermark"], "--basis-observed-at", str(basis["generated_epoch"]), "--author", "fixture-worker", "--text-file", str(textfile)]
+put = [sys.executable, str(root / "bin" / "fm-issues.py"), "summary", "put", record["id"], "alpha", "--basis-fingerprint", next_basis["fingerprint"], "--basis-transition-watermark", next_basis["transition_watermark"], "--basis-observed-at", str(next_basis["observed_epoch"]), "--author", "main-home", "--text-file", str(textfile)]
 outdated = json.loads(subprocess.check_output(put, cwd=root, env=env, text=True))
 assert outdated["status"] == "outdated", "status change during summary composition was not marked outdated"
 record = json.loads(request_file.read_text())

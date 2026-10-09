@@ -470,7 +470,7 @@ def lane_status(home: Path, task: dict, project: str, configured: dict[str, list
             current_head = subprocess.run(["git", "-C", worktree, "rev-parse", "HEAD"], capture_output=True, text=True, timeout=3).stdout.strip()
         except (OSError, subprocess.SubprocessError):
             pass
-    if "source_dirty" in task:
+    if isinstance(task.get("source_dirty"), bool):
         current_dirty = task.get("source_dirty")
     elif isinstance(task.get("source"), dict) and "dirty" in task["source"]:
         current_dirty = task["source"].get("dirty")
@@ -784,7 +784,7 @@ def _make_projection(home: Path, project: str, refresh: bool = False) -> dict:
             rows.append({"url": url, "number": None, "title": None, "forge_state": "unknown", "visibility": visibility, "identity_check": identity, "tasks": linked, "stage": "Unknown", "changed": {"class": "unknown"}})
             continue
         chosen_task = min(linked, key=task_rank) if linked else None
-        chosen = chosen_task["stage"] if chosen_task else ("Unstarted" if issue["state"] == "open" and remote_issue_coverage["complete"] else ("Unknown" if issue["state"] == "open" else "Closed without delivery"))
+        chosen = chosen_task.get("stage", "Unknown") if chosen_task else ("Unstarted" if issue["state"] == "open" and remote_issue_coverage["complete"] else ("Unknown" if issue["state"] == "open" else "Closed without delivery"))
         conflicts = [conflict for task in linked for conflict in task.get("conflicts", [])]
         if issue["state"] == "closed" and any(task.get("task_state") in ("working", "busy", "paused", "running") for task in linked):
             conflicts.append("forge issue is closed while local task remains active")

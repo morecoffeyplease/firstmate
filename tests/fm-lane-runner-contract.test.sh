@@ -61,7 +61,7 @@ assert full.stdout == "full\n" and full_value["argv"] == ["/bin/echo", "full"]
 # and exits successfully; it does not rewrite the child's exact exit result.
 signal_child = tmp / "signal-child.py"
 signal_child.write_text("import signal,time\nsignal.signal(signal.SIGTERM, lambda *_: exit(0))\nprint('ready',flush=True)\ntime.sleep(10)\n")
-proc = subprocess.Popen([str(wrapper), "focused", "--", sys.executable, str(signal_child)], cwd=repo, env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+proc = subprocess.Popen([str(wrapper), "focused", "--", sys.executable, str(signal_child)], cwd=repo, env=env, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
 assert proc.stdout.readline().strip() == "ready"
 proc.send_signal(signal.SIGTERM)
 stdout, stderr = proc.communicate(timeout=5)
@@ -73,7 +73,7 @@ assert signal_receipt["received_signal"] == signal.SIGTERM and signal_receipt["e
 # termination semantics in the caller.
 interrupt_child = tmp / "interrupt-child.py"
 interrupt_child.write_text("import time\nprint('ready',flush=True)\ntime.sleep(10)\n")
-proc = subprocess.Popen([str(wrapper), "focused", "--", sys.executable, str(interrupt_child)], cwd=repo, env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+proc = subprocess.Popen([str(wrapper), "focused", "--", sys.executable, str(interrupt_child)], cwd=repo, env=env, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, preexec_fn=lambda: signal.signal(signal.SIGINT, signal.SIG_DFL))
 assert proc.stdout.readline().strip() == "ready"
 proc.send_signal(signal.SIGINT)
 stdout, stderr = proc.communicate(timeout=5)

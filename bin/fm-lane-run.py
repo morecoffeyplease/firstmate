@@ -148,6 +148,20 @@ def write_error(directory: Path, task: str, generation: str, lane: str, message:
         pass
 
 
+def invalidate_issue_projection(home: Path | None, project: str | None) -> None:
+    if home is None or not project:
+        return
+    cache_dir = home / "state" / "issue-status"
+    try:
+        if cache_dir.is_symlink() or (cache_dir.exists() and not cache_dir.is_dir()):
+            return
+        path = cache_dir / f"projection-{hashlib.sha256(project.encode()).hexdigest()}.json"
+        if not path.is_symlink():
+            path.unlink(missing_ok=True)
+    except OSError:
+        pass
+
+
 def main(argv: list[str]) -> int:
     if not argv or argv[0] not in LANES:
         print("usage: fm-lane-run.sh focused -- <command> [args...] | full | verify", file=sys.stderr)
@@ -213,6 +227,8 @@ def main(argv: list[str]) -> int:
             if validated_receipt_dir:
                 write_error(receipt_dir, task, generation, lane, str(exc))
             receipt_path = None
+    if validated_receipt_dir:
+        invalidate_issue_projection(home, project)
     child = None
     received: list[int] = []
     sigint_stop = threading.Event()
@@ -459,6 +475,7 @@ def main(argv: list[str]) -> int:
                 candidate.unlink(missing_ok=True)
         except OSError as exc:
             write_error(validated_receipt_dir or receipt_dir, task, generation, lane, str(exc))
+        invalidate_issue_projection(home, project)
     if child_signal is not None:
         signal.signal(child_signal, signal.SIG_DFL)
         os.kill(os.getpid(), child_signal)
