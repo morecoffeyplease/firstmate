@@ -655,9 +655,10 @@ list_portable_serial() {
 }
 
 # Measured portable-serial script durations in milliseconds, from the CI timing
-# artifacts recorded in docs/fm-test-portable-shards.md. Each value is the
+# artifacts recorded in docs/fm-test-portable-shards.md. Most values are the
 # slowest of several green runs, so the balance holds on a slow runner rather
-# than only on the fastest one measured. These are balance hints only: the shard
+# than only on the fastest one measured. Single-run provisional values are
+# identified in that document. These are balance hints only: the shard
 # partition stays complete and disjoint whatever they say, so a stale hint costs
 # balance rather than coverage. That doc owns the refresh procedure.
 portable_serial_weight_hints() {
@@ -707,6 +708,7 @@ tests/fm-extension-binding.test.sh 7398
 tests/fm-fleet-snapshot-view.test.sh 8547
 tests/fm-fleet-sync.test.sh 37749
 tests/fm-gitignore-config.test.sh 62
+tests/fm-issues.test.sh 4205
 tests/fm-gotmp.test.sh 1310
 tests/fm-grok-continuity-live-e2e.test.sh 20
 tests/fm-grok-stop-live-e2e.test.sh 21

@@ -1529,6 +1529,7 @@ reconcile_close() {
     [ "$PARENT_HOLD_PUBLISHED" = 1 ] \
       || fail "could not publish the reconciled captain-held task $id to its parent"
     reconcile_request_retire "$id"
+    issue_event_for_task "$id" reconciled
     printf 'reconciled: %s\n' "$id"
     return 0
   fi
@@ -1552,6 +1553,7 @@ reconcile_close() {
   [ "$PARENT_HOLD_PUBLISHED" = 1 ] \
     || fail "could not publish the reconciled captain-held task $id to its parent"
   reconcile_request_retire "$id"
+  issue_event_for_task "$id" reconciled
   printf 'reconciled: %s\n' "$id"
 }
 
@@ -1929,14 +1931,16 @@ case "${1:-}" in
   hold)
     shift
     task_id=${1:-}
-    if command_hold "$@"; then issue_event_for_task "$task_id" held; else exit $?; fi
+    command_hold "$@"
+    issue_event_for_task "$task_id" held
     ;;
   answer)
     shift
     task_id=${1:-}
     event_kind=answered
     for arg in "$@"; do [ "$arg" != --release ] || event_kind=released; done
-    if command_answer "$@"; then issue_event_for_task "$task_id" "$event_kind"; else exit $?; fi
+    command_answer "$@"
+    issue_event_for_task "$task_id" "$event_kind"
     ;;
   answers) shift; command_answers "$@" ;;
   reconcile-requests) shift; command_reconcile_requests "$@" ;;

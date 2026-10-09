@@ -1048,6 +1048,23 @@ secondmate_home_summary_json() {  # <backlog-json-file> <tasks-json-file> <produ
     | ($captain_holds_all
        + ([ $tasks[] as $t | ($t.hints.open_decisions // [])[]
             | {id:$t.id,key,verb,summary:(.summary | trunc(160)),reason:null,source:"status"} ])) as $decisions_all
+    | ([ $backlog.records[]?
+         | select((.state == "in_flight" or .state == "queued") and .kind != "secondmate") as $work
+         | ([$tasks[]? | select(.id == $work.id)] | first) as $task
+         | {id:$work.id,
+            generation:($task.spawn_gen // null),
+            kind:($work.kind // $task.kind // null),
+            current_state:($task.current_state // {state:"unknown",source:"child metadata unavailable"}),
+            backlog:{state:$work.state,kind:($work.kind // null),title:(($work.title // "") | trunc(160)),
+              links:((if ($work.links | type) == "array" then $work.links else [] end) | map(select(type == "string") | trunc(500))[:20]),
+              repo:((($work.repo // null) | if . == null then null else trunc(120) end)),
+              pr_url:((($task.pr.url // $work.pr_url // null) | if . == null then null else trunc(500) end)),
+              pr_head:((($task.pr.head // null) | if . == null then null else trunc(120) end)),
+              blocked_by:((($work.blocked_by // null) | if . == null then null else trunc(120) end)),
+              unresolved_blocker_ids:((if ($work.unresolved_blocker_ids | type) == "array" then $work.unresolved_blocker_ids else [] end) | map(trunc(120))[:30]),
+              hold_reason:((($work.hold_reason // null) | if . == null then null else trunc(160) end)),
+              hold_kind:((($work.hold_kind // null) | if . == null then null else trunc(40) end)),
+              hold_bucket:($work.hold_bucket // null)}} ]) as $issue_tasks_all
     | ([ $queued_all[]
          | select((.unresolved_blocker_ids | length) > 0 or (.hold_reason != null and .hold_kind != null))
          | {id:(.id | trunc(120)),title:(.title | trunc(90)),
@@ -1096,6 +1113,7 @@ secondmate_home_summary_json() {  # <backlog-json-file> <tasks-json-file> <produ
         invalidity:$invalidity,
         state:$state,
         active_children:$active_all[:$child_n],
+        issue_tasks:$issue_tasks_all[:$queued_n],
         decisions_open:$decisions_all[:$decisions_n],
         product_decisions:$product_decisions.open,
         product_decision_count:$product_decisions.total,
@@ -1123,6 +1141,7 @@ secondmate_home_summary_json() {  # <backlog-json-file> <tasks-json-file> <produ
           endpoint:(.endpoint + {target:((.endpoint.target // null) | if . == null then null else trunc(240) end)})}][:$child_n]),
         counts:{
           active_children:($active_all | length),
+          issue_tasks:($issue_tasks_all | length),
           decisions_open:($decisions_all | length),
           holds:($holds_all | length),
           queued:($queued_all | length),
@@ -1131,6 +1150,7 @@ secondmate_home_summary_json() {  # <backlog-json-file> <tasks-json-file> <produ
         },
         omitted:[
           (if ($active_all | length) > $child_n then {surface:"active_children",count:(($active_all | length) - $child_n)} else empty end),
+          (if ($issue_tasks_all | length) > $queued_n then {surface:"issue_tasks",count:(($issue_tasks_all | length) - $queued_n)} else empty end),
           (if ($decisions_all | length) > $decisions_n then {surface:"decisions_open",count:(($decisions_all | length) - $decisions_n)} else empty end),
           (if ($queued_all | length) > $queued_n then {surface:"queued",count:(($queued_all | length) - $queued_n)} else empty end),
           (if ($tasks | length) > $child_n then {surface:"endpoints",count:(($tasks | length) - $child_n)} else empty end),
@@ -1372,13 +1392,22 @@ length == 1 and (.[0] |
   and (.generated_epoch | type) == "number" and .generated_epoch >= 0 and (.generated_epoch | floor) == .generated_epoch
   and (.valid | type) == "boolean" and (.state | type) == "string"
   and (.invalidity | type) == "object" and (.invalidity.ids | type) == "array"
-  and (.active_children | type) == "array" and (.decisions_open | type) == "array"
+  and (.active_children | type) == "array" and ((.issue_tasks // []) | type) == "array"
+  and all((.issue_tasks // [])[];
+    (.id | type) == "string" and (.generation == null or (.generation | type) == "string")
+    and (.kind == null or (.kind | type) == "string")
+    and (.current_state | type) == "object" and (.backlog | type) == "object"
+    and (.backlog.state | IN("queued","in_flight")) and (.backlog.links | type) == "array"
+    and all(.backlog.links[]; type == "string" and length <= 500))
+  and (.decisions_open | type) == "array"
   and ((.product_decisions // []) | type) == "array"
   and ((.product_decision_count // 0) | type) == "number"
   and ((.product_decision_omitted // 0) | type) == "number"
   and (.holds | type) == "array" and (.queued | type) == "array"
   and (.landed | type) == "array" and (.endpoints | type) == "array"
-  and (.counts | type) == "object" and (.omitted | type) == "array"
+  and (.counts | type) == "object" and ((.counts.issue_tasks // 0) | type) == "number"
+  and (.omitted | type) == "array"
+  and ((.counts.issue_tasks // 0) == (((.issue_tasks // []) | length) + (([.omitted[] | select(.surface == "issue_tasks") | (.count // 0)] | add) // 0)))
 )
 JQ
   snapshot_cache_prepare || true
@@ -1879,6 +1908,7 @@ secondmate_current_json() {  # <parent-tasks-json-file> <output-file>
            trust:(if $summary_valid then "complete" else "partial-structured" end),parent_event_role:"historical-only"},
          freshness:{status:$summary_freshness,observed_at:$observed,age_seconds:$summary_age},
          active_children:$summary.active_children,
+         issue_tasks:($summary.issue_tasks // []),
          decisions_open:$summary.decisions_open,
          product_decisions:($summary.product_decisions // []),
          product_decision_count:($summary.product_decision_count // 0),
@@ -1916,7 +1946,7 @@ secondmate_current_json() {  # <parent-tasks-json-file> <output-file>
          reconcile_inventory:(if $summary_sampled then $summary.invalidity else null end),
          provenance:{selected:$provenance,structured_home:($home | if . == "" then null else . end),parent_event_role:"fallback-only-not-current"},
          freshness:{status:$freshness,observed_at:$observed,age_seconds:$event_age},
-         active_children:[],decisions_open:[],holds:[],queued:[],landed:[],endpoints:[],counts:{active_children:0,decisions_open:0,holds:0,queued:0,landed:0,endpoints:0},omitted:[],
+         active_children:[],issue_tasks:[],decisions_open:[],holds:[],queued:[],landed:[],endpoints:[],counts:{active_children:0,issue_tasks:0,decisions_open:0,holds:0,queued:0,landed:0,endpoints:0},omitted:[],
          parent_event:{raw:$event_raw,note:$event_note,age_seconds:$event_age,open_activities:$activities,open_decisions:$decisions,activity_scan:$activity_scan},
          terminal_evidence:$terminal,contradiction:false}' >> "$records_file" || return 1
     fi

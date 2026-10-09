@@ -101,8 +101,8 @@ jq_lib() { # jq options/program via final argument
   jq -L "$SCRIPT_DIR" "$@" "include \"fm-contributions\"; $program"
 }
 
-catalog() { # <owner/repository>; observational, never touches ownership or wake state
-  local repo=$1 owner name raw rc
+catalog() { # <owner/repository> [known issue numbers...]; observational, never touches ownership or wake state
+  local repo=$1 owner name raw rc pagination_error number status identity_error checks="$TMP/catalog-identities.jsonl"
   case "$repo" in
     */*) owner=${repo%%/*}; name=${repo#*/} ;;
     *) fail 'catalog needs canonical owner/repository' ;;
@@ -111,21 +111,37 @@ catalog() { # <owner/repository>; observational, never touches ownership or wake
   case "$name" in ''|*'/'*|*[!A-Za-z0-9._-]*) fail 'invalid canonical owner/repository' ;; esac
   raw="$TMP/catalog-pages.jsonl"
   rc=0
-  GH_PROMPT_DISABLED=1 GH_NO_UPDATE_NOTIFIER=1 \
-    gh-axi api "repos/$owner/$name/issues?state=all&per_page=100" --paginate --jq '.[]' --full \
-      > "$raw" 2> "$TMP/catalog.err" || rc=$?
-  if [ "$rc" -ne 0 ]; then
-    cat "$TMP/catalog.err" >&2
-    return "$rc"
-  fi
-  jq -s --arg repo "$repo" --arg now "$NOW" '
+  forge api "repos/$owner/$name/issues?state=all&per_page=100" --paginate --jq '.[]' > "$raw" || rc=$?
+  pagination_error=$(tail -c 500 "$TMP/forge.err" 2>/dev/null || true)
+  : > "$checks"
+  shift
+  for number in "$@"; do
+    case "$number" in ''|*[!0-9]*|0) fail 'known issue identity must be a positive issue number' ;; esac
+    [ "${#number}" -le 12 ] || fail 'known issue identity is too large'
+    status=checked
+    identity_error=''
+    if forge api "repos/$owner/$name/issues/$number" > "$TMP/catalog-identity.json"; then
+      if ! jq -e --arg expected "https://github.com/$repo/issues/$number" '(.html_url | type) == "string" and (.html_url | ascii_downcase) == ($expected | ascii_downcase)' "$TMP/catalog-identity.json" >/dev/null 2>&1; then
+        status=unknown
+        identity_error='forge response did not match the known issue identity'
+      fi
+    else
+      identity_error=$(tail -c 500 "$TMP/forge.err" 2>/dev/null || true)
+      case "$identity_error" in *'HTTP 403'*|*'HTTP 404'*) status=not-visible-to-login ;; *) status=unknown ;; esac
+    fi
+    jq -cn --arg url "https://github.com/$repo/issues/$number" --arg status "$status" --arg error "$identity_error" \
+      '{url:$url,status:$status,error:(if $status=="unknown" then $error else null end)}' >> "$checks"
+  done
+  jq -s --arg repo "$repo" --arg now "$NOW" --arg error "$pagination_error" --argjson complete "$([ "$rc" -eq 0 ] && echo true || echo false)" '
     ([.[] | select(type == "object" and (has("pull_request") | not))
        | select((.number|type)=="number" and (.title|type)=="string"
          and (.html_url|type)=="string" and (.state|IN("open","closed")))
        | {number,title,url:.html_url,state,updated_at:.updated_at}]
        | sort_by(.number)) as $issues
     | {schema:"fm-issue-catalog.v1",repository:$repo,observed_at:$now,
-       complete:true,issues:$issues,known:($issues|length)}' "$raw"
+       complete:$complete,partial:($complete|not),issues:$issues,known:($issues|length),identity_checks:[],error:(if $complete then null else ($error // "pagination was interrupted; total repository issue count is unknown") end)}' "$raw" > "$TMP/catalog-result.json"
+  jq -s '{identity_checks:.}' "$checks" > "$TMP/catalog-identities-wrapped.json"
+  jq -s '.[0] * .[1]' "$TMP/catalog-result.json" "$TMP/catalog-identities-wrapped.json"
 }
 
 read_saved() {
@@ -408,8 +424,10 @@ arm() {
 
 case "${1:-}" in
   catalog)
-    [ "$#" -eq 2 ] || fail 'catalog needs canonical owner/repository'
-    catalog "$2"
+    [ "$#" -ge 2 ] || fail 'catalog needs canonical owner/repository'
+    DEADLINE=$(( $(date +%s) + BUDGET ))
+    BUDGET_EXHAUSTED=0
+    catalog "$2" "${@:3}"
     ;;
   snapshot)
     [ "$#" -ge 2 ] && [ "$#" -le 3 ] || fail 'snapshot needs canonical input'

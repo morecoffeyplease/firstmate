@@ -326,6 +326,31 @@ fi
 
 REPO=${POS[1]}
 
+render_lane_instructions() { # <registered project>
+  python3 - "$FM_HOME" "$FM_ROOT" "$1" <<'PY'
+import shlex
+import sys
+from pathlib import Path
+sys.path.insert(0, str(Path(sys.argv[2]) / "bin"))
+from fm_project_lanes import read_project_lanes
+home, root, project = Path(sys.argv[1]), Path(sys.argv[2]), sys.argv[3]
+try:
+    lanes = read_project_lanes(home).get(project, {})
+except ValueError as exc:
+    print(f"error: {exc}", file=sys.stderr)
+    raise SystemExit(1)
+if not lanes:
+    raise SystemExit(0)
+wrapper = str(root / "bin" / "fm-lane-run.sh")
+print("## Automatic validation receipts")
+print("These exact wrapper invocations write task and generation bound receipts; unwrapped commands remain invisible to the status table.")
+print(f"For a focused command, run `{shlex.join([wrapper, 'focused', '--', '<command>', '<arg>'])}` with the actual command and every argument spelled out.")
+for name in ("full", "verify"):
+    if name in lanes:
+        print(f"For the configured {name} lane, run `{shlex.join([wrapper, name])}` (configured argv: `{shlex.join(lanes[name])}`).")
+PY
+}
+
 if [ "$HERDR_LAB" -eq 1 ]; then
 HERDR_LAB_HELPER=$(shell_quote "$FM_ROOT/bin/fm-herdr-lab.sh")
 # shellcheck disable=SC2016  # single quotes are deliberate: these lines are literal brief text whose backtick-wrapped $(...) and "$HERDR_LAB_SESSION" snippets must reach the reading agent verbatim, not expand at scaffold time; only the '"$VAR"' break-outs interpolate.
@@ -370,6 +395,7 @@ TASK_SECTION=${TASK_SECTION%$'\n'}
 ASK_USER_BLOCK=$(fm_ask_user_authority_rule)
 
 if [ "$KIND" = scout ]; then
+LANE_INSTRUCTIONS=$(render_lane_instructions "$REPO") || exit 1
 if "$SCRIPT_DIR/fm-bootstrap.sh" lavish-compatible >/dev/null 2>&1; then
   LAVISH_LINE='If your deliverable is a visual artifact the captain will review and iterate on, you may host the Lavish review loop yourself (poll, revise, re-serve, staying alive) instead of handing it back to firstmate.'
 else
@@ -379,6 +405,8 @@ cat > "$BRIEF" <<EOF
 You are a crewmate: an autonomous worker agent managed by firstmate. Work on your own; do not wait for a human.
 
 $TASK_SECTION
+
+$LANE_INSTRUCTIONS
 
 $HERDR_SECTION
 
@@ -390,7 +418,7 @@ The report is the only thing that survives, so anything worth keeping must be in
 
 # Rules
 1. Never push to any remote and never open a PR.
-2. Stay inside this worktree; the only files you may write outside it are the report and the status file below.
+2. Stay inside this worktree; the only files you may write outside it are the report, status file, and this exact lane receipt directory: $DATA/$ID/lane-receipts.
 3. Use gh-axi for GitHub operations and chrome-devtools-axi for browser operations.
 4. Report status by appending one line:
    \`echo "{state}: {one short line}" >> $STATUS_FILE\`
@@ -435,11 +463,14 @@ fi
 SETUP2=""
 RULE1=$(fm_ship_rule_one "$MODE" "$ID") || exit 1
 DOD=$(fm_dod_block "$MODE" "$ID") || exit 1
+LANE_INSTRUCTIONS=$(render_lane_instructions "$REPO") || exit 1
 
 cat > "$BRIEF" <<EOF
 You are a crewmate: an autonomous worker agent managed by firstmate. Work on your own; do not wait for a human.
 
 $TASK_SECTION
+
+$LANE_INSTRUCTIONS
 
 $HERDR_SECTION
 
