@@ -63,7 +63,7 @@ textfile = tmp / "summary.md"
 textfile.write_text("A concise written project summary.\n")
 record_path = home / "state" / "status-summary" / "requests" / f"{first['request']}.json"
 record = json.loads(record_path.read_text())
-put = run("put", first["request"], "alpha", "--basis-fingerprint", "a" * 64, "--basis-observed-at", str(record["requested_epoch"]), "--author", "fixture-worker", "--text-file", str(textfile))
+put = run("put", first["request"], "alpha", "--basis-fingerprint", "a" * 64, "--basis-transition-watermark", "b" * 64, "--basis-observed-at", str(record["requested_epoch"]), "--author", "fixture-worker", "--text-file", str(textfile))
 assert put["status"] == "outdated", "basis changed during composition must be reported immediately"
 summary_file = next((home / "state" / "status-summary" / "summaries").glob("*.json"))
 summary_record = json.loads(summary_file.read_text())["summaries"][-1]

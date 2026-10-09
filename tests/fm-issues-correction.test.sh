@@ -69,7 +69,7 @@ clone = home / "projects" / "alpha"
 subprocess.run(["git", "init", "-q", str(clone)], check=True)
 subprocess.run(["git", "-C", str(clone), "remote", "add", "origin", "https://github.com/acme/widget.git"], check=True)
 issue_url = "https://github.com/acme/widget/issues/9"
-remote_task = {"id": "remote-ship", "generation": "gen-2", "kind": "ship", "current_state": {"state": "working", "source": "remote fixture"}, "backlog": {"state": "in_flight", "links": [issue_url], "repo": "alpha"}}
+remote_task = {"id": "remote-ship", "generation": "gen-2", "kind": "ship", "current_state": {"state": "working", "source": "remote fixture"}, "source": {"head": "b" * 40, "dirty": False, "freshness": "fresh"}, "verification": {"focused": {"status": "passed"}, "full": {"status": "passed"}, "verify": {"status": "passed"}}, "backlog": {"state": "in_flight", "links": [issue_url], "repo": "alpha"}}
 secondmate = {"id": "child", "provenance": {"summary_valid": True}, "freshness": {"status": "cached"}, "counts": {"issue_tasks": 1}, "issue_tasks": [remote_task], "omitted": [], "contributions": {"rows": []}}
 snapshot = {"schema": "fm-fleet-snapshot.v1", "tasks": [], "backlog": {"records": []}, "contributions": {"rows": []}, "secondmate_current": {"records": [secondmate], "total": 1, "truncated": False}}
 now = int(time.time())
@@ -82,11 +82,19 @@ remote_row = next(row for row in projection["rows"] if row["url"] == issue_url)
 assert remote_row["tasks"][0]["task_state"] == "working"
 assert remote_row["tasks"][0]["stage"] == "Implementing"
 assert remote_row["tasks"][0]["ready_for_approval"] == "unknown"
+assert remote_row["tasks"][0]["source_head"] == "b" * 40 and remote_row["tasks"][0]["verification"]["full"]["status"] == "passed"
 assert not any("stale" in conflict for conflict in remote_row["tasks"][0]["conflicts"])
+page_task_a = {"id": "page-a", "current_state": {"state": "working"}, "backlog": {"repo": "alpha", "links": []}}
+page_task_b = {"id": "page-b", "current_state": {"state": "done"}, "backlog": {"repo": "alpha", "links": []}}
+page_summary = {"counts": {"issue_tasks": 2}, "issue_tasks": [page_task_a], "issue_inventory": {"complete": True, "total": 2, "page_size": 1, "page_count": 2, "next_offset": None, "pages": [{"offset": 0, "next_offset": 1, "tasks": [page_task_a]}, {"offset": 1, "next_offset": None, "tasks": [page_task_b]}]}}
+page_rows, page_complete = issues.issue_inventory(page_summary)
+assert page_complete and [item["id"] for item in page_rows] == ["page-a", "page-b"]
+page_summary["issue_inventory"]["pages"][1]["offset"] = 0
+assert issues.issue_inventory(page_summary) == ([], False), "invalid continuation offsets must not claim complete descendant coverage"
 
 # The semantic reducer is pure and shared by every row. Poll/read metadata and
 # task ordering do not enter the relevant status fingerprint.
-from fm_issues_derive import semantic_fingerprint, task_rank
+from fm_issues_derive import choose_change, owner_task_fact, semantic_fingerprint, task_rank, transition_watermark
 row_task = {**task, "stage": "In review", "waiting": None, "next_step": "Review required", "ready_for_approval": "not ready"}
 row = {"url": issue_url, "forge_state": "open", "title": "Review", "stage": "In review", "conflicts": [], "tasks": [row_task]}
 unlinked_task = {"id": "other", "generation": "gen-1", "stage": "Queued", "waiting": None, "next_step": "Queued", "backlog": {"state": "queued"}, "prs": [], "verification": {}}
@@ -94,6 +102,25 @@ first_fp = semantic_fingerprint([row], [unlinked_task])
 read_only_copy = {**row, "tasks": [{**row_task, "last_checked_epoch": 12345, "cache_age_seconds": 9}]}
 assert semantic_fingerprint([read_only_copy], [unlinked_task]) == first_fp
 assert task_rank({**row_task, "id": "decision", "waiting": "your decision"}) < task_rank({**row_task, "id": "ready", "stage": "Ready for approval"})
+common_fact = {"id": "same", "kind": "ship", "task_state": "working", "current_state": {"state": "working"}, "backlog": {"state": "in_flight"}, "prs": [], "verification": {}}
+local_fact = owner_task_fact(common_fact, "main-home", "same", [])
+descendant_fact = owner_task_fact({**common_fact, "evidence_freshness": "fresh"}, "child", "same", [])
+assert (local_fact["stage"], local_fact["waiting"], local_fact["next_step"], local_fact["ready_for_approval"]) == (descendant_fact["stage"], descendant_fact["waiting"], descendant_fact["next_step"], descendant_fact["ready_for_approval"])
+assert local_fact["fact_schema"] == descendant_fact["fact_schema"] == "fm-issue-task-fact.v1"
+assert choose_change([{"class": "event", "at_epoch": 123}], {"from_epoch": 100, "to_epoch": 150}) == {"class": "event", "at_epoch": 123}
+assert choose_change([], {"from_epoch": 100, "to_epoch": 150}) == {"class": "detected", "from_epoch": 100, "to_epoch": 150}
+assert choose_change([], {"from_epoch": 100, "to_epoch": 90000}) == {"class": "unknown"}
+transition_a = {"schema": "fm-task-event.v1", "generation": "gen-1", "class": "event", "at_epoch": 10, "kind": "started", "fields": {"kind": "ship"}}
+transition_b = {"schema": "fm-task-event.v1", "generation": "gen-1", "class": "event", "at_epoch": 20, "kind": "held", "fields": {"source": "owner"}}
+watermark_a = transition_watermark([], [{**common_fact, "generation": "gen-1", "event_history": [transition_a]}])
+watermark_aba = transition_watermark([], [{**common_fact, "generation": "gen-1", "event_history": [transition_a, transition_b, {**transition_a, "at_epoch": 30}]}])
+assert watermark_a != watermark_aba, "retained owner transitions must distinguish an A-B-A history"
+from fm_lane_receipts import classify_finished_receipt
+finished = {"generation": "gen-1", "signal": None, "received_signal": None, "exit_code": 0, "dirty_before": False, "dirty_after": False, "head_before": "a" * 40, "head_after": "a" * 40}
+assert classify_finished_receipt(finished, "gen-1", "a" * 40) == "passed"
+assert classify_finished_receipt({**finished, "generation": "old"}, "gen-1", "a" * 40) == "unknown"
+assert classify_finished_receipt({**finished, "dirty_after": True}, "gen-1", "a" * 40) == "passed-dirty"
+assert classify_finished_receipt({**finished, "exit_code": None}, "gen-1", "a" * 40) == "unknown"
 
 # A lane-specific validated receipt-write error remains unknown even when the
 # first write failed before any start receipt could be retained.

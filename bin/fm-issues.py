@@ -24,16 +24,19 @@ from datetime import datetime, timezone
 from pathlib import Path
 from zoneinfo import ZoneInfo
 from fm_project_lanes import read_project_lanes
-from fm_lane_receipts import repository_identity, valid_receipt
+from fm_lane_receipts import classify_finished_receipt, repository_identity, valid_receipt
 from fm_issues_derive import (
     FINGERPRINT_SCHEMA as FP_SCHEMA,
     fingerprint_pr as derive_fingerprint_pr,
     fingerprint_task as derive_fingerprint_task,
+    choose_change,
     forge_pr_fact,
     next_step as derive_next_step,
+    owner_task_fact,
     ready_state as derive_ready_state,
     semantic_fingerprint,
     stage as derive_stage,
+    transition_watermark,
     task_rank,
 )
 
@@ -296,6 +299,41 @@ def task_links(task: dict, repo: str | None) -> list[str]:
     return canonical_issue_urls(links, repo)
 
 
+def issue_inventory(summary: dict) -> tuple[list[dict], bool]:
+    """Read a complete ordered batch inventory, or retain legacy bounded rows."""
+    inventory = summary.get("issue_inventory")
+    if not isinstance(inventory, dict) or inventory.get("complete") is not True:
+        rows = summary.get("issue_tasks", [])
+        return ([item for item in rows if isinstance(item, dict)] if isinstance(rows, list) else []), False
+    total, size, count, pages = (inventory.get("total"), inventory.get("page_size"),
+                                 inventory.get("page_count"), inventory.get("pages"))
+    if (not isinstance(total, int) or total < 0 or not isinstance(size, int) or size <= 0
+            or not isinstance(count, int) or not isinstance(pages, list) or len(pages) != count
+            or inventory.get("next_offset") is not None):
+        return [], False
+    flattened = []
+    for index, page in enumerate(pages):
+        if not isinstance(page, dict) or page.get("offset") != index * size:
+            return [], False
+        expected_next = (index + 1) * size if index + 1 < count else None
+        if page.get("next_offset") != expected_next or not isinstance(page.get("tasks"), list):
+            return [], False
+        if len(page["tasks"]) > size or any(not isinstance(item, dict) for item in page["tasks"]):
+            return [], False
+        flattened.extend(page["tasks"])
+    if len(flattened) != total:
+        return [], False
+    if any(not isinstance(item.get("id"), str) or not isinstance(item.get("current_state"), dict)
+           or not isinstance(item.get("backlog"), dict) for item in flattened):
+        return [], False
+    if len({item["id"] for item in flattened}) != total:
+        return [], False
+    known_total = (summary.get("counts") or {}).get("issue_tasks")
+    if isinstance(known_total, int) and known_total != total:
+        return [], False
+    return flattened, True
+
+
 def canonical_issue_urls(links: list, repo: str | None) -> list[str]:
     if not isinstance(repo, str) or not repo or not isinstance(links, list):
         return []
@@ -381,6 +419,17 @@ def process_start_matches(pid: int, expected: str | None) -> bool:
         return False
 
 
+def worktree_dirty(path: str | None) -> bool | None:
+    if not isinstance(path, str) or not path:
+        return None
+    try:
+        result = subprocess.run(["git", "-C", path, "status", "--porcelain", "--untracked-files=all"],
+                                capture_output=True, text=True, timeout=3)
+        return result.stdout != "" if result.returncode == 0 else None
+    except (OSError, subprocess.SubprocessError):
+        return None
+
+
 def lane_status(home: Path, task: dict, project: str, configured: dict[str, list[str]] | None = None, current_head: str | None = None) -> dict[str, dict]:
     configured = configured if configured is not None else read_project_lanes(home).get(project, {})
     task_id = task.get("id")
@@ -411,6 +460,7 @@ def lane_status(home: Path, task: dict, project: str, configured: dict[str, list
             current_head = subprocess.run(["git", "-C", worktree, "rev-parse", "HEAD"], capture_output=True, text=True, timeout=3).stdout.strip()
         except (OSError, subprocess.SubprocessError):
             pass
+    current_dirty = task.get("source_dirty") if "source_dirty" in task else worktree_dirty(worktree)
     records: dict[str, list[dict]] = {lane: [] for lane in ("focused", "full", "verify")}
     malformed: dict[str, bool] = {lane: False for lane in records}
     receipt_errors: dict[str, list[tuple[int, str]]] = {lane: [] for lane in records}
@@ -442,13 +492,6 @@ def lane_status(home: Path, task: dict, project: str, configured: dict[str, list
                 malformed[lane] = True
                 continue
             valid = valid_receipt(value, path, lane, task_id, generation, project, expected_repo)
-            if value.get("phase") == "finish":
-                valid = valid and isinstance(value.get("ended_epoch"), int) and value["ended_epoch"] >= value["started_epoch"]
-                valid = valid and isinstance(value.get("head_after"), str) and bool(value["head_after"])
-                valid = valid and isinstance(value.get("dirty_after"), bool)
-                valid = valid and (value.get("exit_code") is None or (isinstance(value.get("exit_code"), int) and 0 <= value["exit_code"] <= 255))
-                valid = valid and (value.get("signal") is None or (isinstance(value.get("signal"), int) and 1 <= value["signal"] <= 64))
-                valid = valid and (value.get("received_signal") is None or (isinstance(value.get("received_signal"), int) and 1 <= value["received_signal"] <= 64))
             if not valid:
                 malformed[lane] = True
                 continue
@@ -478,18 +521,16 @@ def lane_status(home: Path, task: dict, project: str, configured: dict[str, list
             except (OSError, ProcessLookupError):
                 live = False
             state = "running" if live else "interrupted"
-        elif chosen.get("signal") is not None or chosen.get("received_signal") is not None:
-            state = "canceled"
-        elif chosen.get("exit_code") != 0:
-            state = "failed"
-        elif chosen.get("dirty_before") is True or chosen.get("dirty_after") is True or chosen.get("head_before") != chosen.get("head_after"):
-            state = "passed on uncommitted or changed source"
-        elif chosen.get("dirty_before") is not False or chosen.get("dirty_after") is not False or not current_head:
-            state = "unknown"
-        elif chosen.get("head_after") == current_head:
-            state = "passed"
         else:
-            state = "stale (passed on an older head)"
+            state = {
+                "passed-dirty": "passed on uncommitted or changed source",
+                "stale": "stale (passed on an older head)",
+            }.get(classify_finished_receipt(chosen, generation, current_head),
+                  classify_finished_receipt(chosen, generation, current_head))
+            if state == "passed" and current_dirty is True:
+                state = "passed on uncommitted or changed source"
+            elif state == "passed" and current_dirty is not False:
+                state = "unknown"
         error = next((message for stamp, message in reversed(receipt_errors[lane]) if stamp >= chosen["started_epoch"]), None)
         if error:
             state = "unknown"
@@ -595,12 +636,15 @@ def _make_projection(home: Path, project: str, refresh: bool = False) -> dict:
         for secondmate in remote_records:
             valid_summary = (secondmate.get("provenance") or {}).get("summary_valid") is True
             summary_freshness = (secondmate.get("freshness") or {}).get("status")
-            inventory_proven = isinstance((secondmate.get("counts") or {}).get("issue_tasks"), int)
-            issue_tasks = secondmate.get("issue_tasks", []) if isinstance(secondmate.get("issue_tasks", []), list) else []
+            issue_tasks, page_inventory_complete = issue_inventory(secondmate)
+            inventory_proven = (isinstance((secondmate.get("counts") or {}).get("issue_tasks"), int)
+                                and (page_inventory_complete or "issue_inventory" not in secondmate))
             relevant_tasks = [item for item in issue_tasks if isinstance(item, dict) and (item.get("backlog") or {}).get("repo") == project]
             remote_issue_coverage["visible_task_records"] += len(relevant_tasks)
             omissions_by_project = secondmate.get("omitted_issue_tasks_by_project")
-            if isinstance(omissions_by_project, list):
+            if page_inventory_complete:
+                pass
+            elif isinstance(omissions_by_project, list):
                 remote_issue_coverage["omitted_task_records"] += sum(item.get("count", 0) for item in omissions_by_project if isinstance(item, dict) and item.get("project") == project and isinstance(item.get("count"), int))
                 unknown_scope_count = secondmate.get("omitted_issue_tasks_scope_unknown")
                 if isinstance(unknown_scope_count, int) and unknown_scope_count > 0:
@@ -665,7 +709,8 @@ def _make_projection(home: Path, project: str, refresh: bool = False) -> dict:
         secondmates = remote_records
         for secondmate in secondmates:
             home_id = secondmate.get("id") or "registered-home"
-            for remote in secondmate.get("issue_tasks", []):
+            remote_tasks, _pages_complete = issue_inventory(secondmate)
+            for remote in remote_tasks:
                 backlog = remote.get("backlog") if isinstance(remote.get("backlog"), dict) else {}
                 issue_urls = canonical_issue_urls(backlog.get("links", []), repo)
                 source_id = remote.get("id")
@@ -696,11 +741,13 @@ def _make_projection(home: Path, project: str, refresh: bool = False) -> dict:
                     "activity_detail": current_state.get("detail"),
                     "current_state": current_state,
                     "hints": {"open_decisions": decisions, "pending_decision": any(item.get("verb") in ("needs-decision", "captain-hold") for item in decisions), "blocked_event": (remote.get("hints") or {}).get("blocked_event") is True},
-                    "source_head": None,
+                    "source_head": (remote.get("source") or {}).get("head"),
+                    "source_dirty": (remote.get("source") or {}).get("dirty"),
                     "backlog": backlog,
                     "issues": issue_urls,
                     "prs": linked_prs,
-                    "verification": {lane: {"status": "unknown", "basis": "remote lane receipts are not included in the validated home summary"} for lane in ("focused", "full", "verify")},
+                    "verification": (remote.get("verification") if isinstance(remote.get("verification"), dict)
+                                     else {lane: {"status": "unknown", "basis": "owner lane evidence is not included in the validated home summary"} for lane in ("focused", "full", "verify")}),
                     "event": remote_event,
                     "event_history": remote_events,
                     "merge_requests": [],
@@ -761,11 +808,13 @@ def _make_projection(home: Path, project: str, refresh: bool = False) -> dict:
                         pr["revising"] = True
                         pr["prior_head_failure"] = prior_failed
                         pr["prior_head_changes_requested"] = prior_requested
-            task["stage"], task["waiting"] = stage(task, task.get("prs", []), task.get("backlog"))
-            task["ready_for_approval"] = ready_state(task, configured_lanes)
-            if task["ready_for_approval"] == "ready for approval":
-                task["stage"] = "Ready for approval"
-            task["next_step"] = next_step(task)
+            task.update(owner_task_fact(task, task.get("owner_home_id", "main-home"),
+                                        task.get("task_id", task.get("id", "")),
+                                        read_project_lanes_for_ready(configured_lanes)))
+    for task in unlinked:
+        task.update(owner_task_fact(task, task.get("owner_home_id", "main-home"),
+                                    task.get("task_id", task.get("id", "")),
+                                    read_project_lanes_for_ready(configured_lanes)))
     for row in rows:
         linked = row.get("tasks", [])
         if not linked:
@@ -777,10 +826,7 @@ def _make_projection(home: Path, project: str, refresh: bool = False) -> dict:
     previous_fp = previous.get("fingerprint") if isinstance(previous, dict) and previous.get("schema") == FP_SCHEMA else None
     previous_seen = previous.get("observed_epoch") if isinstance(previous, dict) and previous.get("schema") == FP_SCHEMA else None
     changed = {"class": "unknown"}
-    if previous_fp and previous_fp != fingerprint and previous_seen and now - int(previous_seen) <= MAX_OBSERVATION_BRACKET:
-        changed = {"class": "detected", "from_epoch": int(previous_seen), "to_epoch": now}
-    elif previous_fp == fingerprint:
-        changed = previous.get("changed", changed)
+    project_event_facts = []
     next_rows = {}
     for row in rows:
         row_value = {"url": row["url"], "state": row.get("forge_state"), "title": row.get("title"), "stage": row.get("stage"), "conflicts": sorted(row.get("conflicts", [])), "tasks": [fingerprint_task(task) for task in row.get("tasks", [])]}
@@ -813,22 +859,43 @@ def _make_projection(home: Path, project: str, refresh: bool = False) -> dict:
                     changed_fields = {key for key in current_task if prior_task.get(key) != current_task.get(key)}
                     if event and prior_event != event and event_fields.get(event.get("kind"), set()) & changed_fields:
                         changed_events.append(event)
-                event_stamps = [event for event in changed_events if event.get("class") == "event" and isinstance(event.get("at_epoch"), int)]
-                detected = [event for event in changed_events if event.get("class") == "detected" and isinstance(event.get("fields", {}).get("from_epoch"), int) and isinstance(event.get("fields", {}).get("to_epoch"), int)]
-                if event_stamps:
-                    newest = max(event_stamps, key=lambda event: event["at_epoch"])
-                    row_changed = {"class": "event", "at_epoch": newest["at_epoch"]}
-                elif detected:
-                    newest = max(detected, key=lambda event: event["fields"]["to_epoch"])
-                    if newest["fields"]["to_epoch"] - newest["fields"]["from_epoch"] <= MAX_OBSERVATION_BRACKET:
-                        row_changed = {"class": "detected", "from_epoch": newest["fields"]["from_epoch"], "to_epoch": newest["fields"]["to_epoch"]}
-                else:
-                    row_changed = {"class": "detected", "from_epoch": int(old.get("observed_epoch", 0)), "to_epoch": now}
+                event_facts = [
+                    {"class": event.get("class"), "at_epoch": event.get("at_epoch"),
+                     "from_epoch": event.get("fields", {}).get("from_epoch"),
+                     "to_epoch": event.get("fields", {}).get("to_epoch")}
+                    for event in changed_events
+                ]
+                project_event_facts.extend(event_facts)
+                detected = [
+                    event for event in changed_events
+                    if event.get("class") == "detected"
+                    and isinstance(event.get("fields", {}).get("from_epoch"), int)
+                    and isinstance(event.get("fields", {}).get("to_epoch"), int)
+                ]
+                newest = max(detected, key=lambda event: event["fields"]["to_epoch"], default=None)
+                bracket = (
+                    {"from_epoch": newest["fields"]["from_epoch"], "to_epoch": newest["fields"]["to_epoch"]}
+                    if newest else {"from_epoch": int(old.get("observed_epoch", 0)), "to_epoch": now}
+                )
+                row_changed = choose_change(event_facts, bracket)
         row["changed"] = row_changed
         next_rows[row["url"]] = {"fingerprint": row_fingerprint, "observed_epoch": now, "title": row.get("title"), "state": row.get("forge_state"), "changed": row_changed, "events": {task.get("id"): task.get("event") for task in row.get("tasks", []) if task.get("event")}, "tasks": [fingerprint_task(task) for task in row.get("tasks", [])]}
+    changed = {"class": "unknown"}
+    if previous_fp and previous_fp != fingerprint and previous_seen:
+        detected_project = [item for item in project_event_facts
+                            if item.get("class") == "detected"
+                            and isinstance(item.get("from_epoch"), int)
+                            and isinstance(item.get("to_epoch"), int)]
+        newest_detected = max(detected_project, key=lambda item: item["to_epoch"], default=None)
+        project_bracket = ({"from_epoch": newest_detected["from_epoch"], "to_epoch": newest_detected["to_epoch"]}
+                           if newest_detected else {"from_epoch": int(previous_seen), "to_epoch": now})
+        changed = choose_change(project_event_facts, project_bracket)
+    elif previous_fp == fingerprint:
+        changed = previous.get("changed", changed)
     if previous_fp != fingerprint or prior_rows != next_rows:
         atomic_json(state_cache, {"schema": FP_SCHEMA, "fingerprint": fingerprint, "observed_epoch": now, "changed": changed, "rows": next_rows})
-    summary = summary_record_for_projection(home, project, fingerprint, now, changed)
+    watermark = transition_watermark(rows, unlinked)
+    summary = summary_record_for_projection(home, project, fingerprint, watermark, now, changed)
     beat = home / "state" / ".last-watcher-beat"
     try:
         beat_epoch = int(beat.stat().st_mtime) if beat.is_file() and not beat.is_symlink() else None
@@ -836,10 +903,10 @@ def _make_projection(home: Path, project: str, refresh: bool = False) -> dict:
         beat_epoch = None
     session_lock = home / "state" / ".lock"
     supervisor = {"watcher_beat_epoch": beat_epoch, "watcher_age_seconds": now - beat_epoch if beat_epoch else None, "session_lock_present": session_lock.exists()}
-    return {"schema": SCHEMA, "project": project, "repository": repo, "generated_epoch": now, "last_checked_epoch": cat.get("checked_epoch"), "catalog": {key: cat.get(key) for key in ("complete", "partial", "known", "observed_known", "total", "error", "stale", "checked_epoch", "last_attempt_epoch", "throttled")}, "snapshot": {"collected_epoch": checked.get("collected_epoch"), "error": checked.get("error"), "stale": checked.get("stale", False)}, "remote_issue_coverage": remote_issue_coverage, "supervisor": supervisor, "fingerprint_schema": FP_SCHEMA, "fingerprint": fingerprint, "project_changed": changed, "rows": rows, "unlinked_tasks": unlinked, "summary_requests": list_summary_requests(home, project), "summary": summary}
+    return {"schema": SCHEMA, "project": project, "repository": repo, "generated_epoch": now, "last_checked_epoch": cat.get("checked_epoch"), "catalog": {key: cat.get(key) for key in ("complete", "partial", "known", "observed_known", "total", "error", "stale", "checked_epoch", "last_attempt_epoch", "throttled")}, "snapshot": {"collected_epoch": checked.get("collected_epoch"), "error": checked.get("error"), "stale": checked.get("stale", False)}, "remote_issue_coverage": remote_issue_coverage, "supervisor": supervisor, "fingerprint_schema": FP_SCHEMA, "fingerprint": fingerprint, "transition_watermark": watermark, "project_changed": changed, "rows": rows, "unlinked_tasks": unlinked, "summary_requests": list_summary_requests(home, project), "summary": summary}
 
 
-def summary_record_for_projection(home: Path, project: str, fingerprint: str, now: int, changed: dict) -> dict | None:
+def summary_record_for_projection(home: Path, project: str, fingerprint: str, watermark: str, now: int, changed: dict) -> dict | None:
     summary_path = home / "state" / "status-summary" / "summaries" / f"{hashlib.sha256(project.encode()).hexdigest()}.json"
     with project_summary_lock(home, project):
         summary_file = read_json(summary_path, 1_000_000)
@@ -848,7 +915,11 @@ def summary_record_for_projection(home: Path, project: str, fingerprint: str, no
         if not isinstance(summary, dict) or summary.get("schema") != "fm-status-summary.v1":
             return None
         summary = dict(summary)
-        if summary.get("state") != "outdated" and summary.get("basis_fingerprint") != fingerprint:
+        outdated = (
+            summary.get("basis_fingerprint") != fingerprint
+            or summary.get("basis_transition_watermark") != watermark
+        )
+        if summary.get("state") != "outdated" and outdated:
             summary["state"] = "outdated"
             summary["invalidated_epoch"] = now
             summary["invalidated_change"] = changed
@@ -1068,6 +1139,7 @@ def summary_command(home: Path, argv: list[str]) -> int:
     put.add_argument("request_id")
     put.add_argument("project")
     put.add_argument("--basis-fingerprint", required=True)
+    put.add_argument("--basis-transition-watermark", required=True)
     put.add_argument("--basis-observed-at", type=int, required=True)
     put.add_argument("--author", required=True)
     put.add_argument("--text-file", required=True)
@@ -1180,7 +1252,9 @@ def summary_command(home: Path, argv: list[str]) -> int:
         if record.get("results", {}).get(args.project) != "pending":
             print(json.dumps({"status": record.get("results", {}).get(args.project, record.get("state", "unavailable")), "project": args.project}))
             return 1
-        if not re.fullmatch(r"[a-f0-9]{64}", args.basis_fingerprint) or args.basis_observed_at < 0 or not args.author.strip() or len(args.author) > 160:
+        if (not re.fullmatch(r"[a-f0-9]{64}", args.basis_fingerprint)
+                or not re.fullmatch(r"[a-f0-9]{64}", args.basis_transition_watermark)
+                or args.basis_observed_at < 0 or not args.author.strip() or len(args.author) > 160):
             print("error: invalid summary basis or author", file=sys.stderr)
             return 2
         text = Path(args.text_file).read_text(encoding="utf-8")
@@ -1189,9 +1263,10 @@ def summary_command(home: Path, argv: list[str]) -> int:
             return 2
         current = make_projection(home, args.project)
         with project_summary_lock(home, args.project):
-            outdated = current["fingerprint"] != args.basis_fingerprint
+            outdated = (current["fingerprint"] != args.basis_fingerprint
+                        or current["transition_watermark"] != args.basis_transition_watermark)
             written_epoch = utc_now()
-            summary = {"schema": "fm-status-summary.v1", "request": args.request_id, "project": args.project, "author": args.author, "basis_fingerprint": args.basis_fingerprint, "basis_observed_epoch": args.basis_observed_at, "written_epoch": written_epoch, "text": text, "state": "outdated" if outdated else "written", "current_fingerprint": current["fingerprint"], "invalidated_epoch": written_epoch if outdated else None, "invalidated_change": current.get("project_changed") if outdated else None, "evidence": {"basis_fingerprint": args.basis_fingerprint, "basis_observed_epoch": args.basis_observed_at, "comparison_fingerprint": current["fingerprint"], "comparison_observed_epoch": current["generated_epoch"], "repository": current["repository"], "catalog_checked_epoch": current["last_checked_epoch"], "snapshot_collected_epoch": current["snapshot"]["collected_epoch"]}}
+            summary = {"schema": "fm-status-summary.v1", "request": args.request_id, "project": args.project, "author": args.author, "basis_fingerprint": args.basis_fingerprint, "basis_transition_watermark": args.basis_transition_watermark, "basis_observed_epoch": args.basis_observed_at, "written_epoch": written_epoch, "text": text, "state": "outdated" if outdated else "written", "current_fingerprint": current["fingerprint"], "current_transition_watermark": current["transition_watermark"], "invalidated_epoch": written_epoch if outdated else None, "invalidated_change": current.get("project_changed") if outdated else None, "evidence": {"basis_fingerprint": args.basis_fingerprint, "basis_transition_watermark": args.basis_transition_watermark, "basis_observed_epoch": args.basis_observed_at, "comparison_fingerprint": current["fingerprint"], "comparison_transition_watermark": current["transition_watermark"], "comparison_observed_epoch": current["generated_epoch"], "repository": current["repository"], "catalog_checked_epoch": current["last_checked_epoch"], "snapshot_collected_epoch": current["snapshot"]["collected_epoch"]}}
             summary_path = sumdir / f"{hashlib.sha256(args.project.encode()).hexdigest()}.json"
             prior = read_json(summary_path, 1_000_000)
             history = prior.get("summaries", []) if isinstance(prior, dict) and prior.get("schema") == "fm-status-summaries.v1" and isinstance(prior.get("summaries"), list) else []
@@ -1330,9 +1405,24 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--json", action="store_true")
     parser.add_argument("--refresh", action="store_true")
     parser.add_argument("--port", type=int)
+    parser.add_argument("--lane-evidence-task")
+    parser.add_argument("--lane-evidence-project")
+    parser.add_argument("--lane-evidence-generation")
+    parser.add_argument("--lane-evidence-head")
+    parser.add_argument("--lane-evidence-dirty", choices=("true", "false", "unknown"), default="unknown")
     parser.add_argument("summary", nargs=argparse.REMAINDER)
     args = parser.parse_args(argv)
     home = Path(args.home).expanduser().resolve()
+    if args.lane_evidence_task:
+        if (not args.lane_evidence_project or not args.lane_evidence_generation
+                or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,63}", args.lane_evidence_task)):
+            parser.error("lane evidence requires a task, registered project name, and generation")
+        value = lane_status(home, {"id": args.lane_evidence_task,
+                                   "spawn_gen": args.lane_evidence_generation,
+                                   "source_dirty": (True if args.lane_evidence_dirty == "true" else False if args.lane_evidence_dirty == "false" else None)},
+                            args.lane_evidence_project, current_head=args.lane_evidence_head)
+        print(json.dumps(value, sort_keys=True))
+        return 0
     if args.summary:
         summary_args = args.summary[1:] if args.summary[0] == "summary" else args.summary
         return summary_command(home, summary_args)

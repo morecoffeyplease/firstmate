@@ -9,7 +9,7 @@ The initial project is the first registered project when no `--project` is suppl
 
 The projection combines the canonical fleet snapshot with a separately cached, paginated issue catalog.
 Open and closed issues appear even when no local task is linked, and unlinked local tasks appear in their own section.
-Validated secondmate home summaries also contribute bounded queued, in-flight, completed, metadata-only, and unlinked task records, including tasks whose current activity is unknown.
+Validated secondmate home summaries also contribute queued, in-flight, completed, metadata-only, and unlinked task records in bounded pages, including tasks whose current activity is unknown.
 Only issue links whose canonical repository URL matches the selected registered clone are attached to its issue rows; omitted or unvalidated remote summaries are shown as partial coverage.
 The catalog revalidates at most once per hour by default, while the page reads the coalesced projection cache every 15 seconds and pauses while hidden.
 The projection cache is rebuilt at most once per minute per project unless an explicit refresh is requested.
@@ -35,8 +35,8 @@ After the send creates its durable pending-reply record, the main-home owner rec
 Requests without a matching registered secondmate remain assigned to the main-home inbox.
 Each project's route, correlation, result, and failure reason is shown separately, requests deduplicate independently, and requests expire after 30 minutes.
 When composition begins, the summary author reads that project's current fingerprint and observation time from `fm-issues.sh --project <project> --json`.
-The author writes the text with `fm-issues.sh summary put`; the command compares the supplied basis fingerprint with current status and marks a changed basis outdated immediately.
-A later meaningful project fingerprint change also hides or collapses the summary while retaining its labeled historical text.
+The author writes the text with `fm-issues.sh summary put`, supplying the current fingerprint, transition watermark, and observation time read when composition begins; the command compares both status and retained owner transitions with current evidence and marks a changed basis outdated immediately.
+A later meaningful project fingerprint change or retained lifecycle transition also hides or collapses the summary while retaining its labeled historical text, including a status that changes away and back between projections.
 Each summary records its author, basis fingerprint, basis observation time, written time, repository, catalog check, and snapshot observation used for the basis comparison, and its text is never parsed into automatic status fields.
 Requests expose pending, written, outdated, failed, unavailable, and expired states together with supervisor availability.
 Routine collection and rendering never call an AI model.

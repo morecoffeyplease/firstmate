@@ -733,6 +733,8 @@ task_json_lines() {
   local remote_host remote_root current_file endpoint_file observation_line index=0
   local pr pr_source event_json current_json endpoint_exists agent_alive meta_json status_json report_json worktree_json home_json
   local last_event_raw current_state current_source pending_decision blocked_event report_present=0 pr_from_status
+  local source_head='' source_dirty=null source_rc source_status
+  local verification_json='{}' dirty_arg
   local open_decisions_tsv open_decisions_json
 
   while [ "$index" -lt "$SNAPSHOT_TASK_META_COUNT" ]; do
@@ -839,6 +841,35 @@ task_json_lines() {
     else
       home_json=$(jq -n '{path:null,present:false}')
     fi
+    source_head=
+    source_dirty=null
+    if [ -n "$worktree" ] && [ -z "$remote_host" ] && snapshot_task_generation_is_current "$meta" "$id"; then
+      source_head=$(fm_run_timed "$FM_SNAPSHOT_TERMINAL_TIMEOUT" git -C "$worktree" rev-parse HEAD 2>/dev/null) || source_head=
+      case "$source_head" in
+        *[!A-Fa-f0-9]*|'') source_head= ;;
+      esac
+      if [ "${#source_head}" -lt 40 ] || [ "${#source_head}" -gt 64 ]; then source_head=; fi
+    if [ -n "$source_head" ]; then
+        source_status=$(fm_run_timed "$FM_SNAPSHOT_TERMINAL_TIMEOUT" git -C "$worktree" status --porcelain --untracked-files=all 2>/dev/null)
+        source_rc=$?
+        if [ "$source_rc" -eq 0 ]; then
+          [ -z "$source_status" ] && source_dirty=false || source_dirty=true
+        fi
+      fi
+    fi
+    if [ -n "$project" ] && [ -n "$spawn_gen" ] && [ "$kind" != secondmate ]; then
+      case "$source_dirty" in true) dirty_arg=true ;; false) dirty_arg=false ;; *) dirty_arg=unknown ;; esac
+      verification_json=$(FM_HOME="$FM_HOME" fm_run_timed "$FM_SNAPSHOT_TERMINAL_TIMEOUT" python3 "$SCRIPT_DIR/fm-issues.py" \
+        --home "$FM_HOME" --lane-evidence-task "$id" --lane-evidence-project "$project" \
+        --lane-evidence-generation "$spawn_gen" --lane-evidence-head "$source_head" \
+        --lane-evidence-dirty "$dirty_arg" 2>/dev/null) || verification_json='{}'
+      printf '%s' "$verification_json" | jq -e 'type == "object"' >/dev/null 2>&1 || verification_json='{}'
+    fi
+    if ! snapshot_task_generation_is_current "$meta" "$id"; then
+      source_head=
+      source_dirty=null
+      verification_json='{}'
+    fi
 
     jq -n \
       --arg id "$id" \
@@ -858,6 +889,9 @@ task_json_lines() {
       --arg pr "$pr" \
       --arg pr_source "$pr_source" \
       --arg pr_head "$(meta_value "$meta" pr_head)" \
+      --arg source_head "$source_head" \
+      --argjson source_dirty "$source_dirty" \
+      --argjson verification "$verification_json" \
       --arg agent_alive "$agent_alive" \
       --arg observed_at "$SNAPSHOT_NOW" \
       --arg last_event_raw "$last_event_raw" \
@@ -897,6 +931,9 @@ task_json_lines() {
                   else "unknown" end),
           observed_at:$observed_at,freshness:"fresh"},
         pr:{url:($pr | if . == "" then null else . end),source:$pr_source,head:($pr_head | if . == "" then null else . end)},
+        source:{head:($source_head | if . == "" then null else . end),dirty:$source_dirty,observed_at:$observed_at,
+          freshness:(if $source_head == "" or $source_dirty == null then "unknown" else "fresh" end)},
+        verification:$verification,
         hints:{
           pending_decision:$pending_decision,
           blocked_event:$blocked_event,
@@ -1068,6 +1105,8 @@ secondmate_home_summary_json() {  # <backlog-json-file> <tasks-json-file> <produ
          | {id:$work.id,
             generation:($task.spawn_gen // null),
             kind:($work.kind // $task.kind // null),
+            source:($task.source // {head:null,dirty:null,observed_at:$generated,freshness:"unknown"}),
+            verification:($task.verification // {}),
             current_state:($task.current_state // {state:"unknown",source:"child metadata unavailable"}),
             backlog:{state:$work.state,kind:($work.kind // null),title:(($work.title // "") | trunc(160)),
               links:((if ($work.links | type) == "array" then $work.links else [] end) | map(select(type == "string") | trunc(500))[:20]),
@@ -1085,6 +1124,8 @@ secondmate_home_summary_json() {  # <backlog-json-file> <tasks-json-file> <produ
            | select(.kind != "secondmate")
            | select(.id as $id | [$backlog.records[]?.id] | index($id) | not)
            | {id, generation:(.spawn_gen // null), kind,
+              source:(.source // {head:null,dirty:null,observed_at:$generated,freshness:"unknown"}),
+              verification:(.verification // {}),
               current_state:(.current_state // {state:"unknown",source:"task metadata unavailable"}),
               hints:(.hints // {}),
               backlog:{state:null,kind,repo:(.project // null),links:[],pr_url:(.pr.url // null),pr_head:(.pr.head // null),
@@ -1092,6 +1133,7 @@ secondmate_home_summary_json() {  # <backlog-json-file> <tasks-json-file> <produ
               event:(event_history_for(.id; (.spawn_gen // null)) | last // null),
               event_history:event_history_for(.id; (.spawn_gen // null))} ]) as $issue_tasks_all
     | ([ $issue_tasks_all[] | .backlog.repo | select(type == "string" and length > 0) ] | unique) as $issue_projects
+    | ($issue_tasks_all | length) as $issue_task_total
     | ([ $issue_tasks_all[$queued_n:][] | select(.backlog.repo == null or .backlog.repo == "") ] | length) as $unscoped_omitted_issue_tasks
     | ([ $queued_all[]
          | select((.unresolved_blocker_ids | length) > 0 or (.hold_reason != null and .hold_kind != null))
@@ -1142,6 +1184,11 @@ secondmate_home_summary_json() {  # <backlog-json-file> <tasks-json-file> <produ
         state:$state,
         active_children:$active_all[:$child_n],
         issue_tasks:$issue_tasks_all[:$queued_n],
+        issue_inventory:{complete:true,total:$issue_task_total,page_size:$queued_n,
+          page_count:(if $issue_task_total == 0 then 0 else (($issue_task_total + $queued_n - 1) / $queued_n | floor) end),next_offset:null,
+          pages:[range(0;$issue_task_total;$queued_n) as $offset
+            | {offset:$offset,next_offset:(if $offset + $queued_n < $issue_task_total then $offset + $queued_n else null end),
+               tasks:$issue_tasks_all[$offset:($offset + $queued_n)]}]},
         omitted_issue_tasks_by_project:[$issue_projects[] as $project
           | {project:$project,
              count:(([ $issue_tasks_all[] | select(.backlog.repo == $project) ] | length)
@@ -1427,10 +1474,44 @@ length == 1 and (.[0] |
   and (.valid | type) == "boolean" and (.state | type) == "string"
   and (.invalidity | type) == "object" and (.invalidity.ids | type) == "array"
   and (.active_children | type) == "array" and ((.issue_tasks // []) | type) == "array"
+  and ((.issue_inventory // null) == null or
+    ((.issue_inventory) as $inv
+     | ($inv | type) == "object"
+     and $inv.complete == true
+     and ($inv.total | type) == "number" and $inv.total >= 0
+     and ($inv.page_size | type) == "number" and $inv.page_size > 0
+     and ($inv.page_count | type) == "number"
+     and ($inv.pages | type) == "array"
+     and ($inv.page_count == ($inv.pages | length))
+     and ($inv.total == ([$inv.pages[].tasks | length] | add // 0))
+     and all(range(0;$inv.page_count) as $i;
+       $inv.pages[$i].offset == $i * $inv.page_size
+       and $inv.pages[$i].next_offset == (if $i + 1 < $inv.page_count then ($i + 1) * $inv.page_size else null end)
+       and ($inv.pages[$i].tasks | type) == "array"
+       and ($inv.pages[$i].tasks | length) <= $inv.page_size)
+     and all($inv.pages[].tasks[];
+       (.id | type) == "string" and (.generation == null or (.generation | type) == "string")
+       and (.current_state | type) == "object" and (.backlog | type) == "object"
+       and (.backlog.links | type) == "array" and all(.backlog.links[]; type == "string" and length <= 500)
+       and (.source == null or ((.source | type) == "object"
+         and (.source.head == null or (.source.head | type) == "string")
+         and (.source.dirty == null or (.source.dirty | type) == "boolean")
+         and (.source.freshness | IN("fresh","unknown"))))
+       and (.verification | type) == "object"
+       and all(.verification | to_entries[]; (.key | IN("focused","full","verify"))
+         and (.value | type) == "object" and (.value.status | type) == "string"))
+     and (([$inv.pages[].tasks[] | .id] | unique | length) == $inv.total)))
   and all((.issue_tasks // [])[];
     (.id | type) == "string" and (.generation == null or (.generation | type) == "string")
     and (.kind == null or (.kind | type) == "string")
     and (.current_state | type) == "object" and (.backlog | type) == "object"
+    and (.source == null or ((.source | type) == "object"
+      and (.source.head == null or (.source.head | type) == "string")
+      and (.source.dirty == null or (.source.dirty | type) == "boolean")
+      and (.source.freshness | IN("fresh","unknown"))))
+    and ((.verification // {}) | type) == "object"
+    and all((.verification // {}) | to_entries[]; (.key | IN("focused","full","verify"))
+      and (.value | type) == "object" and (.value.status | type) == "string")
     and (.backlog.state == null or (.backlog.state | IN("queued","in_flight","done"))) and (.backlog.links | type) == "array"
     and all(.backlog.links[]; type == "string" and length <= 500)
     and (.event == null or ((.event | type) == "object" and .event.task == .id and .event.generation == .generation))

@@ -221,7 +221,8 @@ request_file = next((home / "state" / "status-summary" / "requests").glob("*.jso
 record = json.loads(request_file.read_text())
 textfile = tmp / "summary.txt"
 textfile.write_text("Fixture project summary.\n")
-put = [sys.executable, str(root / "bin" / "fm-issues.py"), "summary", "put", record["id"], "alpha", "--basis-fingerprint", record["basis_fingerprints"]["alpha"], "--basis-observed-at", str(record["requested_epoch"]), "--author", "fixture-worker", "--text-file", str(textfile)]
+basis = projection()
+put = [sys.executable, str(root / "bin" / "fm-issues.py"), "summary", "put", record["id"], "alpha", "--basis-fingerprint", basis["fingerprint"], "--basis-transition-watermark", basis["transition_watermark"], "--basis-observed-at", str(basis["generated_epoch"]), "--author", "fixture-worker", "--text-file", str(textfile)]
 written = json.loads(subprocess.check_output(put, cwd=root, env=env, text=True))
 assert written["status"] == "written", "summary with unchanged basis did not publish"
 req3 = json.loads(subprocess.check_output(request_cmd, cwd=root, env=env, text=True))
@@ -230,7 +231,7 @@ request_file = home / "state" / "status-summary" / "requests" / f"{req3['request
 record = json.loads(request_file.read_text())
 snapshot["tasks"][0]["current_state"]["state"] = "paused"
 (home / "state" / "issue-status" / "fleet.json").write_text(json.dumps({"schema": "fm-issue-fleet-cache.v1", "collected_epoch": int(time.time()), "snapshot": snapshot, "error": None}))
-put = [sys.executable, str(root / "bin" / "fm-issues.py"), "summary", "put", record["id"], "alpha", "--basis-fingerprint", record["basis_fingerprints"]["alpha"], "--basis-observed-at", str(record["requested_epoch"]), "--author", "fixture-worker", "--text-file", str(textfile)]
+put = [sys.executable, str(root / "bin" / "fm-issues.py"), "summary", "put", record["id"], "alpha", "--basis-fingerprint", basis["fingerprint"], "--basis-transition-watermark", basis["transition_watermark"], "--basis-observed-at", str(basis["generated_epoch"]), "--author", "fixture-worker", "--text-file", str(textfile)]
 outdated = json.loads(subprocess.check_output(put, cwd=root, env=env, text=True))
 assert outdated["status"] == "outdated", "status change during summary composition was not marked outdated"
 record = json.loads(request_file.read_text())

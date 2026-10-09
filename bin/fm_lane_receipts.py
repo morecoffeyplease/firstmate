@@ -58,3 +58,23 @@ def valid_receipt(value: Any, path: Path, lane: str, task: str, generation: str,
         valid = valid and (value.get("signal") is None or (isinstance(value.get("signal"), int) and 1 <= value["signal"] <= 64))
         valid = valid and (value.get("received_signal") is None or (isinstance(value.get("received_signal"), int) and 1 <= value["received_signal"] <= 64))
     return bool(valid)
+
+
+def classify_finished_receipt(value: dict[str, Any], generation: str,
+                              current_head: str | None) -> str:
+    """Qualify a finished receipt without inferring timeout or command intent."""
+    if value.get("generation") != generation:
+        return "unknown"
+    if value.get("signal") is not None or value.get("received_signal") is not None:
+        return "canceled"
+    if value.get("exit_code") is None:
+        return "unknown"
+    if value.get("exit_code") != 0:
+        return "failed"
+    if value.get("dirty_before") is True or value.get("dirty_after") is True or value.get("head_before") != value.get("head_after"):
+        return "passed-dirty"
+    if value.get("dirty_before") is not False or value.get("dirty_after") is not False or not current_head:
+        return "unknown"
+    if value.get("head_after") == current_head:
+        return "passed"
+    return "stale"

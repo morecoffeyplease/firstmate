@@ -142,6 +142,32 @@ def ready_state(task: dict[str, Any], configured_lanes: list[str]) -> str:
     return "ready for approval"
 
 
+def complete_task_fact(task: dict[str, Any], configured_lanes: list[str]) -> dict[str, Any]:
+    """Apply the shared semantic reducer to one validated fact from any owner."""
+    result = dict(task)
+    result["stage"], result["waiting"] = stage(
+        result, result.get("prs", []), result.get("backlog")
+    )
+    ready = ready_state(result, configured_lanes)
+    if result.get("evidence_freshness") not in (None, "fresh"):
+        ready = "unknown"
+    result["ready_for_approval"] = ready
+    if ready == "ready for approval":
+        result["stage"] = "Ready for approval"
+    result["next_step"] = next_step(result)
+    return result
+
+
+def owner_task_fact(task: dict[str, Any], owner_home_id: str,
+                    owner_task_id: str, configured_lanes: list[str]) -> dict[str, Any]:
+    """Stamp a validated source row before applying common issue semantics."""
+    result = dict(task)
+    result["fact_schema"] = "fm-issue-task-fact.v1"
+    result["owner_home_id"] = owner_home_id
+    result["owner_task_id"] = owner_task_id
+    return complete_task_fact(result, configured_lanes)
+
+
 def task_rank(task: dict[str, Any]) -> tuple[int, str]:
     if task.get("waiting") == "your decision":
         return 0, task.get("id") or ""
@@ -197,6 +223,32 @@ def semantic_fingerprint(rows: list[dict[str, Any]], unlinked: list[dict[str, An
     payload = {"schema": FINGERPRINT_SCHEMA, "rows": relevant,
                "unlinked_tasks": [fingerprint_task(task) for task in unlinked]}
     return hashlib.sha256(json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+
+
+def transition_watermark(rows: list[dict[str, Any]], unlinked: list[dict[str, Any]]) -> str:
+    """Bind summary applicability to retained owner transitions, including A-B-A."""
+    tasks = [task for row in rows for task in row.get("tasks", [])] + list(unlinked)
+    transitions = []
+    for task in tasks:
+        history = task.get("event_history")
+        if not isinstance(history, list):
+            continue
+        for event in history:
+            if not isinstance(event, dict) or event.get("generation") != task.get("generation"):
+                continue
+            if event.get("class") not in ("event", "detected"):
+                continue
+            transitions.append({
+                "task": task.get("id"),
+                "generation": task.get("generation"),
+                "at_epoch": event.get("at_epoch"),
+                "kind": event.get("kind"),
+                "fields": event.get("fields"),
+            })
+    transitions.sort(key=lambda item: (str(item["task"]), str(item["generation"]),
+                                       _integer(item["at_epoch"]), str(item["kind"])))
+    encoded = json.dumps(transitions, sort_keys=True, separators=(",", ":")).encode()
+    return hashlib.sha256(encoded).hexdigest()
 
 
 def choose_change(event_facts: list[dict[str, Any]], detected_bracket: dict[str, int] | None) -> dict[str, Any]:
