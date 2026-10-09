@@ -80,7 +80,7 @@ fm_lint_worker_stop() {
 
 fm_lint_worker() {  # <manifest> <output-dir> <shard-index>
   local manifest=$1 output_dir=$2 shard_index=$3 tab index path output invocation_rc rc=0
-  local root_timing root_profile root_index=0
+  local root_timing root_profile root_index=0 root_started root_ended
   local -a roots shellcheck_args
   roots=()
   tab=$(printf '\t')
@@ -115,6 +115,7 @@ fm_lint_worker() {  # <manifest> <output-dir> <shard-index>
     # peak memory at the single largest root instead of their sum.
     for path in "${roots[@]}"; do
       root_index=$((root_index + 1))
+      root_started=$(date +%s)
       invocation_rc=0
       if [ -n "${FM_LINT_INTERNAL_ROOT_PROFILE_DIR:-}" ] && [ -x /usr/bin/time ]; then
         root_timing="$FM_LINT_INTERNAL_ROOT_PROFILE_DIR/root.$shard_index.$root_index.time"
@@ -134,6 +135,7 @@ fm_lint_worker() {  # <manifest> <output-dir> <shard-index>
       FM_LINT_WORKER_SHELLCHECK_PID=$!
       wait "$FM_LINT_WORKER_SHELLCHECK_PID" || invocation_rc=$?
       FM_LINT_WORKER_SHELLCHECK_PID=
+      root_ended=$(date +%s)
       if [ -n "$root_profile" ] && [ -s "$root_timing" ]; then
         if [ "$(uname)" = Darwin ]; then
           root_timing=$(awk '
@@ -146,7 +148,8 @@ fm_lint_worker() {  # <manifest> <output-dir> <shard-index>
         else
           root_timing=$(cat "$root_timing")
         fi
-        printf '%s\t%s\t%s\t%s\n' "$shard_index" "$path" "$root_index" "$root_timing" >> "$root_profile"
+        printf '%s\t%s\t%s\t%s\t%s\t%s\n' \
+          "$shard_index" "$path" "$root_index" "$root_started" "$root_ended" "$root_timing" >> "$root_profile"
       fi
       if [ "$rc" -eq 0 ] && [ "$invocation_rc" -ne 0 ]; then
         rc=$invocation_rc
