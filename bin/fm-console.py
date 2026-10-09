@@ -78,7 +78,7 @@ def snapshot(home: Path, root: Path) -> dict:
 
 def issue_urls(record: dict) -> list[str]:
     backlog = record.get("backlog") or {}
-    values = backlog.get("links") or record.get("links") or []
+    values = [record.get("issue"), *(backlog.get("links") or record.get("links") or [])]
     urls = []
     for value in values:
         if isinstance(value, str) and re.fullmatch(r"https://github\.com/[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+/issues/[1-9][0-9]*", value):
@@ -88,7 +88,7 @@ def issue_urls(record: dict) -> list[str]:
 
 def pr_urls(record: dict) -> list[str]:
     backlog = record.get("backlog") or {}
-    values = [backlog.get("pr_url"), (record.get("pr") or {}).get("url")]
+    values = [backlog.get("pr_url"), record.get("pr_url"), (record.get("pr") or {}).get("url")]
     urls = []
     for value in values:
         if isinstance(value, str) and re.fullmatch(r"https://github\.com/[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+/pull/[1-9][0-9]*", value):
@@ -113,10 +113,25 @@ def task_records(value: dict) -> list[dict]:
                 item["id"] = f"{home_record.get('id', 'secondmate')}/{task.get('id', '')}"
                 item["owner_home_id"] = home_record.get("id")
                 records.append(item)
+        for task in home_record.get("active_children", []):
+            if isinstance(task, dict):
+                item = dict(task)
+                item["id"] = f"{home_record.get('id', 'secondmate')}/{task.get('id', '')}"
+                item["owner_task_id"] = task.get("id")
+                item["owner_home_id"] = home_record.get("id")
+                item["owner_home_path"] = home_record.get("home")
+                item["owner_remote"] = home_record.get("remote") is True
+                item["state"] = task.get("state") or "unknown"
+                item["repo"] = task.get("repo") or item.get("project")
+                records.append(item)
         for row in home_record.get("queued", []):
             if isinstance(row, dict):
                 item = dict(row)
                 item["id"] = f"{home_record.get('id', 'secondmate')}/{row.get('id', '')}"
+                item["owner_task_id"] = row.get("id")
+                item["owner_home_id"] = home_record.get("id")
+                item["owner_home_path"] = home_record.get("home")
+                item["owner_remote"] = home_record.get("remote") is True
                 records.append(item)
     unique: dict[str, dict] = {}
     for record in records:
@@ -137,11 +152,23 @@ def task_records(value: dict) -> list[dict]:
 
 def github_json(root: Path, path: str, home: Path) -> object:
     env = {**os.environ, "FM_HOME": str(home)}
-    result = run(["gh-axi", "api", path, "--full"], cwd=root, env=env, timeout=20)
+    result = run(["gh", "api", path], cwd=root, env=env, timeout=20)
     if result.returncode:
         raise RuntimeError(result.stderr[-500:] or "GitHub read failed")
     data = json.loads(result.stdout)
     return data
+
+
+def github_graphql(root: Path, home: Path, owner: str, repo: str, number: int) -> dict:
+    query = """query($owner:String!,$repo:String!,$number:Int!){repository(owner:$owner,name:$repo){pullRequest(number:$number){number url state isDraft merged mergedAt reviewDecision commits(last:1){nodes{commit{statusCheckRollup{state contexts(first:100){totalCount pageInfo{hasNextPage} nodes{__typename ... on CheckRun{name status conclusion} ... on StatusContext{context state}}}}}}}}}}}"""
+    env = {**os.environ, "FM_HOME": str(home)}
+    result = run(["gh", "api", "graphql", "-f", f"query={query}", "-F", f"owner={owner}", "-F", f"repo={repo}", "-F", f"number={number}"], cwd=root, env=env, timeout=20)
+    if result.returncode:
+        raise RuntimeError(result.stderr[-500:] or "GitHub pull request read failed")
+    value = json.loads(result.stdout)
+    if not isinstance(value, dict) or value.get("errors"):
+        raise RuntimeError("GitHub returned an invalid pull request response")
+    return value
 
 
 def fetch_issue(root: Path, home: Path, url: str) -> dict:
@@ -158,49 +185,58 @@ def fetch_issue(root: Path, home: Path, url: str) -> dict:
 def fetch_pr(root: Path, home: Path, url: str) -> dict:
     parts = url.removeprefix("https://github.com/").split("/")
     owner, repo, _, number = parts
-    pr = github_json(root, f"repos/{owner}/{repo}/pulls/{number}", home)
+    response = github_graphql(root, home, owner, repo, int(number))
+    pr = (((response.get("data") or {}).get("repository") or {}).get("pullRequest"))
     if not isinstance(pr, dict):
         raise RuntimeError("GitHub returned an unexpected pull request")
-    if pr.get("number") != int(number) or str(pr.get("html_url", "")).lower() != url.lower():
+    if pr.get("number") != int(number) or str(pr.get("url", "")).lower() != url.lower():
         raise RuntimeError("GitHub returned a different pull request identity")
-    head = (pr.get("head") or {}).get("sha")
-    pr["review_decision"] = "unknown"
-    pr["checks"] = "unknown"
-    if isinstance(head, str) and re.fullmatch(r"[A-Fa-f0-9]{40,64}", head):
-        try:
-            reviews = github_json(root, f"repos/{owner}/{repo}/pulls/{number}/reviews?per_page=100", home)
-            if isinstance(reviews, list):
-                latest = {}
-                for review in reviews:
-                    if isinstance(review, dict) and isinstance(review.get("user"), dict):
-                        latest[review["user"].get("login")] = review.get("state")
-                if any(state == "CHANGES_REQUESTED" for state in latest.values()):
-                    pr["review_decision"] = "changes requested"
-                elif any(state == "APPROVED" for state in latest.values()):
-                    pr["review_decision"] = "approved"
-                else:
-                    pr["review_decision"] = "review pending"
-            checks = github_json(root, f"repos/{owner}/{repo}/commits/{head}/check-runs?per_page=100", home)
-            runs = checks.get("check_runs") if isinstance(checks, dict) else None
-            if isinstance(runs, list) and runs:
-                conclusions = [item.get("conclusion") for item in runs if isinstance(item, dict)]
-                if any(item in ("failure", "timed_out", "action_required", "cancelled") for item in conclusions):
-                    pr["checks"] = "failed"
-                elif all(item in ("success", "neutral", "skipped") for item in conclusions) and len(conclusions) == len(runs):
-                    pr["checks"] = "passed"
-                else:
-                    pr["checks"] = "running"
-            elif isinstance(runs, list):
-                pr["checks"] = "none reported"
-        except (RuntimeError, ValueError, subprocess.SubprocessError):
-            pass
-    return pr
+    rollup = ((pr.get("commits") or {}).get("nodes") or [{}])
+    commit = (rollup[0].get("commit") or {}) if rollup and isinstance(rollup[0], dict) else {}
+    status = commit.get("statusCheckRollup") or {}
+    contexts = ((status.get("contexts") or {}).get("nodes") or [])
+    review = pr.get("reviewDecision")
+    if review == "APPROVED":
+        review_label = "approved"
+    elif review == "CHANGES_REQUESTED":
+        review_label = "changes requested"
+    elif review == "REVIEW_REQUIRED":
+        review_label = "review pending"
+    else:
+        review_label = "review unavailable"
+    states = []
+    for item in contexts:
+        if not isinstance(item, dict):
+            continue
+        if item.get("__typename") == "CheckRun":
+            if item.get("status") != "COMPLETED":
+                states.append("pending")
+            else:
+                states.append(str(item.get("conclusion") or "pending").lower())
+        elif item.get("__typename") == "StatusContext":
+            states.append(str(item.get("state") or "pending").lower())
+    context_page = ((status.get("contexts") or {}).get("pageInfo") or {})
+    if context_page.get("hasNextPage"):
+        checks_label = "truncated"
+    elif any(state in ("failure", "failed", "error", "timed_out", "action_required", "cancelled") for state in states):
+        checks_label = "failed"
+    elif any(state in ("pending", "queued", "in_progress", "expected") for state in states):
+        checks_label = "running"
+    elif states and all(state in ("success", "neutral", "skipped") for state in states):
+        checks_label = "passed"
+    elif not states and status:
+        checks_label = "none reported"
+    else:
+        checks_label = "unknown"
+    return {"number": pr["number"], "html_url": pr["url"], "state": str(pr.get("state", "unknown")).lower(),
+            "draft": pr.get("isDraft"), "merged": pr.get("merged") is True or bool(pr.get("mergedAt")),
+            "merged_at": pr.get("mergedAt"), "review_decision": review_label, "checks": checks_label}
 
 
 def stage(record: dict, prs: list[dict]) -> str:
-    open_prs = [pr for pr in prs if not (pr.get("merged") is True or pr.get("merged_at"))]
+    open_prs = [pr for pr in prs if not (pr.get("merged") is True or pr.get("merged_at") or str(pr.get("state", "")).lower() == "closed")]
     if prs and not open_prs:
-        return "merged"
+        return "merged" if all(pr.get("merged") is True or pr.get("merged_at") for pr in prs) else "closed unmerged"
     backlog = record.get("backlog") or record
     state = backlog.get("state")
     if state == "queued":
@@ -214,90 +250,185 @@ def stage(record: dict, prs: list[dict]) -> str:
     return "in review"
 
 
-def status_data(home: Path, root: Path, stale: dict | None = None) -> dict:
-    now = int(time.time())
-    try:
-        value = snapshot(home, root)
-        records = task_records(value)
-        projects = registered_projects(home)
-        repositories = {project: repository_identity(home, project) for project in projects}
-        rows: dict[str, dict] = {}
-        failures = []
-        for project, repo in repositories.items():
-            if repo is None:
-                failures.append(f"{project}: registered GitHub project origin is unavailable or invalid")
-        issue_cache: dict[str, dict] = {}
-        pr_cache: dict[str, dict] = {}
-        for record in records:
-            project = (record.get("backlog") or record).get("repo") or record.get("project")
-            if project not in projects:
+def secondmate_disclosures(value: dict) -> list[str]:
+    section = value.get("secondmate_current") or {}
+    warnings = []
+    if section.get("truncated"):
+        warnings.append(f"{section.get('truncated')} secondmate inventory record(s) were omitted")
+    for record in section.get("records", []):
+        if not isinstance(record, dict):
+            warnings.append("secondmate inventory contains an invalid record")
+            continue
+        name = record.get("id") or "secondmate"
+        current = record.get("current") or {}
+        reason = current.get("reason")
+        if current.get("state") == "unknown" or reason or record.get("registered") is False:
+            warnings.append(f"{name}: {reason or 'secondmate inventory is unavailable or unregistered'}")
+        freshness = record.get("freshness") or {}
+        if freshness.get("status") == "cached":
+            warnings.append(f"{name}: showing cached secondmate data ({freshness.get('age_seconds', 'unknown')} seconds old)")
+        omitted = record.get("omitted") or []
+        for item in omitted:
+            if isinstance(item, dict) and item.get("count"):
+                warnings.append(f"{name}: {item.get('count')} {item.get('surface', 'inventory')} record(s) omitted")
+    main = value.get("main_inventory") or {}
+    if main.get("valid") is False:
+        warnings.append(f"Main task inventory is incomplete: {main.get('reason') or 'current inventory could not be verified'}")
+    return sorted(set(warnings))
+
+
+def status_data(home: Path, root: Path, value: dict) -> dict:
+    records = task_records(value)
+    projects = registered_projects(home)
+    repositories = {project: repository_identity(home, project) for project in projects}
+    rows: dict[tuple, dict] = {}
+    failures = []
+    warnings = secondmate_disclosures(value)
+    for project, repo in repositories.items():
+        if repo is None:
+            failures.append(f"{project}: registered GitHub project origin is unavailable or invalid")
+    issue_cache: dict[str, dict] = {}
+    pr_cache: dict[str, dict] = {}
+
+    def add_unlinked(record: dict, project: str) -> None:
+        owner = record.get("owner_home_id") or "main"
+        task_id = record.get("owner_task_id") or record.get("id")
+        state = (record.get("current_state") or {}).get("state") or record.get("state") or "unknown"
+        backlog = record.get("backlog") or record
+        if backlog.get("state") != "in_flight" and state not in ("working", "parked", "paused", "blocked"):
+            return
+        key = (project, "unlinked", owner, task_id)
+        rows[key] = {"project": project, "number": None, "title": "No issue link recorded", "url": None,
+                     "issue_state": "unknown", "issue_missing": True,
+                     "tasks": [{"id": task_id, "owner": owner, "state": state, "stage": stage(record, [])}], "prs": []}
+
+    for record in records:
+        backlog = record.get("backlog") or record
+        project = backlog.get("repo") or record.get("repo") or record.get("project")
+        if project not in projects:
+            continue
+        linked = []
+        for url in issue_urls(record):
+            if repositories.get(project) is None or url_repository(url) != repositories[project]:
+                failures.append(f"{url}: issue repository does not match registered project {project}")
                 continue
-            for url in issue_urls(record):
-                if repositories.get(project) is None or url_repository(url) != repositories[project]:
-                    if url_repository(url) != repositories.get(project):
-                        failures.append(f"{url}: issue repository does not match registered project {project}")
+            linked.append(url)
+        if not linked:
+            add_unlinked(record, project)
+            continue
+        for url in linked:
+            try:
+                if url not in issue_cache:
+                    issue_cache[url] = fetch_issue(root, home, url)
+                issue = issue_cache[url]
+            except (RuntimeError, ValueError, subprocess.SubprocessError) as exc:
+                failures.append(f"{url}: {exc}")
+                issue = {"number": int(url.rsplit("/", 1)[1]), "title": "", "html_url": url, "state": "unknown"}
+            prs = []
+            for pr_url in pr_urls(record):
+                if url_repository(pr_url) != repositories.get(project):
+                    failures.append(f"{pr_url}: pull request repository does not match registered project {project}")
                     continue
                 try:
-                    if url not in issue_cache:
-                        issue_cache[url] = fetch_issue(root, home, url)
-                    issue = issue_cache[url]
+                    if pr_url not in pr_cache:
+                        pr_cache[pr_url] = fetch_pr(root, home, pr_url)
+                    prs.append(pr_cache[pr_url])
                 except (RuntimeError, ValueError, subprocess.SubprocessError) as exc:
-                    failures.append(f"{url}: {exc}")
-                    issue = {"number": int(url.rsplit("/", 1)[1]), "title": "", "html_url": url, "state": "unknown"}
-                prs = []
-                for pr_url in pr_urls(record):
-                    if url_repository(pr_url) != repositories.get(project):
-                        failures.append(f"{pr_url}: pull request repository does not match registered project {project}")
-                        continue
-                    try:
-                        if pr_url not in pr_cache:
-                            pr_cache[pr_url] = fetch_pr(root, home, pr_url)
-                        prs.append(pr_cache[pr_url])
-                    except (RuntimeError, ValueError, subprocess.SubprocessError) as exc:
-                        failures.append(f"{pr_url}: {exc}")
-                        prs.append({"html_url": pr_url, "state": "unknown", "draft": None})
-                key = (project, url)
-                row = rows.setdefault(key, {"project": project, "number": issue.get("number"), "title": issue.get("title"), "url": url, "issue_state": issue.get("state", "unknown"), "tasks": [], "prs": []})
-                row["tasks"].append({"id": record.get("id"), "state": (record.get("current_state") or {}).get("state") or record.get("state") or "unknown", "stage": stage(record, prs)})
-                for pr in prs:
-                    summary = {"url": pr.get("html_url"), "state": pr.get("state", "unknown"), "draft": pr.get("draft"), "merged": pr.get("merged") is True or bool(pr.get("merged_at")), "review": pr.get("review_decision") or "unknown", "checks": pr.get("checks") or "unknown"}
-                    if summary not in row["prs"]:
-                        row["prs"].append(summary)
-        result = {"generated_epoch": now, "projects": projects, "rows": list(rows.values()), "failures": failures, "stale": False, "unavailable": False}
-        result["rows"].sort(key=lambda row: (row["project"], row["number"] or 0))
-        return result
-    except (RuntimeError, ValueError, OSError, subprocess.SubprocessError) as exc:
-        if stale:
-            return {**stale, "stale": True, "error": str(exc), "attempted_epoch": now}
-        return {"generated_epoch": now, "projects": registered_projects(home), "rows": [], "failures": [], "stale": False, "unavailable": True, "error": str(exc)}
+                    failures.append(f"{pr_url}: {exc}")
+                    prs.append({"html_url": pr_url, "state": "unknown", "draft": None})
+            key = (project, url)
+            row = rows.setdefault(key, {"project": project, "number": issue.get("number"), "title": issue.get("title"),
+                                        "url": url, "issue_state": issue.get("state", "unknown"),
+                                        "issue_missing": False, "tasks": [], "prs": []})
+            row["tasks"].append({"id": record.get("owner_task_id") or record.get("id"),
+                                  "owner": record.get("owner_home_id") or "main",
+                                  "state": (record.get("current_state") or {}).get("state") or record.get("state") or "unknown",
+                                  "stage": stage(record, prs)})
+            for pr in prs:
+                summary = {"url": pr.get("html_url"), "state": pr.get("state", "unknown"), "draft": pr.get("draft"),
+                           "merged": pr.get("merged") is True or bool(pr.get("merged_at")),
+                           "review": pr.get("review_decision") or "unknown", "checks": pr.get("checks") or "unknown"}
+                if summary not in row["prs"]:
+                    row["prs"].append(summary)
+    result = {"generated_epoch": int(value.get("generated_epoch") or time.time()), "projects": projects,
+              "rows": list(rows.values()), "failures": failures, "warnings": warnings,
+              "stale": False, "unavailable": False}
+    result["rows"].sort(key=lambda row: (row["project"], row["number"] or 0, row["title"] or ""))
+    return result
 
 
-def decisions(home: Path, root: Path) -> list[dict]:
+def decisions(home: Path, root: Path, value: dict) -> list[dict]:
     env = {**os.environ, "FM_HOME": str(home)}
     script = '. "$1/fm-classify-lib.sh"; scan_open_decisions "${FM_STATE_OVERRIDE:-${FM_HOME}/state}"'
     result = run(["/bin/bash", "-c", script, "fm-console-decisions", str(root / "bin")], cwd=root, env=env)
     if result.returncode:
         raise RuntimeError(result.stderr[-500:] or "open decision scan failed")
     out = []
+    seen = set()
     for line in result.stdout.splitlines():
         parts = line.split("\t", 3)
         if len(parts) != 4:
             continue
         task, key, verb, note = parts
         if ID_RE.fullmatch(task) and key and verb in ("needs-decision", "blocked"):
-            out.append({"task": task, "key": key, "verb": verb, "note": note})
-    return out
+            out.append({"owner": "main", "task": task, "key": key, "verb": verb, "note": note, "answerable": True})
+            seen.add(("main", task, key))
+    main_tasks = [item for item in value.get("tasks", []) if isinstance(item, dict)]
+    targets_by_key = {}
+    for task in main_tasks:
+        for key in task.get("decision_keys", []):
+            targets_by_key.setdefault(key, task.get("id"))
+    for row in (value.get("backlog") or {}).get("records", []):
+        if not isinstance(row, dict) or row.get("captain_actionable") is not True:
+            continue
+        key = row.get("id")
+        target = row.get("target_task_id") or targets_by_key.get(key) or (key if any(task.get("id") == key for task in main_tasks) else None)
+        if isinstance(key, str) and ID_RE.fullmatch(key) and ("main", target, key) not in seen:
+            out.append({"owner": "main", "task": target, "key": key, "verb": "captain-hold",
+                        "note": row.get("hold_reason") or row.get("title") or "Captain-held task", "answerable": bool(target)})
+            seen.add(("main", target, key))
+    for home_record in ((value.get("secondmate_current") or {}).get("records") or []):
+        if not isinstance(home_record, dict):
+            continue
+        owner = home_record.get("id")
+        remote = home_record.get("remote") is True
+        for item in home_record.get("decisions_open", []):
+            if not isinstance(item, dict) or item.get("verb") not in ("needs-decision", "blocked", "captain-hold"):
+                continue
+            key = item.get("key")
+            task = item.get("target_task_id") or (item.get("id") if item.get("verb") != "captain-hold" else None)
+            identity = (owner, task, key)
+            if not isinstance(owner, str) or not ID_RE.fullmatch(owner) or not isinstance(key, str) or not key:
+                continue
+            if identity not in seen:
+                out.append({"owner": owner, "remote": remote, "task": task, "key": key,
+                            "verb": item["verb"], "note": item.get("summary") or item.get("reason") or "Open decision",
+                            "answerable": isinstance(task, str) and ID_RE.fullmatch(task) is not None})
+                seen.add(identity)
+    return sorted(out, key=lambda item: (item.get("owner") or "", item.get("task") or "", item.get("key") or ""))
 
 
-def queue_data(home: Path, root: Path) -> list[dict]:
-    try:
-        snap = snapshot(home, root)
-    except (RuntimeError, ValueError, OSError, subprocess.SubprocessError) as exc:
-        raise RuntimeError(f"queue unavailable: {exc}") from exc
+def queue_data(snap: dict) -> list[dict]:
     out = []
     for row in (snap.get("backlog") or {}).get("records", []):
         if isinstance(row, dict) and row.get("state") in ("queued", "in_flight"):
             out.append({key: row.get(key) for key in ("id", "title", "state", "repo", "blocked_by_ids", "unresolved_blocker_ids", "blocked_reason", "captain_actionable")})
+    for home_record in ((snap.get("secondmate_current") or {}).get("records") or []):
+        if not isinstance(home_record, dict):
+            continue
+        owner = home_record.get("id") or "secondmate"
+        for child in home_record.get("active_children", []):
+            if isinstance(child, dict):
+                out.append({"id": f"{owner}/{child.get('id', '')}", "title": child.get("name") or child.get("id"),
+                            "state": child.get("state") or "working", "repo": child.get("repo"), "blocked_by_ids": [],
+                            "unresolved_blocker_ids": [], "blocked_reason": None, "captain_actionable": False})
+        for row in home_record.get("queued", []):
+            if isinstance(row, dict):
+                out.append({"id": f"{owner}/{row.get('id', '')}", "title": row.get("title"), "state": "queued",
+                            "repo": row.get("repo"), "blocked_by_ids": row.get("blocked_by_ids") or [],
+                            "unresolved_blocker_ids": row.get("unresolved_blocker_ids") or [],
+                            "blocked_reason": row.get("blocked_reason") or row.get("hold_reason"),
+                            "captain_actionable": row.get("captain_actionable") is True})
     out.sort(key=lambda row: (row.get("repo") or "", row.get("id") or ""))
     return out
 
@@ -317,12 +448,36 @@ const el=id=>document.getElementById(id),node=value=>document.createTextNode(val
 function activate(tab){for(const item of tabs){const on=item===tab;item.setAttribute('aria-selected',on);el(item.getAttribute('aria-controls')).hidden=!on}}
 tabs.forEach((tab,index)=>{tab.onclick=()=>activate(tab);tab.onkeydown=event=>{if(!['ArrowLeft','ArrowRight','Home','End'].includes(event.key))return;event.preventDefault();const next=event.key==='Home'?0:event.key==='End'?tabs.length-1:(index+(event.key==='ArrowRight'?1:-1)+tabs.length)%tabs.length;tabs[next].focus();activate(tabs[next])}});
 function link(url,label){const a=document.createElement('a');a.href=url;a.target='_blank';a.textContent=label;a.rel='noopener noreferrer';return a}
-function prCell(prs){const root=document.createElement('div');for(const pr of prs||[]){const state=pr.merged?'merged':pr.draft?'draft PR':pr.state;root.append(link(pr.url,`PR · ${state}`),node(` · review ${pr.review}; checks ${pr.checks}`),document.createElement('br'))}if(!prs?.length)root.textContent='No linked PR';return root}
+function prCell(prs){const root=document.createElement('div');for(const pr of prs||[]){const state=pr.merged?'merged':pr.state==='closed'?'closed unmerged':pr.draft?'draft PR':pr.state;root.append(link(pr.url,`PR · ${state}`),node(` · review ${pr.review}; checks ${pr.checks}`),document.createElement('br'))}if(!prs?.length)root.textContent='No linked PR';return root}
 function table(parent,headers,rows){const t=document.createElement('table'),head=document.createElement('thead'),hr=document.createElement('tr');headers.forEach(h=>{const th=document.createElement('th');th.textContent=h;hr.append(th)});head.append(hr);const body=document.createElement('tbody');rows.forEach(row=>{const tr=document.createElement('tr');row.forEach(value=>{const td=document.createElement('td');if(value instanceof Node)td.append(value);else td.append(node(value));tr.append(td)});body.append(tr)});t.append(head,body);parent.replaceChildren(t)}
-async function load(force=false){try{const project=el('project').value,params=new URLSearchParams();if(project)params.set('project',project);if(force)params.set('refresh','1');const query=params.toString()?'?'+params.toString():'';const [s,d,q]=await Promise.all([fetch('/api/status'+query).then(x=>x.json()),fetch('/api/decisions').then(x=>x.json()),fetch('/api/queue').then(x=>x.json())]);if(s.error&&s.unavailable)throw Error(s.error);const select=el('project'),prior=select.value;select.replaceChildren(...(s.projects||[]).map(name=>{const o=document.createElement('option');o.value=name;o.textContent=name;return o}));if((s.projects||[]).includes(prior))select.value=prior;const rows=(s.rows||[]).filter(row=>!select.value||row.project===select.value).map(row=>[row.project,link(row.url,`#${row.number} ${row.title||'(title unavailable)'}`),row.issue_state,row.tasks.map(task=>`${task.id}: ${task.stage} (${task.state})`).join('\n'),prCell(row.prs)]);if(rows.length)table(el('status-content'),['Project','Issue','Issue state','Lane stage','PR status'],rows);else el('status-content').textContent=select.value?'No admitted issues are linked to this project yet.':'No registered projects are available.';if(s.failures?.length){status.className='error';status.textContent=`Updated with unavailable source data at ${new Date(s.generated_epoch*1000).toLocaleString()}.\n${s.failures.join('\n')}`}else{status.className=s.stale?'error':'muted';status.textContent=`${s.stale?'Stale cached':'Updated'} ${new Date(s.generated_epoch*1000).toLocaleString()}${s.error?' · '+s.error:''}`}const dr=(d.decisions||[]).map(item=>{const form=document.createElement('form'),label=document.createElement('strong'),area=document.createElement('textarea'),send=document.createElement('button');label.textContent=`${item.task} · ${item.key} · ${item.verb}: ${item.note}`;area.name='answer';area.maxLength=8192;area.required=true;area.setAttribute('aria-label',`Answer ${item.key}`);send.textContent='Answer and send';form.append(label,area,send);form.onsubmit=async event=>{event.preventDefault();send.disabled=true;try{const result=await fetch('/api/answer',{method:'POST',headers:{'Content-Type':'application/json','X-FM-Token':token},body:JSON.stringify({task:item.task,key:item.key,answer:area.value})}).then(x=>x.json());if(!result.ok)throw Error(result.error||'answer was not delivered');await load()}catch(error){status.className='error';status.textContent='Answer failed: '+error.message;send.disabled=false}};return [form]});if(d.error)throw Error(d.error);table(el('decisions-content'),['Open decision'],dr);if(!(d.decisions||[]).length)el('decisions-content').textContent='No open decisions.';if(q.error){el('queue-content').textContent='Queue unavailable: '+q.error}else{const items=q.items||[];if(items.length)table(el('queue-content'),['Task','Project','State','Dependencies / blocker'],items.map(item=>[`${item.id||''} ${item.title||''}`,item.repo||'Unassigned',item.state,item.blocked_reason||item.unresolved_blocker_ids?.join(', ')||item.blocked_by_ids?.join(', ')||(item.state==='queued'?'Waiting for admission; no dependency blocker recorded':'Currently admitted')]));else el('queue-content').textContent='No queued or in-flight work.'}}catch(error){status.className='error';status.textContent='Unavailable: '+error.message}}
-el('project').onchange=()=>load();el('refresh').onclick=()=>load(true);load();setInterval(()=>{if(!document.hidden)load()},30000);
+const drafts=new Map();let latestData=null;
+function render(data){if(data.unavailable){status.className='error';status.textContent='Unavailable: '+data.error;return}const s=data.status||{},d=data.decisions||[],q=data.queue||[];const select=el('project'),prior=select.value;select.replaceChildren(...(s.projects||[]).map(name=>{const o=document.createElement('option');o.value=name;o.textContent=name;return o}));if((s.projects||[]).includes(prior))select.value=prior;const rows=(s.rows||[]).filter(row=>!select.value||row.project===select.value).map(row=>[row.project,row.issue_missing?row.title:link(row.url,`#${row.number} ${row.title||'(title unavailable)'}`),row.issue_state,row.tasks.map(task=>`${task.owner||'main'}/${task.id}: ${task.stage} (${task.state})`).join('\n'),prCell(row.prs)]);if(rows.length)table(el('status-content'),['Project','Issue','Issue state','Lane stage','PR status'],rows);else el('status-content').textContent=select.value?'No admitted issues or unlinked work are recorded for this project.':'No registered projects are available.';const notices=[...(s.failures||[]),...(data.warnings||[])];status.className=s.stale||notices.length?'error':'muted';status.textContent=`${s.stale?'Stale cached':'Updated'} ${new Date(data.generated_epoch*1000).toLocaleString()} · snapshot age ${data.age_seconds}s${data.error?' · '+data.error:''}${notices.length?'\n'+notices.join('\n'):''}`;const decisionRows=d.map(item=>{const label=document.createElement('strong'),content=document.createElement('div');label.textContent=`${item.owner==='main'?'Main':item.owner} · ${item.task||'owner unavailable'} · ${item.key} · ${item.verb}: ${item.note}`;content.append(label);if(!item.answerable){const notice=document.createElement('p');notice.textContent='Answer unavailable: owning task could not be resolved.';content.append(notice);return [content]}const identity=JSON.stringify([item.owner,item.task,item.key]),form=document.createElement('form'),area=document.createElement('textarea'),send=document.createElement('button');area.name='answer';area.maxLength=8192;area.required=true;area.setAttribute('aria-label',`Answer ${item.key}`);area.value=drafts.get(identity)||'';area.oninput=()=>drafts.set(identity,area.value);send.textContent='Answer and send';form.append(area,send);form.onsubmit=async event=>{event.preventDefault();send.disabled=true;try{const result=await fetch('/api/answer',{method:'POST',headers:{'Content-Type':'application/json','X-FM-Token':token},body:JSON.stringify({owner:item.owner,task:item.task,key:item.key,answer:area.value})}).then(x=>x.json());if(!result.ok)throw Error(result.error||'answer was not delivered');drafts.delete(identity);await load(true)}catch(error){status.className='error';status.textContent='Answer failed: '+error.message;send.disabled=false}};content.append(form);return [content]});table(el('decisions-content'),['Open decision'],decisionRows);if(!d.length)el('decisions-content').textContent='No open decisions.';if(q.length)table(el('queue-content'),['Task','Project','State','Dependencies / admission blocker'],q.map(item=>[`${item.id||''} ${item.title||''}`,item.repo||'Unassigned',item.state,item.blocked_reason||item.unresolved_blocker_ids?.join(', ')||item.blocked_by_ids?.join(', ')||(item.state==='queued'?'Waiting for admission; no dependency blocker recorded':'Currently admitted')]));else el('queue-content').textContent='No queued or in-flight work.'}
+async function load(force=false){try{const query=force?'?refresh=1':'';const response=await fetch('/api/data'+query),data=await response.json();if(!response.ok&&!data.status)throw Error(data.error||'console data unavailable');latestData=data;render(data)}catch(error){status.className='error';status.textContent='Unavailable: '+error.message}}
+el('project').onchange=()=>{if(latestData)render(latestData)};el('refresh').onclick=()=>load(true);load();setInterval(()=>{if(!document.hidden)load()},30000);
 </script></html>"""
     return html_page.replace("__TOKEN__", token_json).encode()
+
+
+def compose_data(home: Path, root: Path, value: dict) -> dict:
+    status = status_data(home, root, value)
+    generated = int(value.get("generated_epoch") or status["generated_epoch"])
+    warnings = list(status.get("warnings") or [])
+    return {"generated_epoch": generated, "age_seconds": max(0, int(time.time()) - generated),
+            "status": status, "decisions": decisions(home, root, value), "queue": queue_data(value),
+            "warnings": warnings, "stale": False, "unavailable": False}
+
+
+def validated_local_secondmate_home(record: dict, owner: str) -> Path:
+    raw = record.get("home")
+    if not isinstance(raw, str) or not raw.startswith("/"):
+        raise ValueError("secondmate home path is unavailable")
+    path = Path(raw)
+    marker = path / ".fm-secondmate-home"
+    if path.is_symlink() or not path.is_dir() or marker.is_symlink() or not marker.is_file():
+        raise ValueError("secondmate home is unavailable or unsafe")
+    if marker.read_text(encoding="utf-8").strip() != owner:
+        raise ValueError("secondmate home identity changed")
+    return path.resolve(strict=True)
 
 
 def serve(home: Path, root: Path, port: int | None) -> int:
@@ -364,36 +519,29 @@ def serve(home: Path, root: Path, port: int | None) -> int:
                 self.end_headers()
                 self.wfile.write(body)
                 return
-            if parsed.path == "/api/status":
+            if parsed.path == "/api/data":
                 query = urllib.parse.parse_qs(parsed.query)
-                project = query.get("project", [""])[0]
-                names = registered_projects(home)
-                if project and project not in names:
-                    self.send(400, {"error": "project is not registered"})
-                    return
                 if query.get("refresh") == ["1"] or cached is None or time.monotonic() - cache_at >= 20:
-                    cached = status_data(home, root, cached)
-                    cache_at = time.monotonic()
-                value = dict(cached)
-                value["projects"] = names
-                value["rows"] = [row for row in value.get("rows", []) if row["project"] in names and (not project or row["project"] == project)]
-                self.send(200, value)
-                return
-            if parsed.path == "/api/decisions":
-                try:
-                    self.send(200, {"decisions": decisions(home, root)})
-                except (RuntimeError, OSError) as exc:
-                    self.send(503, {"error": str(exc)})
-                return
-            if parsed.path == "/api/queue":
-                try:
-                    self.send(200, {"items": queue_data(home, root)})
-                except RuntimeError as exc:
-                    self.send(503, {"error": str(exc)})
+                    try:
+                        snap = snapshot(home, root)
+                        cached = compose_data(home, root, snap)
+                        cache_at = time.monotonic()
+                    except (RuntimeError, ValueError, OSError, subprocess.SubprocessError) as exc:
+                        if cached is None:
+                            self.send(503, {"unavailable": True, "error": str(exc)})
+                            return
+                        cached = json.loads(json.dumps(cached))
+                        cached["status"]["stale"] = True
+                        cached["status"]["error"] = str(exc)
+                        cached["warnings"] = sorted(set(cached.get("warnings", []) + [f"Refresh failed; showing cached data: {exc}"]))
+                payload = json.loads(json.dumps(cached))
+                payload["age_seconds"] = max(0, int(time.time()) - payload["generated_epoch"])
+                self.send(200, payload)
                 return
             self.send(404, {"error": "not found"})
 
         def do_POST(self) -> None:
+            nonlocal cached, cache_at
             expected_origin = f"http://127.0.0.1:{self.server.server_port}"
             if (self.path != "/api/answer" or not self.valid_host() or self.headers.get("Origin") != expected_origin
                     or not secrets.compare_digest(self.headers.get("X-FM-Token", ""), token)):
@@ -404,19 +552,37 @@ def serve(home: Path, root: Path, port: int | None) -> int:
                 if length <= 0 or length > MAX_ANSWER + 1024:
                     raise ValueError("invalid request size")
                 body = json.loads(self.rfile.read(length))
-                if not isinstance(body, dict) or set(body) != {"task", "key", "answer"}:
+                if not isinstance(body, dict) or set(body) != {"owner", "task", "key", "answer"}:
                     raise ValueError("invalid answer request")
-                task, key, answer = body["task"], body["key"], body["answer"]
-                if not isinstance(task, str) or not ID_RE.fullmatch(task) or not isinstance(key, str) or not re.fullmatch(r"[A-Za-z0-9._-]{1,128}", key):
+                owner, task, key, answer = body["owner"], body["task"], body["key"], body["answer"]
+                if not isinstance(owner, str) or (owner != "main" and not ID_RE.fullmatch(owner)) or not isinstance(task, str) or not ID_RE.fullmatch(task) or not isinstance(key, str) or not re.fullmatch(r"[A-Za-z0-9._-]{1,128}", key):
                     raise ValueError("invalid decision identity")
                 if not isinstance(answer, str) or not answer.strip() or len(answer.encode("utf-8")) > MAX_ANSWER or "\x00" in answer:
                     raise ValueError("answer must contain 1 to 8192 bytes")
-                open_keys = {(item["task"], item["key"]) for item in decisions(home, root)}
-                if (task, key) not in open_keys:
+                current = snapshot(home, root)
+                match = next((item for item in decisions(home, root, current)
+                              if item.get("owner") == owner and item.get("task") == task and item.get("key") == key), None)
+                if not match or not match.get("answerable"):
                     raise ValueError("decision is no longer open")
-                result = run([str(root / "bin" / "fm-send.sh"), task, "--resolve-key", key, "--", answer], cwd=root, env={**os.environ, "FM_HOME": str(home)}, timeout=45)
+                if owner == "main":
+                    command = [str(root / "bin" / "fm-send.sh"), task, "--resolve-key", key, "--", answer]
+                    answer_home = home
+                else:
+                    record = next((item for item in ((current.get("secondmate_current") or {}).get("records") or [])
+                                   if isinstance(item, dict) and item.get("id") == owner), None)
+                    if not record:
+                        raise ValueError("decision owner is no longer registered")
+                    if record.get("remote") is True:
+                        command = [str(root / "bin" / "fm-on.sh"), owner, "fm-send.sh", task, "--resolve-key", key, "--", answer]
+                        answer_home = home
+                    else:
+                        answer_home = validated_local_secondmate_home(record, owner)
+                        command = [str(root / "bin" / "fm-send.sh"), task, "--resolve-key", key, "--", answer]
+                result = run(command, cwd=root, env={**os.environ, "FM_HOME": str(answer_home), "FM_ROOT_OVERRIDE": str(root)}, timeout=60)
                 if result.returncode:
                     raise RuntimeError(result.stderr[-800:] or "fm-send could not deliver the answer")
+                cached = None
+                cache_at = 0.0
                 self.send(200, {"ok": True, "result": result.stdout[-500:]})
             except (OSError, ValueError, RuntimeError, subprocess.SubprocessError, json.JSONDecodeError) as exc:
                 self.send(400, {"ok": False, "error": str(exc)})
