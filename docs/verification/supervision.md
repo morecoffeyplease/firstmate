@@ -58,7 +58,7 @@ A file named both by `-e` and by auto-discovery loads twice (two factory calls, 
 ### Run-tier source vocabulary and context-reset injection
 
 The run tier depends on three facts only the vendor can supply: the session-open source it reports, whether hook stdout reaches model context on a context-RESET open rather than only a cold one, and whether a worker the hook detaches survives the hook returning.
-The first two were measured on 2026-08-05 against a throwaway Firstmate-shaped lab carrying each harness's own tracked registration with a recorder standing in for `bin/fm-sessionstart-run.sh`.
+The first two were measured on 2026-08-05 against a throwaway Firstmate-shaped lab carrying each harness's own tracked registration with a recorder standing in for `bin/fm-sessionstart-run.sh` (Codex refreshed 2026-10-09).
 Each open printed a source-stamped token, and the model was asked to quote that token back, so producing hook stdout could never be mistaken for delivering it.
 The third is recorded below.
 
@@ -83,6 +83,15 @@ FM_SESSIONSTART_HOOK_LIVE_E2E=1 tests/fm-sessionstart-hook-live-e2e.test.sh
 ```
 
 Claude and Pi were absent from that `PATH`, so this run refreshed only Codex evidence.
+The compaction check uses the manual `/compact` command; automatic compaction was not exercised.
+The portable regression also proves the Codex guard rejects a recorded startup and clear with no following `compact` event:
+
+```text
+FM_TEST_BEGIN 2026-10-09T07:32:18Z tests/fm-sessionstart-nudge.test.sh family=session-bootstrap expected_gate_skip=none
+ok - Codex live guard rejects a withheld compaction event
+FM_TEST_END 2026-10-09T07:33:21Z tests/fm-sessionstart-nudge.test.sh exit=0 duration_ms=62562 gate_skip=false
+```
+
 Observed Codex output:
 
 ```text
@@ -321,7 +330,7 @@ Cursor compaction instruction refresh is DEFERRED and not shipped, so a Cursor p
 Two static facts decided that: `PreCompactRequestResponse` carries only `user_message`, and `preCompact` is absent from the `additional_context` step set (`index.js` @ 4814884), so the step cannot inject a digest and any delivery has to be routed through a later boundary.
 A staged-then-delivered design is rejected because carrying a digest across two concurrently running `stop` hooks can deliver it twice or strand it indefinitely, while closing those races enlarges a critical section inside a hook Cursor awaits at the turn boundary.
 Native `preCompact` firing was not observed because a real compaction could not be forced in the isolated session, so the surface has no empirical basis yet.
-It is therefore recorded as uncovered in the same sense as the Codex interactive TUI, and `tests/fm-cursor-primary.test.sh` asserts `preCompact` stays unregistered so it cannot return unnoticed without its own design and evidence.
+`tests/fm-cursor-primary.test.sh` asserts `preCompact` stays unregistered so it cannot return unnoticed without its own design and evidence.
 
 The Grok adaptive matrix ran on 2026-07-28 with separate scratch repositories and homes, dedicated tmux sockets, one target plus one control window, ambient tmux variables removed, and a socket-bound wrapper first in `PATH`.
 
