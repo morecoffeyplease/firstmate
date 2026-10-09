@@ -188,6 +188,7 @@ shell_quote() {
 
 STATUS_FILE=$(shell_quote "$STATE/$ID.status")
 INBOX_DIR=$(shell_quote "$STATE/$ID.inbox")
+DECISION_EVENT_COMMAND="FM_HOME=$(shell_quote "$FM_HOME") FM_ROOT_OVERRIDE=$(shell_quote "$FM_ROOT") FM_STATE_OVERRIDE=$(shell_quote "$STATE") $(shell_quote "$SCRIPT_DIR/fm-captain-hold.sh") decision-event $(shell_quote "$ID") --key '<key>' --input-file '<decision.json>'"
 
 # The receive-and-ack half of the steering-inbox contract, included in every
 # scaffold kind. The record format, doorbell line, and re-ring ladder are
@@ -409,7 +410,9 @@ The report is the only thing that survives, so anything worth keeping must be in
    Use \`blocked:\` when you are stuck and need help.
 5. If you hit the same obstacle twice, append \`blocked: {why}\` and stop; firstmate will help.
 6. If a decision belongs to a human (product choices, destructive actions),
-   create the structured plain-language input required by \`bin/fm-captain-hold.sh --help\`, then use \`decision-event\` for a keyed \`needs-decision\` or \`hold --decision-file\` for an active captain hold; include context, lettered options with pros and cons, and a recommendation naming one letter with its reason.
+   create the structured plain-language JSON required by \`$SCRIPT_DIR/fm-captain-hold.sh --help\`, then record a keyed \`needs-decision\` by running \`$DECISION_EVENT_COMMAND\` after replacing the key and file placeholders.
+   This command is bound to your task id and the supervising Firstmate home; do not create or edit a backlog captain hold yourself.
+   Include context, user impact, lettered options with pros and cons, and a recommendation naming one letter with its reason.
    Use user impact language and full GitHub issue or pull request links where relevant, then stop for Firstmate's reply.
 $ASK_USER_BLOCK
    A decision or blocker you opened stays open until a \`resolved\` line carrying its exact key lands; a later \`done:\` or \`working:\` line never closes it, even when the answer is what started that work.
@@ -475,7 +478,9 @@ $RULE1
    cadence instead of treating it as a possible wedge. Use \`blocked:\` when you are stuck and need help.
 5. If you hit the same obstacle twice, append \`blocked: {why}\` and stop; firstmate will help.
 6. If a decision belongs above the implementation worker (product choices, destructive actions),
-   create the structured plain-language input required by \`bin/fm-captain-hold.sh --help\`, then use \`decision-event\` for a keyed \`needs-decision\` or \`hold --decision-file\` for an active captain hold; include context, lettered options with pros and cons, and a recommendation naming one letter with its reason.
+   create the structured plain-language JSON required by \`$SCRIPT_DIR/fm-captain-hold.sh --help\`, then record a keyed \`needs-decision\` by running \`$DECISION_EVENT_COMMAND\` after replacing the key and file placeholders.
+   This command is bound to your task id and the supervising Firstmate home; do not create or edit a backlog captain hold yourself.
+   Include context, user impact, lettered options with pros and cons, and a recommendation naming one letter with its reason.
    Use user impact language and full GitHub issue or pull request links where relevant, then stop for Firstmate's reply.
 $ASK_USER_BLOCK
    A decision or blocker you opened stays open until a \`resolved\` line carrying its exact key lands; a later \`done:\` or \`working:\` line never closes it, even when the answer is what started that work.

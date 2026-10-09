@@ -131,7 +131,7 @@ An owner-qualified `<project>/pid-<n>` answer instead goes through `bin/fm-produ
 Do not copy the decision into the root backlog or resolve a PID by creating a main-home request.
 Reconcile selections use the same owner-aware route to file the binding-checked request in the task-owning home.
 If a route reports durable queuing, retry it with `bin/fm-product-decision.sh retry-routes` from its owner home before claiming delivery.
-When the captain's answer is "later", record it as a deferral with `bin/fm-captain-hold.sh hold <id> --reason "<reason>" --until <date>` instead of a closure.
+When the captain's answer is "later", defer the existing structured hold with `bin/fm-captain-hold.sh hold <id> --reason "<reason>" --until <date>` instead of a closure.
 A current structured Reconcile selection closes nothing: the versioned board context carries its exact selected option separately from any typed note, and the adapter routes that selection only into a durable re-check request while preserving the note as provenance.
 The rollout-compatible old context still feeds ordinary non-reconcile answers, but its bare or separator-annotated reconcile values and every structurally uncertain choice feed neither intake and remain announced for deliberate handling.
 Verify the call's latest state, then retire the request through `bin/fm-captain-hold.sh reconcile close <id> --evidence-file <path>` when it turns out to be moot, or `reconcile note <id> --note-file <path>` when it is genuinely still open.

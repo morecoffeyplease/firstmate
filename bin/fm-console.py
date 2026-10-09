@@ -126,7 +126,7 @@ def snapshot(home: Path, root: Path) -> dict:
     return value
 
 
-def issue_urls(record: dict, project_home: Path | None = None) -> list[str]:
+def issue_urls(record: dict, project_home: Path | None = None, include_title_references: bool = True) -> list[str]:
     backlog = record.get("backlog") or {}
     values = [record.get("issue"), *(backlog.get("links") or record.get("links") or [])]
     urls = []
@@ -136,7 +136,7 @@ def issue_urls(record: dict, project_home: Path | None = None) -> list[str]:
     text = "\n".join(str(line) for line in (record.get("body_lines") or backlog.get("body_lines") or []))
     text += "\n" + str(backlog.get("body_excerpt") or record.get("body_excerpt") or "")
     urls.extend(re.findall(r"https://github\.com/[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+/issues/[1-9][0-9]*", text))
-    if project_home is not None:
+    if include_title_references and project_home is not None:
         project = record.get("repo") or record.get("project") or backlog.get("repo")
         repository = repository_identity(project_home, project) if isinstance(project, str) else None
         if repository:
@@ -286,7 +286,7 @@ def fetch_issues(root: Path, home: Path, urls: list[str]) -> dict[str, dict]:
             try:
                 found[url] = fetch_issue(root, home, url)
             except (RuntimeError, ValueError, subprocess.SubprocessError):
-                found[url] = {"html_url": url, "title": "Issue details unavailable", "milestone": None}
+                found[url] = {"html_url": url, "title": "Issue details unavailable", "milestone": None, "found": False}
     return found
 
 
@@ -538,17 +538,23 @@ def decisions(home: Path, root: Path, value: dict) -> list[dict]:
         raise RuntimeError(result.stderr[-500:] or "open decision scan failed")
     out = []
     seen = set()
+    secondmate_records = [item for item in ((value.get("secondmate_current") or {}).get("records") or [])
+                          if isinstance(item, dict)]
+    main_tasks = [item for item in value.get("tasks", []) if isinstance(item, dict)]
+    secondmate_task_ids = {item.get("id") for item in main_tasks
+                           if item.get("kind") == "secondmate" and isinstance(item.get("id"), str)}
     for line in result.stdout.splitlines():
         parts = line.split("\t", 3)
         if len(parts) != 4:
             continue
         task, key, verb, note = parts
         if ID_RE.fullmatch(task) and key and verb in ("needs-decision", "blocked"):
+            if verb == "needs-decision" and task in secondmate_task_ids and key.startswith("captain-hold-"):
+                continue
             decision = parse_decision(note)
             out.append({"owner": "main", "task": task, "key": key, "verb": verb, "note": note,
                         "decision": decision, "answerable": decision is not None})
             seen.add(("main", task, key))
-    main_tasks = [item for item in value.get("tasks", []) if isinstance(item, dict)]
     targets_by_key = {}
     for task in main_tasks:
         endpoint = task.get("endpoint") or {}
@@ -572,7 +578,7 @@ def decisions(home: Path, root: Path, value: dict) -> list[dict]:
                         "decision": decision, "answerable": decision is not None,
                         "direct_hold": worker is None})
             seen.add(identity)
-    for home_record in ((value.get("secondmate_current") or {}).get("records") or []):
+    for home_record in secondmate_records:
         if not isinstance(home_record, dict):
             continue
         owner = home_record.get("id")
@@ -654,25 +660,36 @@ def decision_card_id(item: dict) -> str:
 
 def queue_data(snap: dict, home: Path, root: Path) -> list[dict]:
     out = []
-    dependency_states = {}
+    dependency_states_by_owner = {"main": {}}
     for row in (snap.get("backlog") or {}).get("records", []):
         if isinstance(row, dict) and isinstance(row.get("id"), str):
-            dependency_states[row["id"]] = row.get("state") or "unknown"
+            dependency_states_by_owner["main"][row["id"]] = row.get("state") or "unknown"
     for task in snap.get("tasks", []):
         if isinstance(task, dict) and isinstance(task.get("id"), str):
             state = (task.get("current_state") or {}).get("state")
             if state in (None, "unknown", "unavailable"):
                 backlog = task.get("backlog") if isinstance(task.get("backlog"), dict) else {}
                 state = backlog.get("state") or task.get("state") or state
-            dependency_states[task["id"]] = state or "unknown"
+            dependency_states_by_owner["main"][task["id"]] = state or "unknown"
+    secondmate_records = [record for record in ((snap.get("secondmate_current") or {}).get("records") or [])
+                          if isinstance(record, dict)]
+    for home_record in secondmate_records:
+        owner = home_record.get("id")
+        if not isinstance(owner, str):
+            continue
+        states = dependency_states_by_owner.setdefault(owner, {})
+        for child in home_record.get("active_children", []):
+            if isinstance(child, dict) and isinstance(child.get("id"), str):
+                states[child["id"]] = child.get("state") or "working"
+        for row in home_record.get("queued", []):
+            if isinstance(row, dict) and isinstance(row.get("id"), str):
+                states[row["id"]] = row.get("state") or "queued"
     for row in (snap.get("backlog") or {}).get("records", []):
         if isinstance(row, dict) and row.get("state") in ("queued", "in_flight"):
             item = {key: row.get(key) for key in ("id", "title", "state", "repo", "blocked_by_ids", "unresolved_blocker_ids", "blocked_reason", "captain_actionable", "hold_until", "hold_kind", "links", "body_lines")}
             item["owner"] = "main"
             out.append(item)
-    for home_record in ((snap.get("secondmate_current") or {}).get("records") or []):
-        if not isinstance(home_record, dict):
-            continue
+    for home_record in secondmate_records:
         owner = home_record.get("id") or "secondmate"
         for child in home_record.get("active_children", []):
             if isinstance(child, dict):
@@ -714,13 +731,14 @@ def queue_data(snap: dict, home: Path, root: Path) -> list[dict]:
         issue_cache = {}
     for item in out:
         blockers = item.get("unresolved_blocker_ids") or []
+        owner_dependency_states = dependency_states_by_owner.get(item.get("owner"), {})
         known_dependencies = {entry.get("id"): entry.get("state") for entry in item.get("dependency_states", [])
                               if isinstance(entry, dict) and isinstance(entry.get("id"), str)}
         if item.get("state") != "queued":
             item["start_reason"] = "Already in progress"
         elif blockers:
             item["start_reason"] = "Waiting for dependencies: " + "; ".join(
-                f"{dependency} ({known_dependencies.get(dependency, dependency_states.get(dependency, 'not found'))})"
+                f"{dependency} ({known_dependencies.get(dependency, owner_dependency_states.get(dependency, 'state unavailable'))})"
                 for dependency in blockers)
         elif item.get("hold_kind") == "captain":
             decision = decisions_by_key.get((item.get("owner"), item.get("id").split("/", 1)[-1]))
@@ -751,20 +769,32 @@ def queue_data(snap: dict, home: Path, root: Path) -> list[dict]:
                 item["start_reason"] = str(item["blocked_reason"])
             else:
                 item["start_reason"] = "Ready to start now"
-        item["issue_urls"] = issue_urls(item, item_project_home(item))
-        item["issue_missing"] = not item["issue_urls"]
+        project_home = item_project_home(item)
+        explicit_issue_urls = issue_urls(item, project_home, include_title_references=False)
+        all_issue_urls = issue_urls(item, project_home)
+        inferred_issue_urls = [url for url in all_issue_urls if url not in explicit_issue_urls]
+        item["issue_urls"] = []
         item["issues"] = []
-        for url in item["issue_urls"]:
+        for url in explicit_issue_urls + inferred_issue_urls:
             try:
                 issue = issue_cache.get(url)
                 if issue is None:
                     raise RuntimeError("GitHub issue details are unavailable")
+                if url in inferred_issue_urls and (
+                        issue.get("number") != int(url.rsplit("/", 1)[1])
+                        or str(issue.get("html_url") or issue.get("url") or "").lower() != url.lower()):
+                    continue
                 milestone = issue.get("milestone")
+                item["issue_urls"].append(url)
                 item["issues"].append({"html_url": url, "title": issue.get("title"),
                                        "milestone": {"title": milestone.get("title")} if isinstance(milestone, dict) else None})
             except (RuntimeError, ValueError, subprocess.SubprocessError) as exc:
+                if url in inferred_issue_urls:
+                    continue
+                item["issue_urls"].append(url)
                 item["issues"].append({"html_url": url, "title": "Issue details unavailable", "milestone": None,
                                        "error": str(exc)})
+        item["issue_missing"] = not item["issue_urls"]
         item.pop("body_lines", None)
         item.pop("owner_home_path", None)
         item.pop("owner_remote", None)

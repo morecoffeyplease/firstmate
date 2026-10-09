@@ -37,6 +37,8 @@ home = tmp / "home"
 (root / "bin").mkdir(parents=True)
 (home / "data").mkdir(parents=True)
 (home / "state").mkdir()
+(home / "bin").mkdir()
+(home / "AGENTS.md").write_text("# Firstmate test home\n")
 (home / "projects" / "alpha").mkdir(parents=True)
 (tmp / "fake-bin").mkdir()
 (home / "data" / "projects.md").write_text("- alpha - Example project\n")
@@ -61,6 +63,28 @@ invalid_input = tmp / "invalid-decision.json"
 invalid_input.write_text(json.dumps({"schema": "fm-captain-decision.v1", "question": "Pick one"}))
 refused = subprocess.run([str(repo / "bin" / "fm-captain-hold.sh"), "decision-event", "worker", "--key", "invalid", "--input-file", str(invalid_input)], env=event_env, capture_output=True, text=True)
 assert refused.returncode != 0 and not (home / "state" / "worker.status").read_text().endswith("\nneeds-decision [key=invalid]:"), refused.stderr
+for field, update in (("question", "   "), ("context", " \t "), ("user_impact", "  "),
+                      ("option-title", "   "), ("pro", "  "), ("con", " \t "), ("recommendation", "  ")):
+    invalid = json.loads(json.dumps(decision))
+    if field == "option-title":
+        invalid["options"][0]["title"] = update
+    elif field == "pro":
+        invalid["options"][0]["pros"][0] = update
+    elif field == "con":
+        invalid["options"][0]["cons"][0] = update
+    else:
+        invalid[field] = update
+    invalid_path = tmp / f"invalid-{field}.json"
+    invalid_path.write_text(json.dumps(invalid))
+    rejected = subprocess.run([str(repo / "bin" / "fm-captain-hold.sh"), "decision-event", "worker",
+                               "--key", f"blank-{field}", "--input-file", str(invalid_path)],
+                              env=event_env, capture_output=True, text=True)
+    assert rejected.returncode != 0 and f"blank-{field}" not in (home / "state" / "worker.status").read_text(), (field, rejected.stderr)
+unanchored_env = {key: value for key, value in event_env.items() if key not in ("FM_HOME", "FM_STATE_OVERRIDE")}
+unanchored = subprocess.run([str(repo / "bin" / "fm-captain-hold.sh"), "decision-event", "worker",
+                             "--key", "unanchored", "--input-file", str(decision_input)],
+                            cwd=tmp, env=unanchored_env, capture_output=True, text=True)
+assert unanchored.returncode != 0 and "explicit FM_HOME" in unanchored.stderr, unanchored.stderr
 snapshot = {
     "schema": "fm-fleet-snapshot.v1",
     "generated": datetime.datetime.now(datetime.timezone.utc).isoformat(),
@@ -68,6 +92,7 @@ snapshot = {
         {"id": "worker", "issue": issue_url, "project": "alpha", "decision_keys": [], "endpoint": {"exists": True}, "backlog": {"repo": "alpha", "state": "in_flight", "links": [], "pr_url": pr_url}, "current_state": {"state": "working"}},
         {"id": "unknown-worker", "project": "alpha", "backlog": {"repo": "alpha", "state": "queued"}, "current_state": {"state": "unknown"}},
         {"id": "unlinked", "project": "alpha", "backlog": {"repo": "alpha", "state": "in_flight"}, "current_state": {"state": "working"}},
+        {"id": "mate", "kind": "secondmate", "project": "alpha", "endpoint": {"exists": True}, "backlog": {"repo": "alpha", "state": "in_flight"}, "current_state": {"state": "working"}},
     ],
     "backlog": {"records": [
         {"id": "next", "title": "Waiting task", "repo": "alpha", "state": "queued", "links": [issue_url], "blocked_by_ids": ["worker"], "unresolved_blocker_ids": ["worker"]},
@@ -75,6 +100,7 @@ snapshot = {
         {"id": "ready", "title": "Ready task", "repo": "alpha", "state": "queued", "links": [], "blocked_by_ids": [], "unresolved_blocker_ids": []},
         {"id": "linked-shortcut", "title": "Complete issue #7", "repo": "alpha", "state": "queued", "links": [], "blocked_by_ids": [], "unresolved_blocker_ids": []},
         {"id": "missing-reference", "title": "Imported task from #99", "repo": "alpha", "state": "queued", "links": [], "blocked_by_ids": [], "unresolved_blocker_ids": []},
+        {"id": "pr-reference", "title": "Carry from #8147 CodeRabbit Minor", "repo": "alpha", "state": "queued", "links": [], "blocked_by_ids": [], "unresolved_blocker_ids": []},
         {"id": "unknown-worker", "title": "Queued prerequisite", "repo": "alpha", "state": "queued", "links": [], "blocked_by_ids": [], "unresolved_blocker_ids": []},
         {"id": "waiting-on-queued", "title": "Wait for queued prerequisite", "repo": "alpha", "state": "queued", "links": [], "blocked_by_ids": ["unknown-worker"], "unresolved_blocker_ids": ["unknown-worker"]},
         {"id": "closed-pr", "title": "Closed pull request", "repo": "alpha", "state": "in_flight", "links": [issue_url], "pr_url": "https://github.com/example/alpha/pull/9"},
@@ -89,7 +115,8 @@ snapshot = {
              {"id": "mate-held", "key": "mate-held", "verb": "captain-hold", "summary": json.dumps(decision), "target_task_id": "mate-child"},
              {"id": "mate-orphan-hold", "key": "mate-orphan-hold", "verb": "captain-hold", "summary": json.dumps(decision)},
          ],
-         "queued": [{"id": "mate-next", "title": "Secondmate queued", "repo": "alpha", "blocked_by_ids": ["mate-child"], "unresolved_blocker_ids": ["mate-child"]}],
+         "queued": [{"id": "mate-next", "title": "Secondmate queued", "repo": "alpha", "blocked_by_ids": ["mate-child"], "unresolved_blocker_ids": ["mate-child"]},
+                    {"id": "mate-stale-dependency", "title": "Wait on pruned work", "repo": "alpha", "blocked_by_ids": ["finished-pruned"], "unresolved_blocker_ids": ["finished-pruned"]}],
          "omitted": []},
         {"id": "stale-mate", "registered": True, "current": {"state": "unknown", "reason": "structured home unavailable"},
          "freshness": {"status": "cached", "age_seconds": 100}, "omitted": [{"surface": "queued", "count": 2}]},
@@ -121,6 +148,10 @@ elif "graphql" in args:
         import re
         if re.search(r'issue\(number:99\)', query):
             sys.exit("issue 99 is unavailable")
+        if re.search(r'issue\(number:8147\)', query):
+            match = re.search(r'(issue\d+):repository', query)
+            print(json.dumps({"data": {match.group(1): {"issue": None}}}))
+            sys.exit(0)
         match = re.search(r'(issue\d+):repository\(owner:"([^"]+)",name:"([^"]+)"\)\{issue\(number:(\d+)\)', query)
         if not match:
             sys.exit("invalid issue GraphQL query")
@@ -158,7 +189,7 @@ print(json.dumps(out))
 fake_gh.chmod(0o755)
 capture = tmp / "send.txt"
 decisions_path = tmp / "decisions.tsv"
-decisions_path.write_text("worker\tdecision-a\tneeds-decision\t" + json.dumps(decision, separators=(",", ":")) + "\nworker\tlegacy\tneeds-decision\tChoose one\n")
+decisions_path.write_text("worker\tdecision-a\tneeds-decision\t" + json.dumps(decision, separators=(",", ":")) + "\nworker\tlegacy\tneeds-decision\tChoose one\nmate\tcaptain-hold-mate-child-1\tneeds-decision\t" + json.dumps(decision, separators=(",", ":")) + "\n")
 hold_capture = tmp / "hold-capture.txt"
 env = {**os.environ, "PATH": f"{tmp / 'fake-bin'}:{os.environ['PATH']}", "FM_CONSOLE_FIXTURE": str(snapshot_path), "FM_CONSOLE_SEND_CAPTURE": str(capture), "FM_CONSOLE_HOLD_CAPTURE": str(hold_capture), "FM_CONSOLE_DECISIONS_FILE": str(decisions_path), "BROWSER": "/usr/bin/true"}
 snapshot_count = tmp / "snapshot-count"
@@ -193,6 +224,7 @@ try:
         ("mate", "mate-child", "mate-held", "captain-hold"),
         ("mate", None, "mate-orphan-hold", "captain-hold"),
     }, decisions
+    assert not any(item["key"] == "captain-hold-mate-child-1" for item in decisions), decisions
     structured = next(item for item in decisions if item["key"] == "decision-a")
     legacy = next(item for item in decisions if item["key"] == "legacy")
     assert structured["answerable"] is True and structured["decision"]["question"] == decision["question"]
@@ -207,7 +239,9 @@ try:
     shortcut = next(row for row in queue if row["id"] == "linked-shortcut")
     assert shortcut["issues"][0]["html_url"] == issue_url and shortcut["issues"][0]["title"] == "Exact issue title"
     missing = next(row for row in queue if row["id"] == "missing-reference")
-    assert missing["issues"][0]["html_url"].endswith("/issues/99")
+    assert missing["issue_missing"] and missing["issues"] == [], missing
+    pr_reference = next(row for row in queue if row["id"] == "pr-reference")
+    assert pr_reference["issue_missing"] and pr_reference["issues"] == [], pr_reference
     assert next_row["issues"][0]["title"] == "Exact issue title"
     assert next_row["issues"][0]["title"] == "Exact issue title"
     assert next_row["issues"][0]["milestone"]["title"] == "Spring release"
@@ -216,6 +250,8 @@ try:
     assert all(row["start_reason"] == "Ready to start now" for row in queue[:first_blocked])
     assert any(row["id"] == "mate/mate-child" for row in queue)
     assert any(row["id"] == "mate/mate-next" and row["unresolved_blocker_ids"] == ["mate-child"] for row in queue)
+    assert next(row for row in queue if row["id"] == "mate/mate-next")["start_reason"] == "Waiting for dependencies: mate-child (working)"
+    assert next(row for row in queue if row["id"] == "mate/mate-stale-dependency")["start_reason"] == "Waiting for dependencies: finished-pruned (state unavailable)"
     assert "admission state" not in page
     assert "Home operations" in page
     assert "Needs rewrite" in page

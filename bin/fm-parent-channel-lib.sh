@@ -129,8 +129,9 @@ fm_parent_channel_destination() {  # <home> <state>
 
 # Fold <text> onto one bounded line, so a note copied from a child ledger or a
 # hold reason cannot break the channel's line framing.
-fm_parent_channel_clean_note() {  # <text>
-  printf '%s' "$1" | LC_ALL=C tr '\t\r\n' '   ' | cut -c1-1200
+fm_parent_channel_clean_note() {  # <text> [maximum characters]
+  local maximum=${2:-1200}
+  printf '%s' "$1" | LC_ALL=C tr '\t\r\n' '   ' | cut -c1-"$maximum"
 }
 
 # Append <line> to <path> unless that exact line is already there.

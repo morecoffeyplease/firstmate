@@ -340,13 +340,13 @@ FM_HOME="$REMOTE_HOME" FM_ROOT_OVERRIDE="$REMOTE_ROOT" "$REMOTE_ROOT/bin/fm-task
   add remote-held-task 'Remote account recovery' --kind ship --repo alpha --start >/dev/null \
   || fail 'could not create remote held task'
 FM_HOME="$REMOTE_HOME" FM_ROOT_OVERRIDE="$REMOTE_ROOT" "$REMOTE_ROOT/bin/fm-captain-hold.sh" \
-  hold remote-held-task --reason 'Captain needs to decide the remote recovery behavior' >/dev/null \
+  hold remote-held-task --reason 'Captain needs to decide the remote recovery behavior' --decision-file "$CAPTAIN_DECISION" >/dev/null \
   || fail 'could not hold remote task for the captain'
 FM_HOME="$REMOTE_HOME" FM_ROOT_OVERRIDE="$REMOTE_ROOT" "$REMOTE_ROOT/bin/fm-tasks-axi.sh" \
   add remote-pid-origin 'Implement the chosen account recovery flow' --kind ship --repo alpha --start >/dev/null \
   || fail 'could not create remote PID-origin task'
 FM_HOME="$REMOTE_HOME" FM_ROOT_OVERRIDE="$REMOTE_ROOT" "$REMOTE_ROOT/bin/fm-captain-hold.sh" \
-  hold remote-pid-origin --reason 'Captain needs to choose the recovery experience' >/dev/null \
+  hold remote-pid-origin --reason 'Captain needs to choose the recovery experience' --decision-file "$CAPTAIN_DECISION" >/dev/null \
   || fail 'could not hold remote PID-origin task for the captain'
 printf 'schema=fm-secondmate-parent.v1\nroute=local\nparent_home=%s\nparent_role=project-firstmate\nrepo_authority_home=%s\nrepo_authority_id=%s\nrepo_identity=%s\n' \
   "$PFA" "$PFA" "$authority_id" "$repo_identity" > "$REMOTE_HOME/.fm-secondmate-parent"

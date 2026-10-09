@@ -16,6 +16,8 @@ set -u
 BEARINGS="$ROOT/bin/fm-bearings-snapshot.sh"
 TASKS_AXI_BIN=$(command -v tasks-axi || true)
 TMP_ROOT=$(fm_test_tmproot fm-bearings)
+DECISION_FILE="$TMP_ROOT/captain-decision.json"
+fm_test_captain_decision "$DECISION_FILE" 'Which change should we make for users?'
 # Keep disposable homes outside the snapshot's fixture repo boundary even when
 # TMPDIR is inside an isolated source worktree.
 FM_ROOT_OVERRIDE="$TMP_ROOT/fixture-root"
@@ -215,8 +217,14 @@ run() {  # <home> <fakebin> <args...>
 }
 
 run_captain() {  # <home> <fakebin> <command args...>
-  local home=$1 fakebin=$2
+  local home=$1 fakebin=$2 command=${3:-} arg needs_decision=1
   shift 2
+  if [ "$command" = hold ]; then
+    for arg in "$@"; do
+      case "$arg" in --decision-file) needs_decision=0 ;; esac
+    done
+    if [ "$needs_decision" = 1 ]; then set -- "$@" --decision-file "$DECISION_FILE"; fi
+  fi
   PATH="$fakebin:$PATH" REAL_TASKS_AXI="$TASKS_AXI_BIN" FM_ROOT_OVERRIDE="$ROOT" \
     FM_HOME="$home" FM_STATE_OVERRIDE="$home/state" FM_DATA_OVERRIDE="$home/data" \
     FM_CONFIG_OVERRIDE="$home/config" "$ROOT/bin/fm-captain-hold.sh" "$@"
