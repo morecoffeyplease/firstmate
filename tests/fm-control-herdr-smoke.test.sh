@@ -267,31 +267,36 @@ kill "$AGENT_PID" 2>/dev/null || fail "could not stop the agent-named process"
 wait_process_state shell 50 \
   || version_fail "after the agent process exited the pane reads '$(fm_backend_herdr_pane_process_state "$SESSION" "$PANE_ID")' rather than 'shell' through pane process-info. Raw process-info: $(herdr pane process-info --pane "$PANE_ID" --session "$SESSION" 2>&1 | tr -d '\n')"
 
-# The divergence that makes this case non-vacuous: Herdr's own registry still
-# reports the agent, and only the process-level view disagrees.
+# Older Herdr versions keep the registration after the process exits, while
+# newer versions release it. Both views must classify the pane as dead so
+# recovery can proceed.
 REGISTERED=$(herdr agent get "$PANE_ID" --session "$SESSION" 2>/dev/null | jq -r '.result.agent.agent_status // empty')
-[ -n "$REGISTERED" ] \
-  || version_fail "Herdr released the registration when the agent process exited, so this run cannot prove the stale-registration path; the classifier still reads dead through agent_not_found"
-
 PANE_STATE=$(fm_backend_herdr_pane_agent_state "$SESSION" "$PANE_ID")
-[ "$PANE_STATE" = stale-agent ] \
-  || version_fail "a registration over a shell-only pane reads '$PANE_STATE' rather than 'stale-agent'"
+if [ -n "$REGISTERED" ]; then
+  [ "$PANE_STATE" = stale-agent ] \
+    || version_fail "a retained registration over a shell-only pane reads '$PANE_STATE' rather than 'stale-agent'"
+  REGISTRATION_RESULT="retained registration classified stale-agent"
+else
+  [ "$PANE_STATE" = no-agent ] \
+    || version_fail "a released registration over a shell-only pane reads '$PANE_STATE' rather than 'no-agent'"
+  REGISTRATION_RESULT="released registration classified no-agent"
+fi
 STATE=$(fm_backend_agent_state herdr "$SESSION:$PANE_ID")
 [ "$STATE" = dead ] \
-  || version_fail "a registration over a shell-only pane recovers as '$STATE' rather than 'dead'; every relaunch would be refused"
-pass "real herdr $HERDR_VERSION: a registration Herdr keeps after its agent exits reads stale-agent and recovers as dead"
+  || version_fail "a shell-only pane recovers as '$STATE' rather than 'dead'; every relaunch would be refused"
+pass "real herdr $HERDR_VERSION: $REGISTRATION_RESULT and recovers as dead"
 
-OUT=$(run_control hsmoke exit) || fail "exit against a stale-registration pane should be idempotent success: $OUT"
+OUT=$(run_control hsmoke exit) || fail "exit against the dead-agent pane should be idempotent success: $OUT"
 case "$OUT" in
   "already-stopped hsmoke"*) : ;;
-  *) fail "a stale-registration pane should report already-stopped, got: $OUT" ;;
+  *) fail "the dead-agent pane should report already-stopped, got: $OUT" ;;
 esac
-pass "real herdr: exit on a pane with a stale registration is idempotent success"
+pass "real herdr: exit on a dead-agent pane is idempotent success"
 
 rm -f "$SCRATCH/codex-launched"
 OUT=$(env FM_HOME="$HOME_DIR" HERDR_SESSION="$SESSION" FM_SPAWN_NO_GUARD=1 \
   "$ROOT/bin/fm-spawn.sh" hsmoke --relaunch --harness codex) \
-  || fail "a stale-registration Herdr pane should be relaunched: $OUT"
+  || fail "a dead-agent Herdr pane should be relaunched: $OUT"
 for _ in $(seq 1 20); do
   [ ! -e "$SCRATCH/codex-launched" ] || break
   sleep 0.1
@@ -305,7 +310,7 @@ herdr pane get "$PANE_ID" --session "$SESSION" >/dev/null 2>&1 \
 awk -F= '$1 == "harness" {$0="harness=claude"} {print}' "$HOME_DIR/state/hsmoke.meta" \
   > "$HOME_DIR/state/hsmoke.meta.tmp"
 mv "$HOME_DIR/state/hsmoke.meta.tmp" "$HOME_DIR/state/hsmoke.meta"
-pass "real herdr: a stale registration no longer blocks relaunch, and the endpoint and local copy survive"
+pass "real herdr: a dead agent no longer blocks relaunch, and the endpoint and local copy survive"
 
 # Last: the foreground process is a plain `sleep`, so the pane never draws any
 # recognized composer chrome. exit's composer-empty guard (bin/fm-control.sh)

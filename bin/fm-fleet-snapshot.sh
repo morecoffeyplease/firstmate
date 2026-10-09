@@ -1108,7 +1108,8 @@ secondmate_home_summary_json() {  # <backlog-json-file> <tasks-json-file> <produ
        + ([ $tasks[] as $t | ($t.hints.open_decisions // [])[]
             | {id:$t.id,key,verb,summary:(.summary | trunc(160)),reason:null,source:"status"} ])) as $decisions_all
     | ([ $backlog.records[]?
-         | select((.state == "in_flight" or .state == "queued" or .state == "done") and .kind != "secondmate") as $work
+         | select((.state == "in_flight" or .state == "queued" or .state == "done") and .kind != "secondmate")
+         | select((.id | type) == "string") as $work
          | ([$tasks[]? | select(.id == $work.id)] | first) as $task
          | {id:$work.id,
             generation:($task.spawn_gen // null),
@@ -1494,8 +1495,8 @@ length == 1 and (.[0] |
      and ($inv.pages | type) == "array"
      and ($inv.page_count == ($inv.pages | length))
      and ($inv.total == ([$inv.pages[].tasks | length] | add // 0))
-     and all(range(0;$inv.page_count) as $i;
-       $inv.pages[$i].offset == $i * $inv.page_size
+     and all(range(0;$inv.page_count);
+       . as $i | $inv.pages[$i].offset == $i * $inv.page_size
        and $inv.pages[$i].next_offset == (if $i + 1 < $inv.page_count then ($i + 1) * $inv.page_size else null end)
        and ($inv.pages[$i].tasks | type) == "array"
        and ($inv.pages[$i].tasks | length) <= $inv.page_size)
