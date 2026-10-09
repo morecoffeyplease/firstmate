@@ -1,0 +1,10 @@
+{
+  "$schema": "https://github.com/ButterTrip/butterworks-workflow/schema/bw-config.schema.json",
+  "consumerName": "firstmate",
+  "productName": "Firstmate",
+  "githubRepo": "morecoffeyplease/firstmate",
+  "workflowRef": "v0.1.0-rc.37",
+  "recipe": "generic-engineering",
+  "installMode": "plugin",
+  "ownsRootAgentsMd": true
+}

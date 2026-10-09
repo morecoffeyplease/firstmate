@@ -562,6 +562,8 @@ The skill owns the guarded fleet update and restart procedure; it never touches 
 
 ## 13. Agent-only reference skills
 
+Installed Butterworks generic-engineering skills and playbooks provide optional engineering guidance; this AGENTS.md and Firstmate's local skills take precedence whenever guidance conflicts.
+
 These skills are not captain-invocable; load them only at their precise triggers.
 
 - `bootstrap-diagnostics` - load whenever the session-start digest's bootstrap or network-checks section prints an actionable diagnostic line (`MISSING:`, `MISSING_MANUAL:`, `PRESENTATION_UNAVAILABLE:`, `BACKEND_INVALID:`, `NEEDS_GH_AUTH`, `TANGLE:`, `STARTUP_MEMORY_BUDGET:`, `CREW_DISPATCH: invalid`, `FLEET_SYNC:`, `NETWORK_CHECKS:`, `HOME_SUMMARY:`, `BACKLOG_RECONCILE:`, `SECONDMATE_SYNC:`, `SECONDMATE_LIVENESS:`, `SECONDMATE_HANDOFF:`, `NUDGE_SECONDMATES:`, `REPO_CONCURRENCY:`, or `FMX:`), or when `BOOTSTRAP_INFO:` says an interrupted backlog cleanup may have left an endpoint or local copy; silence and other `BOOTSTRAP_INFO:` facts need no load.
