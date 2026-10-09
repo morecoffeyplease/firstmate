@@ -1242,6 +1242,110 @@ SH
   pass "jobs=1 and jobs=2 preserve deterministic diagnostics, failures, cleanup bounds, and quiet telemetry"
 }
 
+test_ci_lint_progress_records() {
+  local tmp fakebin first second argv_log start_marker release_marker stdout_file stderr_file
+  local rc i progress_out plain_out alt_out plain_rc alt_rc
+  tmp=$(fm_test_tmproot fm-lint-progress)
+  fakebin=$(fm_fakebin "$tmp")
+  first="$tmp/first root.sh"
+  second="$tmp/second-root.sh"
+  argv_log="$tmp/argv.log"
+  start_marker="$tmp/first-started"
+  release_marker="$tmp/release-first"
+  stdout_file="$tmp/progress.stdout"
+  stderr_file="$tmp/progress.stderr"
+  : > "$argv_log"
+  : > "$first"
+  : > "$second"
+  cat > "$fakebin/shellcheck" <<'SH'
+#!/usr/bin/env bash
+if [ "${1:-}" = --version ]; then
+  printf 'ShellCheck - shell script analysis tool\nversion: 0.11.0\n'
+  exit 0
+fi
+printf '%s\n' "$*" >> "$FM_TEST_ARGV_LOG"
+path=${!#}
+if [ "$path" = "$FM_TEST_PROGRESS_FIRST" ]; then
+  printf 'started\n' > "$FM_TEST_PROGRESS_STARTED"
+  while [ ! -e "$FM_TEST_PROGRESS_RELEASE" ]; do
+    sleep 0.01
+  done
+  printf 'diagnostic from first root\n' >&2
+  exit 7
+fi
+printf 'diagnostic from second root\n' >&2
+exit 0
+SH
+  chmod +x "$fakebin/shellcheck"
+
+  PATH="$fakebin:$PATH" FM_TEST_ARGV_LOG="$argv_log" \
+    FM_TEST_PROGRESS_FIRST="$first" FM_TEST_PROGRESS_STARTED="$start_marker" \
+    FM_TEST_PROGRESS_RELEASE="$release_marker" GITHUB_ACTIONS=true GITHUB_JOB=lint \
+    FM_LINT_JOBS=1 "$LINT" "$first" "$second" > "$stdout_file" 2> "$stderr_file" &
+  local owner_pid=$!
+  i=0
+  while [ "$i" -lt 500 ] && [ ! -s "$start_marker" ]; do
+    kill -0 "$owner_pid" 2>/dev/null || break
+    sleep 0.01
+    i=$((i + 1))
+  done
+  [ -s "$start_marker" ] || {
+    kill -TERM "$owner_pid" 2>/dev/null || true
+    wait "$owner_pid" 2>/dev/null || true
+    fail "canonical lint job did not start the controlled ShellCheck root"
+  }
+  i=0
+  while [ "$i" -lt 500 ] && ! grep -F "path=$first" "$stderr_file" >/dev/null 2>&1; do
+    sleep 0.01
+    i=$((i + 1))
+  done
+  assert_grep "fm-lint-progress-v1$(printf '\t')start$(printf '\t')shard=0$(printf '\t')root_index=0$(printf '\t')path=$first" \
+    "$stderr_file" "start record was not flushed while ShellCheck remained blocked"
+  assert_grep "utc=$(date -u '+%Y-%m-%dT')" "$stderr_file" "start record omitted UTC time"
+  [ ! -s "$stdout_file" ] || fail "diagnostic output appeared before the blocked ShellCheck root finished"
+  : > "$release_marker"
+  rc=0
+  wait "$owner_pid" || rc=$?
+  [ "$rc" -eq 7 ] || fail "canonical lint job returned $rc, expected first root's exit 7"
+  progress_out=$(cat "$stdout_file")
+  assert_contains "$progress_out" "diagnostic from first root" "first root diagnostic was not replayed"
+  assert_contains "$progress_out" "diagnostic from second root" "later root did not run after a nonzero root"
+  assert_grep "fm-lint-progress-v1$(printf '\t')finish$(printf '\t')shard=0$(printf '\t')root_index=0$(printf '\t')path=$first" \
+    "$stderr_file" "first root finish record is missing"
+  assert_grep "fm-lint-progress-v1$(printf '\t')finish$(printf '\t')shard=0$(printf '\t')root_index=1$(printf '\t')path=$second" \
+    "$stderr_file" "second root finish record is missing"
+  assert_grep "utc=$(date -u '+%Y-%m-%dT')" "$stderr_file" "finish record omitted UTC time"
+  grep -E 'fm-lint-progress-v1[[:space:]]finish.*elapsed_seconds=[0-9]+.*exit=7$' "$stderr_file" >/dev/null \
+    || fail "first root finish record omitted numeric elapsed time or its exit status"
+  grep -E 'fm-lint-progress-v1[[:space:]]finish.*elapsed_seconds=[0-9]+.*exit=0$' "$stderr_file" >/dev/null \
+    || fail "second root finish record omitted numeric elapsed time or its exit status"
+  assert_grep "exit=7" "$stderr_file" "first root finish record omitted its nonzero status"
+  assert_grep "exit=0" "$stderr_file" "second root finish record omitted its successful status"
+  assert_grep "--norc --external-sources -- $first" "$argv_log" "first ShellCheck invocation changed argv"
+  assert_grep "--norc --external-sources -- $second" "$argv_log" "second ShellCheck invocation changed argv"
+
+  plain_rc=0
+  PATH="$fakebin:$PATH" GITHUB_ACTIONS= GITHUB_JOB= FM_TEST_ARGV_LOG="$tmp/plain.argv" \
+    FM_TEST_PROGRESS_FIRST="$first" FM_TEST_PROGRESS_STARTED="$tmp/plain-start" \
+    FM_TEST_PROGRESS_RELEASE="$release_marker" FM_LINT_JOBS=1 \
+    "$LINT" "$first" "$second" > "$tmp/plain.stdout" 2> "$tmp/plain.stderr" || plain_rc=$?
+  [ "$plain_rc" -eq "$rc" ] || fail "local lint exit $plain_rc differed from canonical progress run $rc"
+  plain_out=$(cat "$tmp/plain.stdout")
+  [ "$plain_out" = "$progress_out" ] || fail "local diagnostics differed from canonical progress run"
+  assert_no_grep "fm-lint-progress-v1" "$tmp/plain.stderr" "local run emitted CI progress records"
+
+  alt_rc=0
+  PATH="$fakebin:$PATH" FM_TEST_ARGV_LOG="$tmp/alternate.argv" \
+    FM_TEST_PROGRESS_FIRST="$first" FM_TEST_PROGRESS_STARTED="$tmp/alternate-start" \
+    FM_TEST_PROGRESS_RELEASE="$release_marker" GITHUB_ACTIONS=true GITHUB_JOB=tests-portable-serial \
+    FM_LINT_JOBS=1 "$LINT" "$first" "$second" > "$tmp/alternate.stdout" 2> "$tmp/alternate.stderr" || alt_rc=$?
+  [ "$alt_rc" -eq "$rc" ] || fail "other CI job exit $alt_rc differed from canonical progress run $rc"
+  alt_out=$(cat "$tmp/alternate.stdout")
+  [ "$alt_out" = "$progress_out" ] || fail "other CI job diagnostics differed from canonical progress run"
+  assert_no_grep "fm-lint-progress-v1" "$tmp/alternate.stderr" "other CI job emitted progress records"
+  pass "canonical lint progress is flushed, accurate, and behavior-neutral outside its job"
+}
+
 test_worker_trees_stop_on_signal() {
   local tmp fakebin fixture jobs telemetry lint_tmp pid_file out_file telemetry_file
   local parent_pid shellcheck_pid i parent_rc survivor
@@ -1279,6 +1383,7 @@ SH
       fi
       PATH="$fakebin:$PATH" TMPDIR="$lint_tmp" FM_LINT_JOBS="$jobs" \
         FM_LINT_TELEMETRY="$telemetry_file" FM_TEST_SHELLCHECK_PID="$pid_file" \
+        GITHUB_ACTIONS=true GITHUB_JOB=lint \
         "$LINT" "$fixture" > "$out_file" 2>&1 &
       parent_pid=$!
       i=0
@@ -1311,6 +1416,10 @@ SH
         || fail "jobs=$jobs telemetry=$telemetry signal exit was $parent_rc, expected 143"
       [ "$survivor" -eq 0 ] \
         || fail "jobs=$jobs telemetry=$telemetry left ShellCheck running"
+      assert_grep "fm-lint-progress-v1$(printf '\t')start" "$out_file" \
+        "jobs=$jobs telemetry=$telemetry signal fixture omitted the root start record"
+      assert_no_grep "fm-lint-progress-v1$(printf '\t')finish" "$out_file" \
+        "jobs=$jobs telemetry=$telemetry signal fixture fabricated a root finish record"
       [ -z "$(find "$lint_tmp" -mindepth 1 -maxdepth 1 -name 'fm-lint.*' -print -quit)" ] \
         || fail "jobs=$jobs telemetry=$telemetry left temporary worker state"
     done
@@ -1410,6 +1519,7 @@ test_rejects_direct_beads_cli_in_explicit_core_path
 test_ignores_ambient_shellcheck_opts
 test_clean_fixture_passes
 test_jobs_are_deterministic_and_complete
+test_ci_lint_progress_records
 test_worker_trees_stop_on_signal
 test_seeded_module_boundary_parity
 test_changed_mode_lints_only_the_changed_file
