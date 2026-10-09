@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import datetime
 import http.server
 import json
 import os
@@ -11,6 +12,7 @@ import re
 import secrets
 import subprocess
 import sys
+import tempfile
 import time
 import urllib.parse
 import webbrowser
@@ -20,10 +22,58 @@ from pathlib import Path
 ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._/-]{0,127}$")
 PROJECT_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
 MAX_ANSWER = 8192
+PR_QUERY = """query($owner: String!, $repo: String!, $number: Int!) {
+  repository(owner: $owner, name: $repo) {
+    pullRequest(number: $number) {
+      number
+      url
+      state
+      isDraft
+      merged
+      mergedAt
+      reviewDecision
+      commits(last: 1) {
+        nodes {
+          commit {
+            statusCheckRollup {
+              state
+              contexts(first: 100) {
+                totalCount
+                pageInfo { hasNextPage }
+                nodes {
+                  __typename
+                  ... on CheckRun { name status conclusion }
+                  ... on StatusContext { context state }
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+}"""
 
 
-def run(command: list[str], *, cwd: Path, env: dict[str, str], timeout: int = 30) -> subprocess.CompletedProcess[str]:
-    return subprocess.run(command, cwd=cwd, env=env, capture_output=True, text=True, timeout=timeout)
+def run(command: list[str], *, cwd: Path, env: dict[str, str], timeout: int = 30,
+        input_text: str | None = None) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(command, cwd=cwd, env=env, capture_output=True, text=True, timeout=timeout, input=input_text)
+
+
+def snapshot_epoch(value: dict) -> int:
+    epoch = value.get("generated_epoch")
+    if isinstance(epoch, (int, float)) and not isinstance(epoch, bool):
+        return int(epoch)
+    generated = value.get("generated")
+    if not isinstance(generated, str) or not generated:
+        raise ValueError("fleet snapshot has no valid generation timestamp")
+    try:
+        parsed = datetime.datetime.fromisoformat(generated.replace("Z", "+00:00"))
+    except ValueError as exc:
+        raise ValueError("fleet snapshot generation timestamp is invalid") from exc
+    if parsed.tzinfo is None:
+        raise ValueError("fleet snapshot generation timestamp has no timezone")
+    return int(parsed.timestamp())
 
 
 def registered_projects(home: Path) -> list[str]:
@@ -160,9 +210,8 @@ def github_json(root: Path, path: str, home: Path) -> object:
 
 
 def github_graphql(root: Path, home: Path, owner: str, repo: str, number: int) -> dict:
-    query = """query($owner:String!,$repo:String!,$number:Int!){repository(owner:$owner,name:$repo){pullRequest(number:$number){number url state isDraft merged mergedAt reviewDecision commits(last:1){nodes{commit{statusCheckRollup{state contexts(first:100){totalCount pageInfo{hasNextPage} nodes{__typename ... on CheckRun{name status conclusion} ... on StatusContext{context state}}}}}}}}}}}"""
     env = {**os.environ, "FM_HOME": str(home)}
-    result = run(["gh", "api", "graphql", "-f", f"query={query}", "-F", f"owner={owner}", "-F", f"repo={repo}", "-F", f"number={number}"], cwd=root, env=env, timeout=20)
+    result = run(["gh", "api", "graphql", "-f", f"query={PR_QUERY}", "-F", f"owner={owner}", "-F", f"repo={repo}", "-F", f"number={number}"], cwd=root, env=env, timeout=20)
     if result.returncode:
         raise RuntimeError(result.stderr[-500:] or "GitHub pull request read failed")
     value = json.loads(result.stdout)
@@ -350,7 +399,7 @@ def status_data(home: Path, root: Path, value: dict) -> dict:
                            "review": pr.get("review_decision") or "unknown", "checks": pr.get("checks") or "unknown"}
                 if summary not in row["prs"]:
                     row["prs"].append(summary)
-    result = {"generated_epoch": int(value.get("generated_epoch") or time.time()), "projects": projects,
+    result = {"generated_epoch": snapshot_epoch(value), "projects": projects,
               "rows": list(rows.values()), "failures": failures, "warnings": warnings,
               "stale": False, "unavailable": False}
     result["rows"].sort(key=lambda row: (row["project"], row["number"] or 0, row["title"] or ""))
@@ -376,6 +425,9 @@ def decisions(home: Path, root: Path, value: dict) -> list[dict]:
     main_tasks = [item for item in value.get("tasks", []) if isinstance(item, dict)]
     targets_by_key = {}
     for task in main_tasks:
+        endpoint = task.get("endpoint") or {}
+        if endpoint.get("exists") is not True:
+            continue
         for key in task.get("decision_keys", []):
             targets_by_key.setdefault(key, task.get("id"))
     for row in (value.get("backlog") or {}).get("records", []):
@@ -383,10 +435,15 @@ def decisions(home: Path, root: Path, value: dict) -> list[dict]:
             continue
         key = row.get("id")
         target = row.get("target_task_id") or targets_by_key.get(key) or (key if any(task.get("id") == key for task in main_tasks) else None)
-        if isinstance(key, str) and ID_RE.fullmatch(key) and ("main", target, key) not in seen:
-            out.append({"owner": "main", "task": target, "key": key, "verb": "captain-hold",
-                        "note": row.get("hold_reason") or row.get("title") or "Captain-held task", "answerable": bool(target)})
-            seen.add(("main", target, key))
+        target_task = next((task for task in main_tasks if task.get("id") == target), None)
+        target_live = isinstance(target_task, dict) and (target_task.get("endpoint") or {}).get("exists") is True
+        worker = target if target_live else None
+        identity = ("main", worker, key)
+        if isinstance(key, str) and ID_RE.fullmatch(key) and identity not in seen:
+            out.append({"owner": "main", "task": worker, "key": key, "verb": "captain-hold",
+                        "note": row.get("hold_reason") or row.get("title") or "Captain-held task",
+                        "answerable": True, "direct_hold": worker is None})
+            seen.add(identity)
     for home_record in ((value.get("secondmate_current") or {}).get("records") or []):
         if not isinstance(home_record, dict):
             continue
@@ -397,13 +454,22 @@ def decisions(home: Path, root: Path, value: dict) -> list[dict]:
                 continue
             key = item.get("key")
             task = item.get("target_task_id") or (item.get("id") if item.get("verb") != "captain-hold" else None)
+            direct_hold = False
+            if item.get("verb") == "captain-hold":
+                children = [child for child in home_record.get("active_children", []) if isinstance(child, dict)]
+                if not task and isinstance(key, str):
+                    task = next((child.get("id") for child in children if key in (child.get("decision_keys") or [])), None)
+                if not any(child.get("id") == task for child in children):
+                    task = None
+                    direct_hold = True
             identity = (owner, task, key)
             if not isinstance(owner, str) or not ID_RE.fullmatch(owner) or not isinstance(key, str) or not key:
                 continue
             if identity not in seen:
                 out.append({"owner": owner, "remote": remote, "task": task, "key": key,
                             "verb": item["verb"], "note": item.get("summary") or item.get("reason") or "Open decision",
-                            "answerable": isinstance(task, str) and ID_RE.fullmatch(task) is not None})
+                            "answerable": direct_hold or isinstance(task, str) and ID_RE.fullmatch(task) is not None,
+                            "direct_hold": direct_hold})
                 seen.add(identity)
     return sorted(out, key=lambda item: (item.get("owner") or "", item.get("task") or "", item.get("key") or ""))
 
@@ -412,7 +478,9 @@ def queue_data(snap: dict) -> list[dict]:
     out = []
     for row in (snap.get("backlog") or {}).get("records", []):
         if isinstance(row, dict) and row.get("state") in ("queued", "in_flight"):
-            out.append({key: row.get(key) for key in ("id", "title", "state", "repo", "blocked_by_ids", "unresolved_blocker_ids", "blocked_reason", "captain_actionable")})
+            item = {key: row.get(key) for key in ("id", "title", "state", "repo", "blocked_by_ids", "unresolved_blocker_ids", "blocked_reason", "captain_actionable")}
+            item["admission_state"] = row.get("admission_state") or ("unknown" if row.get("state") == "queued" else "admitted")
+            out.append(item)
     for home_record in ((snap.get("secondmate_current") or {}).get("records") or []):
         if not isinstance(home_record, dict):
             continue
@@ -421,14 +489,16 @@ def queue_data(snap: dict) -> list[dict]:
             if isinstance(child, dict):
                 out.append({"id": f"{owner}/{child.get('id', '')}", "title": child.get("name") or child.get("id"),
                             "state": child.get("state") or "working", "repo": child.get("repo"), "blocked_by_ids": [],
-                            "unresolved_blocker_ids": [], "blocked_reason": None, "captain_actionable": False})
+                            "unresolved_blocker_ids": [], "blocked_reason": None, "captain_actionable": False,
+                            "admission_state": "admitted"})
         for row in home_record.get("queued", []):
             if isinstance(row, dict):
                 out.append({"id": f"{owner}/{row.get('id', '')}", "title": row.get("title"), "state": "queued",
                             "repo": row.get("repo"), "blocked_by_ids": row.get("blocked_by_ids") or [],
                             "unresolved_blocker_ids": row.get("unresolved_blocker_ids") or [],
                             "blocked_reason": row.get("blocked_reason") or row.get("hold_reason"),
-                            "captain_actionable": row.get("captain_actionable") is True})
+                            "captain_actionable": row.get("captain_actionable") is True,
+                            "admission_state": row.get("admission_state") or "unknown"})
     out.sort(key=lambda row: (row.get("repo") or "", row.get("id") or ""))
     return out
 
@@ -451,7 +521,8 @@ function link(url,label){const a=document.createElement('a');a.href=url;a.target
 function prCell(prs){const root=document.createElement('div');for(const pr of prs||[]){const state=pr.merged?'merged':pr.state==='closed'?'closed unmerged':pr.draft?'draft PR':pr.state;root.append(link(pr.url,`PR · ${state}`),node(` · review ${pr.review}; checks ${pr.checks}`),document.createElement('br'))}if(!prs?.length)root.textContent='No linked PR';return root}
 function table(parent,headers,rows){const t=document.createElement('table'),head=document.createElement('thead'),hr=document.createElement('tr');headers.forEach(h=>{const th=document.createElement('th');th.textContent=h;hr.append(th)});head.append(hr);const body=document.createElement('tbody');rows.forEach(row=>{const tr=document.createElement('tr');row.forEach(value=>{const td=document.createElement('td');if(value instanceof Node)td.append(value);else td.append(node(value));tr.append(td)});body.append(tr)});t.append(head,body);parent.replaceChildren(t)}
 const drafts=new Map();let latestData=null;
-function render(data){if(data.unavailable){status.className='error';status.textContent='Unavailable: '+data.error;return}const s=data.status||{},d=data.decisions||[],q=data.queue||[];const select=el('project'),prior=select.value;select.replaceChildren(...(s.projects||[]).map(name=>{const o=document.createElement('option');o.value=name;o.textContent=name;return o}));if((s.projects||[]).includes(prior))select.value=prior;const rows=(s.rows||[]).filter(row=>!select.value||row.project===select.value).map(row=>[row.project,row.issue_missing?row.title:link(row.url,`#${row.number} ${row.title||'(title unavailable)'}`),row.issue_state,row.tasks.map(task=>`${task.owner||'main'}/${task.id}: ${task.stage} (${task.state})`).join('\n'),prCell(row.prs)]);if(rows.length)table(el('status-content'),['Project','Issue','Issue state','Lane stage','PR status'],rows);else el('status-content').textContent=select.value?'No admitted issues or unlinked work are recorded for this project.':'No registered projects are available.';const notices=[...(s.failures||[]),...(data.warnings||[])];status.className=s.stale||notices.length?'error':'muted';status.textContent=`${s.stale?'Stale cached':'Updated'} ${new Date(data.generated_epoch*1000).toLocaleString()} · snapshot age ${data.age_seconds}s${data.error?' · '+data.error:''}${notices.length?'\n'+notices.join('\n'):''}`;const decisionRows=d.map(item=>{const label=document.createElement('strong'),content=document.createElement('div');label.textContent=`${item.owner==='main'?'Main':item.owner} · ${item.task||'owner unavailable'} · ${item.key} · ${item.verb}: ${item.note}`;content.append(label);if(!item.answerable){const notice=document.createElement('p');notice.textContent='Answer unavailable: owning task could not be resolved.';content.append(notice);return [content]}const identity=JSON.stringify([item.owner,item.task,item.key]),form=document.createElement('form'),area=document.createElement('textarea'),send=document.createElement('button');area.name='answer';area.maxLength=8192;area.required=true;area.setAttribute('aria-label',`Answer ${item.key}`);area.value=drafts.get(identity)||'';area.oninput=()=>drafts.set(identity,area.value);send.textContent='Answer and send';form.append(area,send);form.onsubmit=async event=>{event.preventDefault();send.disabled=true;try{const result=await fetch('/api/answer',{method:'POST',headers:{'Content-Type':'application/json','X-FM-Token':token},body:JSON.stringify({owner:item.owner,task:item.task,key:item.key,answer:area.value})}).then(x=>x.json());if(!result.ok)throw Error(result.error||'answer was not delivered');drafts.delete(identity);await load(true)}catch(error){status.className='error';status.textContent='Answer failed: '+error.message;send.disabled=false}};content.append(form);return [content]});table(el('decisions-content'),['Open decision'],decisionRows);if(!d.length)el('decisions-content').textContent='No open decisions.';if(q.length)table(el('queue-content'),['Task','Project','State','Dependencies / admission blocker'],q.map(item=>[`${item.id||''} ${item.title||''}`,item.repo||'Unassigned',item.state,item.blocked_reason||item.unresolved_blocker_ids?.join(', ')||item.blocked_by_ids?.join(', ')||(item.state==='queued'?'Waiting for admission; no dependency blocker recorded':'Currently admitted')]));else el('queue-content').textContent='No queued or in-flight work.'}
+function queueBlocker(item){const dependencies=item.blocked_reason||item.unresolved_blocker_ids?.join(', ')||item.blocked_by_ids?.join(', ');if(item.state==='queued')return (dependencies?'Dependencies: '+dependencies+'; ':'')+'admission state '+(item.admission_state||'unknown');return dependencies||item.admission_state||'Admitted'}
+function render(data){if(data.unavailable){status.className='error';status.textContent='Unavailable: '+data.error;return}const s=data.status||{},d=data.decisions||[],q=data.queue||[];const select=el('project'),prior=select.value;select.replaceChildren(...(s.projects||[]).map(name=>{const o=document.createElement('option');o.value=name;o.textContent=name;return o}));if((s.projects||[]).includes(prior))select.value=prior;const rows=(s.rows||[]).filter(row=>!select.value||row.project===select.value).map(row=>[row.project,row.issue_missing?row.title:link(row.url,`#${row.number} ${row.title||'(title unavailable)'}`),row.issue_state,row.tasks.map(task=>`${task.owner||'main'}/${task.id}: ${task.stage} (${task.state})`).join('\n'),prCell(row.prs)]);if(rows.length)table(el('status-content'),['Project','Issue','Issue state','Lane stage','PR status'],rows);else el('status-content').textContent=select.value?'No admitted issues or unlinked work are recorded for this project.':'No registered projects are available.';const notices=[...(s.failures||[]),...(data.warnings||[])];status.className=s.stale||notices.length?'error':'muted';status.textContent=`${s.stale?'Stale cached':'Updated'} ${new Date(data.generated_epoch*1000).toLocaleString()} · snapshot age ${data.age_seconds}s${data.error?' · '+data.error:''}${notices.length?'\n'+notices.join('\n'):''}`;const decisionRows=d.map(item=>{const label=document.createElement('strong'),content=document.createElement('div');label.textContent=`${item.owner==='main'?'Main':item.owner} · ${item.task||(item.direct_hold?'captain-held call':'owner unavailable')} · ${item.key} · ${item.verb}: ${item.note}`;content.append(label);if(!item.answerable){const notice=document.createElement('p');notice.textContent='Answer unavailable: owning task could not be resolved.';content.append(notice);return [content]}const identity=JSON.stringify([item.owner,item.task,item.key]),form=document.createElement('form'),area=document.createElement('textarea'),send=document.createElement('button');area.name='answer';area.maxLength=8192;area.required=true;area.setAttribute('aria-label',`Answer ${item.key}`);area.value=drafts.get(identity)||'';area.oninput=()=>drafts.set(identity,area.value);send.textContent='Answer and send';form.append(area,send);form.onsubmit=async event=>{event.preventDefault();send.disabled=true;try{const result=await fetch('/api/answer',{method:'POST',headers:{'Content-Type':'application/json','X-FM-Token':token},body:JSON.stringify({owner:item.owner,task:item.task,key:item.key,answer:area.value})}).then(x=>x.json());if(!result.ok)throw Error(result.error||'answer was not delivered');drafts.delete(identity);await load(true)}catch(error){status.className='error';status.textContent='Answer failed: '+error.message;send.disabled=false}};content.append(form);return [content]});table(el('decisions-content'),['Open decision'],decisionRows);if(!d.length)el('decisions-content').textContent='No open decisions.';if(q.length)table(el('queue-content'),['Task','Project','State','Dependencies / admission blocker'],q.map(item=>[`${item.id||''} ${item.title||''}`,item.repo||'Unassigned',item.state,queueBlocker(item)]));else el('queue-content').textContent='No queued or in-flight work.'}
 async function load(force=false){try{const query=force?'?refresh=1':'';const response=await fetch('/api/data'+query),data=await response.json();if(!response.ok&&!data.status)throw Error(data.error||'console data unavailable');latestData=data;render(data)}catch(error){status.className='error';status.textContent='Unavailable: '+error.message}}
 el('project').onchange=()=>{if(latestData)render(latestData)};el('refresh').onclick=()=>load(true);load();setInterval(()=>{if(!document.hidden)load()},30000);
 </script></html>"""
@@ -460,7 +531,7 @@ el('project').onchange=()=>{if(latestData)render(latestData)};el('refresh').oncl
 
 def compose_data(home: Path, root: Path, value: dict) -> dict:
     status = status_data(home, root, value)
-    generated = int(value.get("generated_epoch") or status["generated_epoch"])
+    generated = snapshot_epoch(value)
     warnings = list(status.get("warnings") or [])
     return {"generated_epoch": generated, "age_seconds": max(0, int(time.time()) - generated),
             "status": status, "decisions": decisions(home, root, value), "queue": queue_data(value),
@@ -548,6 +619,7 @@ def serve(home: Path, root: Path, port: int | None) -> int:
                 self.send(403, {"error": "request refused"})
                 return
             try:
+                staged_answer: Path | None = None
                 length = int(self.headers.get("Content-Length", "0"))
                 if length <= 0 or length > MAX_ANSWER + 1024:
                     raise ValueError("invalid request size")
@@ -555,7 +627,7 @@ def serve(home: Path, root: Path, port: int | None) -> int:
                 if not isinstance(body, dict) or set(body) != {"owner", "task", "key", "answer"}:
                     raise ValueError("invalid answer request")
                 owner, task, key, answer = body["owner"], body["task"], body["key"], body["answer"]
-                if not isinstance(owner, str) or (owner != "main" and not ID_RE.fullmatch(owner)) or not isinstance(task, str) or not ID_RE.fullmatch(task) or not isinstance(key, str) or not re.fullmatch(r"[A-Za-z0-9._-]{1,128}", key):
+                if not isinstance(owner, str) or (owner != "main" and not ID_RE.fullmatch(owner)) or (task is not None and (not isinstance(task, str) or not ID_RE.fullmatch(task))) or not isinstance(key, str) or not re.fullmatch(r"[A-Za-z0-9._-]{1,128}", key):
                     raise ValueError("invalid decision identity")
                 if not isinstance(answer, str) or not answer.strip() or len(answer.encode("utf-8")) > MAX_ANSWER or "\x00" in answer:
                     raise ValueError("answer must contain 1 to 8192 bytes")
@@ -564,7 +636,36 @@ def serve(home: Path, root: Path, port: int | None) -> int:
                               if item.get("owner") == owner and item.get("task") == task and item.get("key") == key), None)
                 if not match or not match.get("answerable"):
                     raise ValueError("decision is no longer open")
-                if owner == "main":
+                answer_input = None
+                if match.get("direct_hold") is True:
+                    if owner == "main":
+                        answer_home = home
+                        hold_script = str(root / "bin" / "fm-captain-hold.sh")
+                    else:
+                        record = next((item for item in ((current.get("secondmate_current") or {}).get("records") or [])
+                                       if isinstance(item, dict) and item.get("id") == owner), None)
+                        if not record:
+                            raise ValueError("decision owner is no longer registered")
+                        if record.get("remote") is True:
+                            answer_home = home
+                            if any(char in answer for char in "\t\r\n"):
+                                raise ValueError("remote held-call answers must be a single line")
+                            command = [str(root / "bin" / "fm-on.sh"), "--stdin", owner,
+                                       "fm-captain-hold.sh", "answers", "--source", "local operator console"]
+                            answer_input = f"{key}\t{answer}\tAnswered from the local console\n"
+                        else:
+                            answer_home = validated_local_secondmate_home(record, owner)
+                            hold_script = str(root / "bin" / "fm-captain-hold.sh")
+                    if answer_input is None:
+                        state_dir = answer_home / "state"
+                        if state_dir.is_symlink() or not state_dir.is_dir():
+                            raise ValueError("owning home state directory is unavailable or unsafe")
+                        with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", dir=state_dir,
+                                                         prefix=".console-answer-", delete=False) as staged:
+                            staged.write(answer)
+                            staged_answer = Path(staged.name)
+                        command = [hold_script, "answer", key, "--decision-file", str(staged_answer)]
+                elif owner == "main":
                     command = [str(root / "bin" / "fm-send.sh"), task, "--resolve-key", key, "--", answer]
                     answer_home = home
                 else:
@@ -578,7 +679,12 @@ def serve(home: Path, root: Path, port: int | None) -> int:
                     else:
                         answer_home = validated_local_secondmate_home(record, owner)
                         command = [str(root / "bin" / "fm-send.sh"), task, "--resolve-key", key, "--", answer]
-                result = run(command, cwd=root, env={**os.environ, "FM_HOME": str(answer_home), "FM_ROOT_OVERRIDE": str(root)}, timeout=60)
+                try:
+                    result = run(command, cwd=root, env={**os.environ, "FM_HOME": str(answer_home), "FM_ROOT_OVERRIDE": str(root)},
+                                 timeout=60, input_text=answer_input)
+                finally:
+                    if staged_answer is not None:
+                        staged_answer.unlink(missing_ok=True)
                 if result.returncode:
                     raise RuntimeError(result.stderr[-800:] or "fm-send could not deliver the answer")
                 cached = None
