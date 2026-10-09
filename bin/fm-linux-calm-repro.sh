@@ -72,7 +72,7 @@ verify_counterfactual_candidate_input() {
 }
 
 verify_counterfactual_binding() {
-  local phase=$1 head_rc=125 tree_rc=125 status_rc=125 fixture_hash_rc=125 actual_head='' actual_tree='' actual_status='' fixture_hash='' expected_status content
+  local phase=$1 head_rc=125 tree_rc=125 status_rc=125 fixture_hash_rc=125 actual_head='' actual_tree='' actual_status='' fixture_hash='' content
   local prefix="$EVIDENCE/counterfactual-$phase"
   local expected_fixture_status=' M tests/fm-calm-pi-extension.test.sh'
   if [[ -e "$COUNTERFACTUAL_OBSERVER" || -L "$COUNTERFACTUAL_OBSERVER" ]]; then
@@ -180,6 +180,7 @@ verify_observer_custody() {
   return 1
 }
 
+# shellcheck disable=SC2329 # Called by finish_cleanup on observer custody failure.
 preserve_observer_after_custody_failure() {
   local copy="$EVIDENCE/observer-original-after-custody-failure.sh" rc content
   if [[ ! -f "$OBSERVER" ]]; then
@@ -251,6 +252,7 @@ fixture_evidence_complete() {
   [[ -f "$EVIDENCE/fixture-exit-active.stderr" && -f "$EVIDENCE/fixture-exit-alternate.stderr" ]]
 }
 
+# shellcheck disable=SC2329 # Called by finish_cleanup when task paths must be preserved.
 capture_preserved_task_paths() {
   local -a paths=() tar_args=()
   local path receipt_content status_content source_missing=0 receipt_ok=1 path_receipt_ok=0 rc
@@ -304,6 +306,7 @@ capture_preserved_task_paths() {
   fi
 }
 
+# shellcheck disable=SC2329 # Invoked through the EXIT trap below.
 finish_cleanup() {
   trap - EXIT
   if [[ -f "$EVIDENCE/fixture-started" ]]; then
