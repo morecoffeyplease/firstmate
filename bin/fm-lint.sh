@@ -80,12 +80,15 @@ fm_lint_worker_stop() {
 
 fm_lint_worker() {  # <manifest> <output-dir> <shard-index>
   local manifest=$1 output_dir=$2 shard_index=$3 tab index path output invocation_rc rc=0
-  local -a roots shellcheck_args
+  local root_position root_index root_started root_elapsed root_started_utc root_finished_utc
+  local -a roots root_indices shellcheck_args
   roots=()
+  root_indices=()
   tab=$(printf '\t')
   while IFS="$tab" read -r index path || [ -n "${index:-}${path:-}" ]; do
     [ -n "${index:-}" ] || continue
     roots+=("$path")
+    root_indices+=("$index")
   done < "$manifest"
   output="$output_dir/shard.$shard_index"
   if [ "${#roots[@]}" -gt 0 ]; then
@@ -112,12 +115,23 @@ fm_lint_worker() {  # <manifest> <output-dir> <shard-index>
     # exhausted the CI runner and killed the whole worker with exit 143
     # before any diagnostic could name a culprit; one process per root caps
     # peak memory at the single largest root instead of their sum.
+    root_position=0
     for path in "${roots[@]}"; do
+      root_index=${root_indices[$root_position]}
+      root_started_utc=$(date -u '+%Y-%m-%dT%H:%M:%SZ')
+      root_started=$SECONDS
+      printf 'fm-lint-progress-v1\tstart\tshard=%s\troot_index=%s\tpath=%s\tutc=%s\n' \
+        "$shard_index" "$root_index" "$path" "$root_started_utc" >&2
       invocation_rc=0
       "$FM_LINT_SHELLCHECK" "${shellcheck_args[@]}" -- "$path" >> "$output.out" 2>&1 &
       FM_LINT_WORKER_SHELLCHECK_PID=$!
       wait "$FM_LINT_WORKER_SHELLCHECK_PID" || invocation_rc=$?
       FM_LINT_WORKER_SHELLCHECK_PID=
+      root_elapsed=$((SECONDS - root_started))
+      root_finished_utc=$(date -u '+%Y-%m-%dT%H:%M:%SZ')
+      printf 'fm-lint-progress-v1\tfinish\tshard=%s\troot_index=%s\tpath=%s\tutc=%s\telapsed_seconds=%s\texit=%s\n' \
+        "$shard_index" "$root_index" "$path" "$root_finished_utc" "$root_elapsed" "$invocation_rc" >&2
+      root_position=$((root_position + 1))
       if [ "$rc" -eq 0 ] && [ "$invocation_rc" -ne 0 ]; then
         rc=$invocation_rc
       fi
