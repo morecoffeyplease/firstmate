@@ -347,7 +347,7 @@ test_build_injects_binds_then_arms() {
 }
 
 test_registration_cannot_consume_before_any_origin_binding() {
-  local home data runtime origin key hold board sid show
+  local home data runtime origin key hold board sid show decision
   home=$(make_home order-proof)
   data="$home/payload.json"
   runtime="$home/runtime"
@@ -365,8 +365,11 @@ test_registration_cannot_consume_before_any_origin_binding() {
 ## Done
 EOF
   fm_write_meta "$home/state/$origin.meta" "project=$home/projects/sample" "kind=scout"
+  decision="$home/order-proof-decision.json"
+  fm_test_captain_decision "$decision" "Should the answer be consumed before its source is bound?"
   run_decisions "$home" hold "$origin" "$key" \
-    --title "Choose the order proof" --reason "captain choice pending" --repo sample >/dev/null \
+    --title "Choose the order proof" --reason "captain choice pending" --repo sample \
+    --decision-file "$decision" >/dev/null \
     || fail "could not create the order-proof captain hold"
 
   write_valid_payload "$data"
