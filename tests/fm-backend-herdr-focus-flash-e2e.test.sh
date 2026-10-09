@@ -82,13 +82,20 @@ mkws() {  # <label> -> "<workspace_id> <tab_id> <pane_id>"
     | jq -er '"\(.result.workspace.workspace_id) \(.result.tab.tab_id) \(.result.root_pane.pane_id)"'
 }
 focus_snapshot() {
-  local list workspace tab tabs
+  local list
   list=$(lab workspace list) || return 1
-  workspace=$(printf '%s' "$list" | jq -er '[.result.workspaces[] | select(.focused == true)] | select(length == 1) | .[0].workspace_id') || return 1
-  tab=$(printf '%s' "$list" | jq -er --arg workspace "$workspace" '[.result.workspaces[] | select(.workspace_id == $workspace)] | select(length == 1) | .[0].active_tab_id') || return 1
-  tabs=$(lab tab list --workspace "$workspace") || return 1
-  printf '%s' "$tabs" | jq -e --arg tab "$tab" '([.result.tabs[] | select(.focused == true)] | length) == 1 and ([.result.tabs[] | select(.focused == true)][0].tab_id == $tab)' >/dev/null || return 1
-  printf '%s\t%s' "$workspace" "$tab"
+  # Take the workspace and its active tab from one Herdr snapshot. Separate
+  # workspace.list and tab.list calls can straddle the short focus transition
+  # under test and turn a valid state into a false unreadable sample.
+  printf '%s' "$list" | jq -er '
+    [.result.workspaces[] | select(.focused == true)]
+    | select(length == 1)
+    | .[0]
+    | select((.workspace_id | type) == "string" and (.workspace_id | length) > 0)
+    | select((.active_tab_id | type) == "string" and (.active_tab_id | length) > 0)
+    | [.workspace_id, .active_tab_id]
+    | @tsv
+  '
 }
 focus_samples_verdict() {  # <anchor workspace<TAB>tab> <samples file>
   local anchor=$1 samples=$2 line workspace tab count=0 wrong=0
