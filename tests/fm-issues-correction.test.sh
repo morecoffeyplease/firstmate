@@ -79,7 +79,21 @@ repo_hash = hashlib.sha256(b"acme/widget").hexdigest()
 projection = issues._make_projection(home, "alpha")
 assert projection["remote_issue_coverage"]["stale_home_summaries"] == 1 and not projection["remote_issue_coverage"]["complete"]
 remote_row = next(row for row in projection["rows"] if row["url"] == issue_url)
-assert remote_row["tasks"][0]["task_state"] == "unknown" and "stale" in remote_row["tasks"][0]["conflicts"][0]
+assert remote_row["tasks"][0]["task_state"] == "working"
+assert remote_row["tasks"][0]["stage"] == "Implementing"
+assert remote_row["tasks"][0]["ready_for_approval"] == "unknown"
+assert not any("stale" in conflict for conflict in remote_row["tasks"][0]["conflicts"])
+
+# The semantic reducer is pure and shared by every row. Poll/read metadata and
+# task ordering do not enter the relevant status fingerprint.
+from fm_issues_derive import semantic_fingerprint, task_rank
+row_task = {**task, "stage": "In review", "waiting": None, "next_step": "Review required", "ready_for_approval": "not ready"}
+row = {"url": issue_url, "forge_state": "open", "title": "Review", "stage": "In review", "conflicts": [], "tasks": [row_task]}
+unlinked_task = {"id": "other", "generation": "gen-1", "stage": "Queued", "waiting": None, "next_step": "Queued", "backlog": {"state": "queued"}, "prs": [], "verification": {}}
+first_fp = semantic_fingerprint([row], [unlinked_task])
+read_only_copy = {**row, "tasks": [{**row_task, "last_checked_epoch": 12345, "cache_age_seconds": 9}]}
+assert semantic_fingerprint([read_only_copy], [unlinked_task]) == first_fp
+assert task_rank({**row_task, "id": "decision", "waiting": "your decision"}) < task_rank({**row_task, "id": "ready", "stage": "Ready for approval"})
 
 # A lane-specific validated receipt-write error remains unknown even when the
 # first write failed before any start receipt could be retained.

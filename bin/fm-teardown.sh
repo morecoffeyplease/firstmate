@@ -250,8 +250,7 @@ SUB_HOME_PARENT_MARKER=".fm-secondmate-parent"
 . "$SCRIPT_DIR/fm-tasks-axi-lib.sh"
 # shellcheck source=bin/fm-backlog-transition-lib.sh
 . "$SCRIPT_DIR/fm-backlog-transition-lib.sh"
-# shellcheck source=bin/fm-issue-events-lib.sh
-. "$SCRIPT_DIR/fm-issue-events-lib.sh"
+fm_issue_event_append() { "$SCRIPT_DIR/fm-issue-event.sh" append "$@" >/dev/null 2>&1; }
 # shellcheck source=bin/fm-backend.sh
 . "$SCRIPT_DIR/fm-backend.sh"
 # shellcheck source=bin/fm-control-lib.sh

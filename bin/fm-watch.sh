@@ -128,8 +128,7 @@ STATE="${FM_STATE_OVERRIDE:-$FM_HOME/state}"
 DATA="${FM_DATA_OVERRIDE:-$FM_HOME/data}"
 CONFIG="${FM_CONFIG_OVERRIDE:-$FM_HOME/config}"
 mkdir -p "$STATE"
-# shellcheck source=bin/fm-issue-events-lib.sh
-. "$SCRIPT_DIR/fm-issue-events-lib.sh"
+fm_issue_event_append() { "$SCRIPT_DIR/fm-issue-event.sh" append "$@" >/dev/null 2>&1; }
 
 # The native event fast-path and only its true dependencies have one narrow
 # production owner. The Herdr event-wait smoke test consumes this same owner
@@ -1511,7 +1510,9 @@ issue_status_seen_event() { # <status-file> <captured-end> <captured-identity>
     old_epoch=$(awk -F= '$1=="epoch" {print $2; exit}' "$marker")
     old_end=$(awk -F= '$1=="end" {print $2; exit}' "$marker")
   fi
-  [ "$old_end" != "$end:$ident" ] || return 0
+  local changed=0
+  [ "$old_end" = "$end:$ident" ] || changed=1
+  if [ "$changed" -eq 1 ]; then
   line=$(tail -n 1 -- "$file" 2>/dev/null || true)
   state=${line%%:*}
   case "$state" in working|needs-decision|blocked|paused|done|failed|resolved|note|receipt|waiting|busy|running|complete|completed) ;; *) state=unknown ;; esac
@@ -1520,6 +1521,7 @@ issue_status_seen_event() { # <status-file> <captured-end> <captured-identity>
   case "$old_epoch" in ''|*[!0-9]*) old_epoch=null ;; esac
   fields=$(jq -cn --arg state "$state" --arg key "$key" --argjson from "$old_epoch" --argjson to "$now" '{state:$state,key:(if $key == "" then null else $key end),from_epoch:$from,to_epoch:$to}') || return 0
   fm_issue_event_append "$DATA/$id" "$id" "$generation" status-seen "$fields" detected || true
+  fi
   tmp=$(umask 077; mktemp "$DATA/$id/.status-observed.XXXXXX") || return 0
   printf 'epoch=%s\nend=%s\n' "$now" "$end:$ident" > "$tmp" || { rm -f "$tmp"; return 0; }
   if chmod 600 "$tmp" && mv -f -- "$tmp" "$marker"; then

@@ -261,8 +261,7 @@ fi
 . "$SCRIPT_DIR/fm-task-inbox-lib.sh"
 # shellcheck source=bin/fm-timeout-lib.sh
 . "$SCRIPT_DIR/fm-timeout-lib.sh"
-# shellcheck source=bin/fm-issue-events-lib.sh
-. "$SCRIPT_DIR/fm-issue-events-lib.sh"
+fm_issue_event_append() { "$SCRIPT_DIR/fm-issue-event.sh" append "$@" >/dev/null 2>&1; }
 
 FM_GUARD_CONTINUE_LINE='This is a supervision warning only; the requested message WILL still be sent.' "$SCRIPT_DIR/fm-guard.sh" || true
 

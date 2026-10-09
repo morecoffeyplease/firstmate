@@ -404,8 +404,7 @@ FM_HOME="${FM_HOME:-${FM_ROOT_OVERRIDE:-$FM_ROOT}}"
 . "$SCRIPT_DIR/fm-tasks-axi-lib.sh"
 # shellcheck source=bin/fm-backlog-transition-lib.sh
 . "$SCRIPT_DIR/fm-backlog-transition-lib.sh"
-# shellcheck source=bin/fm-issue-events-lib.sh
-. "$SCRIPT_DIR/fm-issue-events-lib.sh"
+fm_issue_event_append() { "$SCRIPT_DIR/fm-issue-event.sh" append "$@" >/dev/null 2>&1; }
 
 resolve_directory_input() {
   local name=$1 path=$2 resolved raw_bytes

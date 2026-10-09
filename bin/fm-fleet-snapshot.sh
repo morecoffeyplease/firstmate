@@ -208,8 +208,7 @@ esac
 # shellcheck source=bin/fm-backend.sh
 # shellcheck disable=SC1091
 . "$SCRIPT_DIR/fm-backend.sh"
-# shellcheck source=bin/fm-issue-events-lib.sh
-. "$SCRIPT_DIR/fm-issue-events-lib.sh"
+fm_issue_event_validate_file() { "$SCRIPT_DIR/fm-issue-event.sh" validate "$@"; }
 # shellcheck source=bin/fm-classify-lib.sh
 # shellcheck disable=SC1091
 . "$SCRIPT_DIR/fm-classify-lib.sh"
@@ -961,7 +960,7 @@ secondmate_home_summary_json() {  # <backlog-json-file> <tasks-json-file> <produ
     case "$task_id$task_generation" in *[!A-Za-z0-9._-]*) continue ;; esac
     event_path="$DATA/$task_id/events.jsonl"
     if fm_issue_event_validate_file "$event_path" "$task_id"; then
-      jq -c --arg generation "$task_generation" 'select(.generation == $generation)' "$event_path" | tail -n 1 >> "$issue_events_file" || return 1
+      jq -c --arg generation "$task_generation" 'select(.generation == $generation)' "$event_path" >> "$issue_events_file" || return 1
     fi
   done < <(jq -r '.[] | select((.id | type) == "string" and (.spawn_gen | type) == "string") | [.id,.spawn_gen] | @tsv' "$2")
   jq -n \
@@ -992,8 +991,8 @@ secondmate_home_summary_json() {  # <backlog-json-file> <tasks-json-file> <produ
       | sort_by((.value | filed_epoch) as $epoch
           | if $epoch == null then [1, 0, .key] else [0, -$epoch, .key] end)
       | map(.value);
-    def event_for($id; $generation):
-      [$issue_events[]? | select(.task == $id and .generation == $generation)] | last // null;
+    def event_history_for($id; $generation):
+      [$issue_events[]? | select(.task == $id and .generation == $generation)] | .[-32:];
     ([ $backlog.records[]?
        | select((.state == "in_flight" or .state == "queued") and (.structured | not)) ]) as $unstructured_current
     | ([ $backlog.records[]? | select(.state == "in_flight" and .structured) ]) as $owned_in_flight
@@ -1064,7 +1063,7 @@ secondmate_home_summary_json() {  # <backlog-json-file> <tasks-json-file> <produ
        + ([ $tasks[] as $t | ($t.hints.open_decisions // [])[]
             | {id:$t.id,key,verb,summary:(.summary | trunc(160)),reason:null,source:"status"} ])) as $decisions_all
     | ([ $backlog.records[]?
-         | select((.state == "in_flight" or .state == "queued") and .kind != "secondmate") as $work
+         | select((.state == "in_flight" or .state == "queued" or .state == "done") and .kind != "secondmate") as $work
          | ([$tasks[]? | select(.id == $work.id)] | first) as $task
          | {id:$work.id,
             generation:($task.spawn_gen // null),
@@ -1080,7 +1079,18 @@ secondmate_home_summary_json() {  # <backlog-json-file> <tasks-json-file> <produ
               hold_reason:((($work.hold_reason // null) | if . == null then null else trunc(160) end)),
               hold_kind:((($work.hold_kind // null) | if . == null then null else trunc(40) end)),
               hold_bucket:($work.hold_bucket // null)},
-            event:event_for($work.id; ($task.spawn_gen // null))} ]) as $issue_tasks_all
+            event:(event_history_for($work.id; ($task.spawn_gen // null)) | last // null),
+            event_history:event_history_for($work.id; ($task.spawn_gen // null))} ]
+       + [ $tasks[]
+           | select(.kind != "secondmate")
+           | select(.id as $id | [$backlog.records[]?.id] | index($id) | not)
+           | {id, generation:(.spawn_gen // null), kind,
+              current_state:(.current_state // {state:"unknown",source:"task metadata unavailable"}),
+              hints:(.hints // {}),
+              backlog:{state:null,kind,repo:(.project // null),links:[],pr_url:(.pr.url // null),pr_head:(.pr.head // null),
+                unresolved_blocker_ids:[],hold_reason:null,hold_kind:null,hold_bucket:null},
+              event:(event_history_for(.id; (.spawn_gen // null)) | last // null),
+              event_history:event_history_for(.id; (.spawn_gen // null))} ]) as $issue_tasks_all
     | ([ $issue_tasks_all[] | .backlog.repo | select(type == "string" and length > 0) ] | unique) as $issue_projects
     | ([ $issue_tasks_all[$queued_n:][] | select(.backlog.repo == null or .backlog.repo == "") ] | length) as $unscoped_omitted_issue_tasks
     | ([ $queued_all[]
@@ -1421,9 +1431,16 @@ length == 1 and (.[0] |
     (.id | type) == "string" and (.generation == null or (.generation | type) == "string")
     and (.kind == null or (.kind | type) == "string")
     and (.current_state | type) == "object" and (.backlog | type) == "object"
-    and (.backlog.state | IN("queued","in_flight")) and (.backlog.links | type) == "array"
+    and (.backlog.state == null or (.backlog.state | IN("queued","in_flight","done"))) and (.backlog.links | type) == "array"
     and all(.backlog.links[]; type == "string" and length <= 500)
-    and (.event == null or ((.event | type) == "object" and .event.task == .id and .event.generation == .generation)))
+    and (.event == null or ((.event | type) == "object" and .event.task == .id and .event.generation == .generation))
+    and ((.event_history // []) | type) == "array"
+    and (. as $task | all(($task.event_history // [])[];
+      .schema == "fm-task-event.v1" and .task == $task.id and .generation == $task.generation
+      and (.at_epoch | type) == "number" and .at_epoch >= 0
+      and (.class | IN("event","detected"))
+      and (.kind | IN("started","done","reopened","held","answered","released","reconciled","blocked-by","unblocked","pr-bound","merge-requested","decision-resolved","status-seen"))
+      and (.fields | type) == "object")))
   and ((.omitted_issue_tasks_by_project // []) | type) == "array"
   and all((.omitted_issue_tasks_by_project // [])[]; (.project | type) == "string" and (.count | type) == "number" and .count >= 0)
   and ((.omitted_issue_tasks_scope_unknown // 0) | type) == "number"

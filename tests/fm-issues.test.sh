@@ -108,21 +108,18 @@ assert first["fingerprint"] == second["fingerprint"], f"repoll/check ages change
 assert "--paginate" in (tmp / "gh-args").read_text(), "canonical forge reader did not request all paginated issue inventory"
 snapshot["tasks"].reverse()
 (home / "state" / "issue-status" / "fleet.json").write_text(json.dumps({"schema": "fm-issue-fleet-cache.v1", "collected_epoch": int(time.time()), "snapshot": snapshot, "error": None}))
-reordered = projection()
+reordered = projection(("--refresh",))
 assert reordered["fingerprint"] == second["fingerprint"], "task source ordering changed the relevant fingerprint"
 snapshot["tasks"].append({"id": "unlinked-task", "kind": "ship", "project": "alpha", "spawn_gen": "gen-u", "current_state": {"state": "working"}, "backlog": {"repo": "alpha", "state": "in_flight", "links": []}, "pr": {"url": None}})
 (home / "state" / "issue-status" / "fleet.json").write_text(json.dumps({"schema": "fm-issue-fleet-cache.v1", "collected_epoch": int(time.time()), "snapshot": snapshot, "error": None}))
-unlinked_change = projection()
+unlinked_change = projection(("--refresh",))
 assert len(unlinked_change["unlinked_tasks"]) == 1 and unlinked_change["fingerprint"] != second["fingerprint"], "unlinked task change did not invalidate project summary basis"
 
-(fakebin / "gh-axi").write_text("#!/bin/sh\necho offline >&2\nexit 7\n")
 cache = json.loads(cat_path.read_text())
 cache["last_attempt_epoch"] = 0
 cat_path.write_text(json.dumps(cache))
-result = projection(("--refresh",))
+result = projection(("--refresh",), {"FM_FAKE_GH_FAIL": "1"})
 assert result["catalog"]["stale"] is True and result["catalog"]["known"] == 3 and result["catalog"]["error"], "catalog outage discarded last-known coverage or hid its error"
-(fakebin / "gh-axi").write_text("#!/bin/sh\ncat \"$FM_FAKE_ISSUES\"\n")
-(fakebin / "gh-axi").chmod(0o755)
 issues_payload[0]["title"] = "Renamed issue"
 write_issues()
 cache = json.loads(cat_path.read_text())

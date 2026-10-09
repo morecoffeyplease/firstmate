@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import contextlib
 import hashlib
 import html
 import http.server
@@ -23,11 +24,23 @@ from datetime import datetime, timezone
 from pathlib import Path
 from zoneinfo import ZoneInfo
 from fm_project_lanes import read_project_lanes
+from fm_lane_receipts import repository_identity, valid_receipt
+from fm_issues_derive import (
+    FINGERPRINT_SCHEMA as FP_SCHEMA,
+    fingerprint_pr as derive_fingerprint_pr,
+    fingerprint_task as derive_fingerprint_task,
+    forge_pr_fact,
+    next_step as derive_next_step,
+    ready_state as derive_ready_state,
+    semantic_fingerprint,
+    stage as derive_stage,
+    task_rank,
+)
 
 ROOT = Path(__file__).resolve().parent.parent
 SCHEMA = "fm-issues.v1"
-FP_SCHEMA = "fm-issues-fingerprint.v2"
 MAX_CATALOG_AGE = 3600
+MAX_PROJECTION_AGE = 60
 MAX_OBSERVATION_BRACKET = 86400
 COLLECT_LOCK = threading.Lock()
 
@@ -65,6 +78,33 @@ def atomic_json(path: Path, payload: object) -> None:
             temp.unlink()
         except FileNotFoundError:
             pass
+
+
+@contextlib.contextmanager
+def project_summary_lock(home: Path, project: str):
+    root = home / "state" / "status-summary"
+    if root.is_symlink():
+        raise ValueError("status summary state is a symlink")
+    root.mkdir(parents=True, exist_ok=True)
+    lock_path = root / f".{hashlib.sha256(project.encode()).hexdigest()}.lock"
+    if lock_path.is_symlink():
+        raise ValueError("project summary lock is a symlink")
+    import fcntl
+    fd = os.open(lock_path, os.O_CREAT | os.O_RDWR, 0o600)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        yield
+    finally:
+        os.close(fd)
+
+
+def invalidate_projection_cache(home: Path, project: str) -> None:
+    cache_dir = home / "state" / "issue-status"
+    if cache_dir.is_symlink():
+        return
+    path = cache_dir / f"projection-{hashlib.sha256(project.encode()).hexdigest()}.json"
+    if path.is_file() and not path.is_symlink():
+        path.unlink(missing_ok=True)
 
 
 def read_json(path: Path, max_bytes: int = 20_000_000) -> object | None:
@@ -119,26 +159,26 @@ def canonical_repo(home: Path, project: str) -> tuple[str | None, str | None]:
         path = origin.split(":", 1)[1].strip("/")
     path = path.removesuffix(".git")
     if host == "github.com" and len(path.split("/")) == 2:
-        return path, None
+        repository = "/".join(part.lower() for part in path.split("/"))
+        catalog_state = home / "state" / "issue-catalog"
+        if catalog_state.is_symlink():
+            return None, "repository identity state directory is unsafe"
+        catalog_state.mkdir(parents=True, exist_ok=True)
+        pins = catalog_state / "identity-pins"
+        if pins.is_symlink():
+            return None, "repository identity pin directory is unsafe"
+        pins.mkdir(parents=True, exist_ok=True)
+        pin = pins / f"{hashlib.sha256(project.encode()).hexdigest()}.json"
+        if pin.is_symlink():
+            return None, "repository identity pin is unsafe"
+        prior = read_json(pin, 4096)
+        if not pin.exists():
+            atomic_json(pin, {"schema": "fm-issue-repository-pin.v1", "project": project, "repository": repository})
+        elif (not isinstance(prior, dict) or prior.get("schema") != "fm-issue-repository-pin.v1"
+              or prior.get("project") != project or prior.get("repository") != repository):
+            return None, "registered project origin conflicts with its pinned repository identity"
+        return repository, None
     return None, "registered origin is not a supported GitHub repository"
-
-
-def repository_identity(origin: object) -> str | None:
-    if not isinstance(origin, str) or len(origin) > 2048 or any(char in origin for char in "\r\n\x00"):
-        return None
-    parsed = urllib.parse.urlparse(origin)
-    if origin.startswith("git@") and ":" in origin:
-        host = origin.split("@", 1)[1].split(":", 1)[0]
-        path = origin.split(":", 1)[1]
-    else:
-        host = parsed.hostname
-        path = parsed.path.lstrip("/")
-        if parsed.scheme not in ("https", "ssh", "git") or parsed.username not in (None, "git"):
-            return None
-    path = path.removesuffix(".git").strip("/")
-    if host != "github.com" or not re.fullmatch(r"[A-Za-z0-9-]+/[A-Za-z0-9._-]+", path):
-        return None
-    return path
 
 
 def run_snapshot(home: Path) -> tuple[dict | None, str | None]:
@@ -301,100 +341,15 @@ def canonical_pr_url(value: object) -> str | None:
 
 
 def stage(task: dict, linked_prs: list[dict], backlog: dict | None) -> tuple[str, str | None]:
-    current = task.get("current_state", {}).get("state")
-    hints = task.get("hints") or {}
-    unresolved = (backlog or {}).get("unresolved_blocker_ids") or []
-    waiting = None
-    if (backlog and backlog.get("hold_bucket") == "live") or hints.get("pending_decision") is True:
-        waiting = "your decision"
-    elif unresolved or hints.get("blocked_event") is True:
-        waiting = "blocked"
-    elif (backlog and backlog.get("hold_bucket") in ("dated", "aged")) or current == "paused":
-        waiting = "paused"
-    if backlog and backlog.get("state") == "queued":
-        return "Queued", "prerequisite" if unresolved else waiting
-    if linked_prs:
-        if any(pr.get("forge_checked") is True and pr.get("state") == "merged" for pr in linked_prs):
-            return ("Unknown", waiting) if backlog and backlog.get("state") == "in_flight" else ("Completed", waiting)
-        merge_requests = task.get("merge_requests") or []
-        merge_requested = any(
-            item.get("url") == pr.get("url") and pr.get("state") == "open"
-            for item in merge_requests for pr in linked_prs
-        )
-        if merge_requested:
-            return "Merging", waiting
-        if not any(pr.get("forge_checked") is True and pr.get("state") == "open" for pr in linked_prs):
-            return "Unknown", waiting
-        if any(pr.get("revising") is True for pr in linked_prs):
-            return "Revising", waiting
-    if task.get("kind") == "scout" and backlog and backlog.get("state") == "in_flight":
-        return "Investigating", waiting
-    if task.get("kind") == "ship" and backlog and backlog.get("state") == "in_flight" and not linked_prs:
-        return "Implementing", waiting
-    if linked_prs:
-        return "In review", waiting
-    if current == "done" or (backlog and backlog.get("state") == "done"):
-        return "Closed without delivery", waiting
-    if current == "failed":
-        return "Unknown", waiting or "failed"
-    return "Unknown", waiting
+    return derive_stage(task, linked_prs, backlog)
 
 
 def next_step(task: dict) -> str:
-    waiting = task.get("waiting")
-    backlog = task.get("backlog") or {}
-    if waiting == "your decision":
-        return f"Waiting on your decision: {backlog.get('hold_reason') or task.get('id')}"
-    if waiting == "paused":
-        return f"Paused/deferred: {backlog.get('hold_reason') or 'task is paused'}"
-    if waiting == "prerequisite":
-        return f"Queued behind {', '.join(backlog.get('unresolved_blocker_ids') or [])}"
-    if waiting == "blocked":
-        return f"Blocked by {backlog.get('blocked_by') or 'untyped blocker'}"
-    if task.get("task_state") == "failed":
-        return "Failed; next step not recorded"
-    if any(pr.get("review_decision") == "CHANGES_REQUESTED" for pr in task.get("prs", [])):
-        return "Changes requested; revise the current PR head"
-    if any(pr.get("failed_checks", 0) for pr in task.get("prs", [])):
-        return "Checks failing on the current PR head"
-    if any(pr.get("pending_checks", 0) for pr in task.get("prs", [])):
-        running = sum(pr.get("pending_checks", 0) for pr in task.get("prs", []))
-        total = sum(len(pr.get("checks") or []) for pr in task.get("prs", []))
-        return f"Waiting on CI ({running} of {total} checks running)"
-    if any(pr.get("review_decision") == "REVIEW_REQUIRED" for pr in task.get("prs", [])):
-        return "Review required"
-    if task.get("stage") == "Ready for approval":
-        return "Ready for your approval"
-    if task.get("stage") == "Queued":
-        return "Queued"
-    return "Next step not recorded"
+    return derive_next_step(task)
 
 
 def ready_state(task: dict, configured: dict[str, list[str]]) -> str:
-    if task.get("waiting") or task.get("stage") in ("Queued", "Unknown", "Implementing", "Investigating"):
-        return "not ready"
-    if task.get("conflicts") or task.get("hints", {}).get("open_decisions"):
-        return "not ready"
-    backlog = task.get("backlog") or {}
-    if backlog.get("unresolved_blocker_ids") or backlog.get("hold_bucket") in ("live", "blocked", "dated", "aged"):
-        return "not ready"
-    prs = task.get("prs", [])
-    if not prs:
-        return "not ready"
-    for pr in prs:
-        if pr.get("forge_checked") is not True or pr.get("state") in (None, "unknown") or pr.get("draft") is None or pr.get("checks") is None:
-            return "unknown"
-        if pr.get("state") != "open" or pr.get("draft") or pr.get("outstanding_changes_requested") or pr.get("missing_verdicts", 0) or pr.get("stale_verdicts", 0):
-            return "not ready"
-        checks = pr.get("checks", [])
-        if not checks or any(check.get("status") != "completed" or check.get("conclusion") not in ("success", "skipped", "neutral") for check in checks):
-            return "not ready"
-        if not pr.get("head") or not task.get("source_head") or pr.get("head") != task.get("source_head"):
-            return "not ready"
-    lanes = read_project_lanes_for_ready(configured)
-    if any(task.get("verification", {}).get(lane, {}).get("status") != "passed" for lane in lanes):
-        return "not ready"
-    return "ready for approval"
+    return derive_ready_state(task, read_project_lanes_for_ready(configured))
 
 
 def read_project_lanes_for_ready(configured: dict[str, list[str]]) -> list[str]:
@@ -402,18 +357,7 @@ def read_project_lanes_for_ready(configured: dict[str, list[str]]) -> list[str]:
 
 
 def fingerprint_pr(pr: dict) -> dict:
-    checks = pr.get("checks")
-    latest = {}
-    for check in checks if isinstance(checks, list) else []:
-        name = check.get("name")
-        if not isinstance(name, str):
-            continue
-        prior = latest.get(name)
-        candidate_key = (str(check.get("started_at") or ""), safe_integer(check.get("id")))
-        prior_key = (str(prior.get("started_at") or ""), safe_integer(prior.get("id"))) if prior else None
-        if prior is None or candidate_key > prior_key:
-            latest[name] = check
-    return {"url": pr.get("url"), "state": pr.get("state"), "head": pr.get("head"), "draft": pr.get("draft"), "review_decision": pr.get("review_decision"), "failed_checks": pr.get("failed_checks", 0), "checks": [{"name": name, "status": value.get("status"), "conclusion": value.get("conclusion")} for name, value in sorted(latest.items())]}
+    return derive_fingerprint_pr(pr)
 
 
 def safe_integer(value: object) -> int:
@@ -424,23 +368,7 @@ def safe_integer(value: object) -> int:
 
 
 def fingerprint_task(task: dict) -> dict:
-    return {
-        "id": task.get("id"),
-        "generation": task.get("generation"),
-        "kind": task.get("kind"),
-        "source_head": task.get("source_head"),
-        "stage": task.get("stage"),
-        "waiting": task.get("waiting"),
-        "next_step": task.get("next_step"),
-        "backlog_state": (task.get("backlog") or {}).get("state"),
-        "unresolved_blocker_ids": sorted((task.get("backlog") or {}).get("unresolved_blocker_ids") or []),
-        "hold_reason": (task.get("backlog") or {}).get("hold_reason"),
-        "open_decisions": task.get("hints", {}).get("open_decisions", []),
-        "conflicts": sorted(task.get("conflicts", [])),
-        "prs": sorted((fingerprint_pr(pr) for pr in task.get("prs", [])), key=lambda pr: pr.get("url") or ""),
-        "verification": {lane: task.get("verification", {}).get(lane, {}).get("status") for lane in ("focused", "full", "verify")},
-        "ready_for_approval": task.get("ready_for_approval"),
-    }
+    return derive_fingerprint_task(task)
 
 
 def process_start_matches(pid: int, expected: str | None) -> bool:
@@ -453,8 +381,8 @@ def process_start_matches(pid: int, expected: str | None) -> bool:
         return False
 
 
-def lane_status(home: Path, task: dict, project: str) -> dict[str, dict]:
-    configured = read_project_lanes(home).get(project, {})
+def lane_status(home: Path, task: dict, project: str, configured: dict[str, list[str]] | None = None, current_head: str | None = None) -> dict[str, dict]:
+    configured = configured if configured is not None else read_project_lanes(home).get(project, {})
     task_id = task.get("id")
     generation = task.get("spawn_gen") or task.get("generation")
     result = {lane: {"status": "not instrumented", "basis": "receipts from wrapped runs; unwrapped runs are invisible"} for lane in ("focused", "full", "verify")}
@@ -478,8 +406,7 @@ def lane_status(home: Path, task: dict, project: str) -> dict[str, dict]:
     if receipt_dir.is_symlink() or not receipt_dir.is_dir():
         return result
     worktree = (task.get("paths") or {}).get("worktree", {}).get("path")
-    current_head = None
-    if isinstance(worktree, str) and worktree:
+    if current_head is None and isinstance(worktree, str) and worktree:
         try:
             current_head = subprocess.run(["git", "-C", worktree, "rev-parse", "HEAD"], capture_output=True, text=True, timeout=3).stdout.strip()
         except (OSError, subprocess.SubprocessError):
@@ -514,23 +441,7 @@ def lane_status(home: Path, task: dict, project: str) -> dict[str, dict]:
             if not isinstance(value, dict):
                 malformed[lane] = True
                 continue
-            valid = (
-                value.get("schema") == "fm-lane-receipt.v1"
-                and value.get("phase") in ("start", "finish")
-                and value.get("lane") == lane
-                and isinstance(value.get("id"), str) and path.stem == f"{lane}-{value.get('id')}"
-                and value.get("task") == task_id and value.get("generation") == generation
-                and value.get("project") == project and value.get("repository")
-                and repository_identity(value.get("repository")) == expected_repo
-                and isinstance(value.get("argv"), list) and value["argv"]
-                and all(isinstance(arg, str) and "\x00" not in arg for arg in value["argv"])
-                and isinstance(value.get("started_epoch"), int) and value["started_epoch"] >= 0
-                and isinstance(value.get("started_order_ns"), int) and value["started_order_ns"] >= 0
-                and isinstance(value.get("pid"), int) and value["pid"] > 0
-                and isinstance(value.get("process_start"), str) and bool(value["process_start"])
-                and isinstance(value.get("head_before"), str) and bool(value["head_before"])
-                and isinstance(value.get("dirty_before"), bool)
-            )
+            valid = valid_receipt(value, path, lane, task_id, generation, project, expected_repo)
             if value.get("phase") == "finish":
                 valid = valid and isinstance(value.get("ended_epoch"), int) and value["ended_epoch"] >= value["started_epoch"]
                 valid = valid and isinstance(value.get("head_after"), str) and bool(value["head_after"])
@@ -667,6 +578,7 @@ def _make_projection(home: Path, project: str, refresh: bool = False) -> dict:
             atomic_json(snapshot_file, checked)
     snap = checked.get("snapshot") if isinstance(checked, dict) else None
     candidates = []
+    configured_lanes = read_project_lanes(home).get(project, {})
     remote_issue_coverage = {"registered_homes": 0, "shown_home_summaries": 0, "unknown_home_summaries": 0, "stale_home_summaries": 0, "visible_task_records": 0, "omitted_task_records": 0, "omitted_scope_unknown": False, "complete": False}
     if isinstance(snap, dict):
         secondmate_current = snap.get("secondmate_current") or {}
@@ -685,7 +597,7 @@ def _make_projection(home: Path, project: str, refresh: bool = False) -> dict:
             summary_freshness = (secondmate.get("freshness") or {}).get("status")
             inventory_proven = isinstance((secondmate.get("counts") or {}).get("issue_tasks"), int)
             issue_tasks = secondmate.get("issue_tasks", []) if isinstance(secondmate.get("issue_tasks", []), list) else []
-            relevant_tasks = [item for item in issue_tasks if isinstance(item, dict) and (item.get("backlog") or {}).get("repo") == project and canonical_issue_urls((item.get("backlog") or {}).get("links", []), repo)]
+            relevant_tasks = [item for item in issue_tasks if isinstance(item, dict) and (item.get("backlog") or {}).get("repo") == project]
             remote_issue_coverage["visible_task_records"] += len(relevant_tasks)
             omissions_by_project = secondmate.get("omitted_issue_tasks_by_project")
             if isinstance(omissions_by_project, list):
@@ -708,7 +620,6 @@ def _make_projection(home: Path, project: str, refresh: bool = False) -> dict:
                 remote_issue_coverage["stale_home_summaries"] += 1
                 remote_issue_coverage["complete"] = False
         contribution_rows = (snap.get("contributions") or {}).get("rows", [])
-        configured_lanes = read_project_lanes(home).get(project, {})
         for task in snap.get("tasks", []):
             repo_name = (task.get("backlog") or {}).get("repo") or task.get("project")
             if repo_name != project or task.get("kind") == "secondmate":
@@ -719,23 +630,15 @@ def _make_projection(home: Path, project: str, refresh: bool = False) -> dict:
             linked = []
             if pr_url:
                 contribution = next((item for item in contribution_rows if item.get("url") == pr_url), None)
-                forge = contribution.get("forge") if isinstance(contribution, dict) else None
-                forge = forge if isinstance(forge, dict) else {}
-                forge_checked = isinstance(contribution, dict) and contribution.get("checked") is True
-                checks = forge.get("checks") if forge_checked and isinstance(forge.get("checks"), list) else None
-                failed_checks = sum(1 for check in checks or [] if check.get("status") == "completed" and check.get("conclusion") not in (None, "success", "skipped", "neutral"))
-                reviews = contribution.get("reviews", []) if forge_checked and isinstance(contribution, dict) else []
-                decision = forge.get("review_decision") if forge_checked else None
-                requested_reviews = [review for review in reviews if review.get("state") == "CHANGES_REQUESTED"]
-                outstanding = decision == "CHANGES_REQUESTED" and (not requested_reviews or any(review.get("freshness") == "current" for review in requested_reviews))
-                revising = bool(forge_checked and forge.get("head") and any(review.get("freshness") == "STALE" for review in requested_reviews))
-                linked.append({"url": pr_url, "state": forge.get("state", "unknown") if forge_checked else "unknown", "head": forge.get("head") if forge_checked else None, "draft": forge.get("draft") if forge_checked else None, "review_decision": decision, "mergeable": forge.get("mergeable") if forge_checked else None, "checks": checks, "reviews": reviews, "outstanding_changes_requested": outstanding, "revising": revising, "checked_at": contribution.get("checked_at") if isinstance(contribution, dict) else None, "forge_checked": forge_checked, "missing_verdicts": contribution.get("missing_verdicts", 0) if isinstance(contribution, dict) else 0, "stale_verdicts": contribution.get("stale_verdicts", 0) if isinstance(contribution, dict) else 0, "pending_checks": contribution.get("pending_checks", 0) if isinstance(contribution, dict) else 0, "failed_checks": failed_checks, "association": "task-linked; issue-specific PR relation not recorded"})
+                linked.append(forge_pr_fact(pr_url, contribution, "task-linked; issue-specific PR relation not recorded"))
             task_id = task.get("id")
             generation = task.get("spawn_gen")
             event = task_event_fact(home, task_id, generation)
             event_history = event.get("history", []) if isinstance(event, dict) else []
             latest_event = {key: value for key, value in event.items() if key != "history"} if isinstance(event, dict) else None
-            task_row = {"id": task_id, "generation": generation, "kind": task.get("kind"), "task_state": task.get("current_state", {}).get("state", "unknown"), "activity_source": task.get("current_state", {}).get("source", "unknown"), "activity_detail": task.get("current_state", {}).get("detail"), "current_state": task.get("current_state", {}), "hints": task.get("hints", {}), "source_head": worktree_head(task), "backlog": backlog, "issues": task_links(task, repo), "prs": linked, "verification": lane_status(home, task, project), "event": latest_event, "merge_requests": [{"url": item.get("fields", {}).get("url"), "at_epoch": item.get("at_epoch")} for item in event_history if item.get("kind") == "merge-requested"]}
+            source_head = worktree_head(task)
+            verification = lane_status(home, task, project, configured_lanes, source_head)
+            task_row = {"id": task_id, "generation": generation, "kind": task.get("kind"), "task_state": task.get("current_state", {}).get("state", "unknown"), "activity_source": task.get("current_state", {}).get("source", "unknown"), "activity_detail": task.get("current_state", {}).get("detail"), "current_state": task.get("current_state", {}), "hints": task.get("hints", {}), "source_head": source_head, "backlog": backlog, "issues": task_links(task, repo), "prs": linked, "verification": verification, "event": latest_event, "event_history": event_history, "merge_requests": [{"url": item.get("fields", {}).get("url"), "at_epoch": item.get("at_epoch")} for item in event_history if item.get("kind") == "merge-requested"]}
             if backlog and backlog.get("state") == "in_flight" and any(pr.get("state") == "merged" for pr in linked):
                 task_row["conflicts"] = ["forge PR is merged while local task remains in flight"]
             if raw_pr_url and not pr_url:
@@ -765,8 +668,6 @@ def _make_projection(home: Path, project: str, refresh: bool = False) -> dict:
             for remote in secondmate.get("issue_tasks", []):
                 backlog = remote.get("backlog") if isinstance(remote.get("backlog"), dict) else {}
                 issue_urls = canonical_issue_urls(backlog.get("links", []), repo)
-                if not issue_urls:
-                    continue
                 source_id = remote.get("id")
                 if not isinstance(source_id, str) or not source_id:
                     continue
@@ -777,22 +678,13 @@ def _make_projection(home: Path, project: str, refresh: bool = False) -> dict:
                 if pr_url:
                     remote_rows = ((secondmate.get("contributions") or {}).get("rows", []))
                     contribution = next((item for item in remote_rows if isinstance(item, dict) and item.get("url") == pr_url), None)
-                    forge = contribution.get("forge") if isinstance(contribution, dict) and contribution.get("checked") is True else None
-                    forge = forge if isinstance(forge, dict) else {}
-                    forge_checked = isinstance(contribution, dict) and contribution.get("checked") is True
-                    checks = forge.get("checks") if forge_checked and isinstance(forge.get("checks"), list) else None
-                    failed_checks = sum(1 for check in checks or [] if check.get("status") == "completed" and check.get("conclusion") not in (None, "success", "skipped", "neutral"))
-                    reviews = contribution.get("reviews", []) if forge_checked and isinstance(contribution, dict) else []
-                    decision = forge.get("review_decision") if forge_checked else None
-                    requested_reviews = [review for review in reviews if review.get("state") == "CHANGES_REQUESTED"]
-                    linked_prs.append({"url": pr_url, "head": forge.get("head") if forge_checked else None, "state": forge.get("state", "unknown") if forge_checked else "unknown", "draft": forge.get("draft") if forge_checked else None, "review_decision": decision, "mergeable": forge.get("mergeable") if forge_checked else None, "checks": checks, "reviews": reviews, "outstanding_changes_requested": decision == "CHANGES_REQUESTED" and (not requested_reviews or any(review.get("freshness") == "current" for review in requested_reviews)), "revising": bool(forge_checked and forge.get("head") and any(review.get("freshness") == "STALE" for review in requested_reviews)), "forge_checked": forge_checked, "missing_verdicts": contribution.get("missing_verdicts", 0) if isinstance(contribution, dict) else 0, "stale_verdicts": contribution.get("stale_verdicts", 0) if isinstance(contribution, dict) else 0, "pending_checks": contribution.get("pending_checks", 0) if isinstance(contribution, dict) else 0, "failed_checks": failed_checks, "association": "task-linked; issue-specific PR relation not recorded"})
+                    linked_prs.append(forge_pr_fact(pr_url, contribution, "task-linked; issue-specific PR relation not recorded"))
                 current_state = remote.get("current_state") if isinstance(remote.get("current_state"), dict) else {"state": "unknown", "source": "remote summary unavailable"}
                 summary_valid = (secondmate.get("provenance") or {}).get("summary_valid") is True
                 summary_fresh = (secondmate.get("freshness") or {}).get("status") == "fresh"
-                if not summary_valid or not summary_fresh:
-                    current_state = {**current_state, "reported_state": current_state.get("state"), "state": "unknown", "source": "untrusted partial home summary"}
                 decisions = [item for item in secondmate.get("decisions_open", []) if isinstance(item, dict) and item.get("id") == source_id and item.get("verb") in ("needs-decision", "captain-hold")]
                 remote_event = remote.get("event") if isinstance(remote.get("event"), dict) else None
+                remote_events = remote.get("event_history") if isinstance(remote.get("event_history"), list) else []
                 task_row = {
                     "id": task_id,
                     "task_id": source_id,
@@ -803,22 +695,24 @@ def _make_projection(home: Path, project: str, refresh: bool = False) -> dict:
                     "activity_source": current_state.get("source", "unknown"),
                     "activity_detail": current_state.get("detail"),
                     "current_state": current_state,
-                    "hints": {"open_decisions": decisions, "pending_decision": any(item.get("verb") in ("needs-decision", "captain-hold") for item in decisions), "blocked_event": current_state.get("state") in ("blocked", "parked")},
+                    "hints": {"open_decisions": decisions, "pending_decision": any(item.get("verb") in ("needs-decision", "captain-hold") for item in decisions), "blocked_event": (remote.get("hints") or {}).get("blocked_event") is True},
                     "source_head": None,
                     "backlog": backlog,
                     "issues": issue_urls,
                     "prs": linked_prs,
                     "verification": {lane: {"status": "unknown", "basis": "remote lane receipts are not included in the validated home summary"} for lane in ("focused", "full", "verify")},
                     "event": remote_event,
+                    "event_history": remote_events,
                     "merge_requests": [],
+                    "evidence_freshness": "fresh" if summary_valid and summary_fresh else "stale" if summary_valid else "unknown",
                     "source_accepted": "not recorded",
                     "canonical_journeys": "not recorded",
-                    "conflicts": ([] if summary_valid and summary_fresh else ["remote home summary is stale or not valid for complete current-state evidence"])
+                    "conflicts": ([] if summary_valid else ["remote home summary is not valid for complete current-state evidence"])
                         + (["task PR URL has an unsupported identity"] if raw_remote_pr_url and not pr_url else []),
                 }
                 task_row["stage"], task_row["waiting"] = stage(task_row, linked_prs, backlog)
                 task_row["next_step"] = next_step(task_row)
-                task_row["ready_for_approval"] = "unknown"
+                task_row["ready_for_approval"] = "unknown" if task_row["evidence_freshness"] != "fresh" else ready_state(task_row, configured_lanes)
                 candidates.append(task_row)
     cat = {"schema": "fm-issue-catalog.v1", "repo": None, "checked_epoch": None, "complete": False, "known": 0, "observed_known": 0, "total": None, "issues": [], "error": repo_error, "stale": False}
     if repo:
@@ -841,17 +735,8 @@ def _make_projection(home: Path, project: str, refresh: bool = False) -> dict:
             visibility = "not visible to this login (forge returned 403/404)" if identity.get("status") == "not-visible-to-login" else "known identity observation unknown" if identity.get("status") == "unknown" else "known identity not present in observed catalog coverage"
             rows.append({"url": url, "number": None, "title": None, "forge_state": "unknown", "visibility": visibility, "identity_check": identity, "tasks": linked, "stage": "Unknown", "changed": {"class": "unknown"}})
             continue
-        def actionable_rank(task: dict) -> tuple[int, str]:
-            if task.get("waiting") == "your decision":
-                return (0, task.get("id") or "")
-            if task.get("conflicts") or task.get("waiting") in ("prerequisite", "blocked", "failed") or task.get("task_state") == "failed" or any(pr.get("failed_checks", 0) for pr in task.get("prs", [])):
-                return (1, task.get("id") or "")
-            if task.get("stage") == "Ready for approval":
-                return (2, task.get("id") or "")
-            order = {"Queued": 3, "Investigating": 4, "Implementing": 5, "Revising": 6, "In review": 7, "Merging": 8, "Completed": 9, "Closed without delivery": 10}
-            return (order.get(task.get("stage"), 1), task.get("id") or "")
-        chosen_task = min(linked, key=actionable_rank) if linked else None
-        chosen = chosen_task["stage"] if chosen_task else ("Unstarted" if issue["state"] == "open" else "Closed without delivery")
+        chosen_task = min(linked, key=task_rank) if linked else None
+        chosen = chosen_task["stage"] if chosen_task else ("Unstarted" if issue["state"] == "open" and remote_issue_coverage["complete"] else ("Unknown" if issue["state"] == "open" else "Closed without delivery"))
         conflicts = [conflict for task in linked for conflict in task.get("conflicts", [])]
         if issue["state"] == "closed" and any(task.get("task_state") in ("working", "busy", "paused", "running") for task in linked):
             conflicts.append("forge issue is closed while local task remains active")
@@ -859,7 +744,7 @@ def _make_projection(home: Path, project: str, refresh: bool = False) -> dict:
     unlinked = sorted((task for task in candidates if not task["issues"]), key=lambda task: task.get("id") or "")
     state_cache = home / "state" / "issue-status" / f"{hashlib.sha256(project.encode()).hexdigest()}.json"
     previous = read_json(state_cache)
-    prior_rows = previous.get("rows", {}) if isinstance(previous, dict) and isinstance(previous.get("rows"), dict) else {}
+    prior_rows = previous.get("rows", {}) if isinstance(previous, dict) and previous.get("schema") == FP_SCHEMA and isinstance(previous.get("rows"), dict) else {}
     prior_prs = {}
     for old_row in prior_rows.values():
         for old_task in old_row.get("tasks", []) if isinstance(old_row, dict) else []:
@@ -876,7 +761,6 @@ def _make_projection(home: Path, project: str, refresh: bool = False) -> dict:
                         pr["revising"] = True
                         pr["prior_head_failure"] = prior_failed
                         pr["prior_head_changes_requested"] = prior_requested
-            configured_lanes = read_project_lanes(home).get(project, {})
             task["stage"], task["waiting"] = stage(task, task.get("prs", []), task.get("backlog"))
             task["ready_for_approval"] = ready_state(task, configured_lanes)
             if task["ready_for_approval"] == "ready for approval":
@@ -886,18 +770,10 @@ def _make_projection(home: Path, project: str, refresh: bool = False) -> dict:
         linked = row.get("tasks", [])
         if not linked:
             continue
-        def rank(task: dict) -> tuple[int, str]:
-            if task.get("waiting") == "your decision": return (0, task.get("id") or "")
-            if task.get("conflicts") or task.get("waiting") in ("prerequisite", "blocked", "failed") or task.get("task_state") == "failed" or any(pr.get("failed_checks", 0) for pr in task.get("prs", [])): return (1, task.get("id") or "")
-            if task.get("stage") == "Ready for approval": return (2, task.get("id") or "")
-            order = {"Queued": 3, "Investigating": 4, "Implementing": 5, "Revising": 6, "In review": 7, "Merging": 8, "Completed": 9, "Closed without delivery": 10}
-            return (order.get(task.get("stage"), 1), task.get("id") or "")
-        chosen_task = min(linked, key=rank)
+        chosen_task = min(linked, key=task_rank)
         row["stage"] = chosen_task.get("stage", "Unknown")
         row["next_step"] = chosen_task.get("next_step")
-    relevant_rows = [{"url": row["url"], "state": row.get("forge_state"), "title": row.get("title"), "stage": row.get("stage"), "conflicts": sorted(row.get("conflicts", [])), "tasks": [fingerprint_task(task) for task in row.get("tasks", [])]} for row in rows]
-    relevant_rows.sort(key=lambda value: value["url"])
-    fingerprint = hashlib.sha256(json.dumps({"schema": FP_SCHEMA, "rows": relevant_rows, "unlinked_tasks": [fingerprint_task(task) for task in unlinked]}, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+    fingerprint = semantic_fingerprint(rows, unlinked)
     previous_fp = previous.get("fingerprint") if isinstance(previous, dict) and previous.get("schema") == FP_SCHEMA else None
     previous_seen = previous.get("observed_epoch") if isinstance(previous, dict) and previous.get("schema") == FP_SCHEMA else None
     changed = {"class": "unknown"}
@@ -952,11 +828,25 @@ def _make_projection(home: Path, project: str, refresh: bool = False) -> dict:
         next_rows[row["url"]] = {"fingerprint": row_fingerprint, "observed_epoch": now, "title": row.get("title"), "state": row.get("forge_state"), "changed": row_changed, "events": {task.get("id"): task.get("event") for task in row.get("tasks", []) if task.get("event")}, "tasks": [fingerprint_task(task) for task in row.get("tasks", [])]}
     if previous_fp != fingerprint or prior_rows != next_rows:
         atomic_json(state_cache, {"schema": FP_SCHEMA, "fingerprint": fingerprint, "observed_epoch": now, "changed": changed, "rows": next_rows})
+    summary = summary_record_for_projection(home, project, fingerprint, now, changed)
+    beat = home / "state" / ".last-watcher-beat"
+    try:
+        beat_epoch = int(beat.stat().st_mtime) if beat.is_file() and not beat.is_symlink() else None
+    except OSError:
+        beat_epoch = None
+    session_lock = home / "state" / ".lock"
+    supervisor = {"watcher_beat_epoch": beat_epoch, "watcher_age_seconds": now - beat_epoch if beat_epoch else None, "session_lock_present": session_lock.exists()}
+    return {"schema": SCHEMA, "project": project, "repository": repo, "generated_epoch": now, "last_checked_epoch": cat.get("checked_epoch"), "catalog": {key: cat.get(key) for key in ("complete", "partial", "known", "observed_known", "total", "error", "stale", "checked_epoch", "last_attempt_epoch", "throttled")}, "snapshot": {"collected_epoch": checked.get("collected_epoch"), "error": checked.get("error"), "stale": checked.get("stale", False)}, "remote_issue_coverage": remote_issue_coverage, "supervisor": supervisor, "fingerprint_schema": FP_SCHEMA, "fingerprint": fingerprint, "project_changed": changed, "rows": rows, "unlinked_tasks": unlinked, "summary_requests": list_summary_requests(home, project), "summary": summary}
+
+
+def summary_record_for_projection(home: Path, project: str, fingerprint: str, now: int, changed: dict) -> dict | None:
     summary_path = home / "state" / "status-summary" / "summaries" / f"{hashlib.sha256(project.encode()).hexdigest()}.json"
-    summary_file = read_json(summary_path, 1_000_000)
-    summaries = summary_file.get("summaries", []) if isinstance(summary_file, dict) and isinstance(summary_file.get("summaries"), list) else []
-    summary = summaries[-1] if summaries else None
-    if isinstance(summary, dict) and summary.get("schema") == "fm-status-summary.v1":
+    with project_summary_lock(home, project):
+        summary_file = read_json(summary_path, 1_000_000)
+        summaries = summary_file.get("summaries", []) if isinstance(summary_file, dict) and isinstance(summary_file.get("summaries"), list) else []
+        summary = summaries[-1] if summaries else None
+        if not isinstance(summary, dict) or summary.get("schema") != "fm-status-summary.v1":
+            return None
         summary = dict(summary)
         if summary.get("state") != "outdated" and summary.get("basis_fingerprint") != fingerprint:
             summary["state"] = "outdated"
@@ -966,16 +856,7 @@ def _make_projection(home: Path, project: str, refresh: bool = False) -> dict:
             atomic_json(summary_path, {**summary_file, "summaries": summaries[-20:]})
         else:
             summary["state"] = "outdated" if summary.get("state") == "outdated" else "written"
-    else:
-        summary = None
-    beat = home / "state" / ".last-watcher-beat"
-    try:
-        beat_epoch = int(beat.stat().st_mtime) if beat.is_file() and not beat.is_symlink() else None
-    except OSError:
-        beat_epoch = None
-    session_lock = home / "state" / ".lock"
-    supervisor = {"watcher_beat_epoch": beat_epoch, "watcher_age_seconds": now - beat_epoch if beat_epoch else None, "session_lock_present": session_lock.exists()}
-    return {"schema": SCHEMA, "project": project, "repository": repo, "generated_epoch": now, "last_checked_epoch": cat.get("checked_epoch"), "catalog": {key: cat.get(key) for key in ("complete", "partial", "known", "observed_known", "total", "error", "stale", "checked_epoch", "last_attempt_epoch", "throttled")}, "snapshot": {"collected_epoch": checked.get("collected_epoch"), "error": checked.get("error"), "stale": checked.get("stale", False)}, "remote_issue_coverage": remote_issue_coverage, "supervisor": supervisor, "fingerprint_schema": FP_SCHEMA, "fingerprint": fingerprint, "project_changed": changed, "rows": rows, "unlinked_tasks": unlinked, "summary_requests": list_summary_requests(home, project), "summary": summary}
+        return summary
 
 
 def make_projection(home: Path, project: str, refresh: bool = False) -> dict:
@@ -990,7 +871,27 @@ def make_projection(home: Path, project: str, refresh: bool = False) -> dict:
         try:
             import fcntl
             fcntl.flock(fd, fcntl.LOCK_EX)
-            return _make_projection(home, project, refresh)
+            cache_dir = state / "issue-status"
+            if cache_dir.is_symlink():
+                raise ValueError("issue status cache directory is a symlink")
+            cache_dir.mkdir(parents=True, exist_ok=True)
+            cache_path = cache_dir / f"projection-{hashlib.sha256(project.encode()).hexdigest()}.json"
+            if cache_path.is_symlink():
+                raise ValueError("issue status projection cache is a symlink")
+            cached = read_json(cache_path)
+            now = utc_now()
+            if (not refresh and isinstance(cached, dict)
+                    and cached.get("schema") == "fm-issue-projection-cache.v1"
+                    and isinstance(cached.get("cached_epoch"), int)
+                    and now - cached["cached_epoch"] < MAX_PROJECTION_AGE
+                    and isinstance(cached.get("projection"), dict)):
+                projection = dict(cached["projection"])
+                projection["projection_cached_epoch"] = cached["cached_epoch"]
+                return projection
+            projection = _make_projection(home, project, refresh)
+            atomic_json(cache_path, {"schema": "fm-issue-projection-cache.v1", "cached_epoch": now, "projection": projection})
+            projection["projection_cached_epoch"] = now
+            return projection
         finally:
             os.close(fd)
 
@@ -1158,6 +1059,11 @@ def summary_command(home: Path, argv: list[str]) -> int:
     sub = parser.add_subparsers(dest="command", required=True)
     request = sub.add_parser("request")
     request.add_argument("--project", action="append", required=True)
+    route = sub.add_parser("route")
+    route.add_argument("request_id")
+    route.add_argument("project")
+    route.add_argument("--target", required=True)
+    route.add_argument("--correlation", required=True)
     put = sub.add_parser("put")
     put.add_argument("request_id")
     put.add_argument("project")
@@ -1172,7 +1078,7 @@ def summary_command(home: Path, argv: list[str]) -> int:
     resolve.add_argument("--reason", required=True)
     sub.add_parser("list")
     args = parser.parse_args(argv)
-    if args.command in ("put", "resolve") and not re.fullmatch(r"[0-9]{1,12}-[a-f0-9]{12}", args.request_id):
+    if args.command in ("put", "resolve", "route") and not re.fullmatch(r"[0-9]{1,12}-[a-f0-9]{12}", args.request_id):
         print("error: invalid summary request identity", file=sys.stderr)
         return 2
     registered = projects(home)
@@ -1194,9 +1100,6 @@ def summary_command(home: Path, argv: list[str]) -> int:
         if not selected or any(name not in registered for name in selected):
             print("error: request must select registered projects", file=sys.stderr)
             return 2
-        projections = {}
-        for name in selected:
-            projections[name] = make_projection(home, name)
         now = utc_now()
         open_requests = list_summary_requests(home)
         existing_by_project = {}
@@ -1213,11 +1116,12 @@ def summary_command(home: Path, argv: list[str]) -> int:
             print(json.dumps({"status": "pending", "requests": attached, "deduplicated": True, "supervisor_availability": availability}))
             return 0
         ident = f"{now}-{secrets.token_hex(6)}"
-        routes = summary_route_candidates(home, selected)
-        initial_results = {name: routes[name]["state"] for name in selected}
-        initial_state = "unavailable" if all(value == "unavailable" for value in initial_results.values()) else "pending"
-        record = {"schema": "fm-status-summary-request.v1", "id": ident, "requested_epoch": now, "requested_at": iso_utc(now), "projects": selected, "basis_fingerprints": {name: projections[name]["fingerprint"] for name in selected}, "state": initial_state, "results": initial_results, "result_reasons": {name: routes[name]["reason"] for name in selected if routes[name].get("reason")}, "routes": routes, "correlations": {}, "expires_epoch": now + 1800, "supervisor_availability": supervisor_availability(home)}
+        initial_results = {name: "pending" for name in selected}
+        routes = {name: {"route": "awaiting-main-home", "target": None, "state": "pending"} for name in selected}
+        record = {"schema": "fm-status-summary-request.v1", "id": ident, "requested_epoch": now, "requested_at": iso_utc(now), "projects": selected, "basis_fingerprints": {}, "state": "pending", "results": initial_results, "result_reasons": {}, "routes": routes, "correlations": {}, "expires_epoch": now + 1800, "supervisor_availability": supervisor_availability(home)}
         atomic_json(reqdir / f"{ident}.json", record)
+        for name in selected:
+            invalidate_projection_cache(home, name)
         note = [str(ROOT / "bin" / "fm-inbox.sh"), "note", f"Request Manual Update id={ident} projects={','.join(selected)}"]
         env = os.environ.copy()
         env["FM_HOME"] = str(home)
@@ -1230,38 +1134,37 @@ def summary_command(home: Path, argv: list[str]) -> int:
             record["result_reasons"] = {name: record["error"] for name in selected}
             record["state"] = "failed"
             atomic_json(reqdir / f"{ident}.json", record)
+            for name in selected:
+                invalidate_projection_cache(home, name)
             print(json.dumps({"status": "failed", "request": ident, "error": record["error"]}))
             return 1
-        for name in selected:
-            route = routes[name]
-            target = route.get("target")
-            if route.get("route") != "secondmate" or not target or record["results"].get(name) != "pending":
-                continue
-            marker = f"request={ident} project={name}"
-            message = f"{marker} Request Manual Update. At composition start, read the current structured projection and use its fingerprint, observation time, and evidence as the summary basis. Please provide a concise written project summary through the correlated parent status channel."
-            try:
-                routed = subprocess.run([str(ROOT / "bin" / "fm-send.sh"), target, message], env=env, cwd=ROOT, capture_output=True, text=True, timeout=30)
-            except (OSError, subprocess.SubprocessError) as exc:
-                routed = None
-                reason = str(exc)[:300]
-            else:
-                reason = (routed.stderr or routed.stdout)[-500:] if routed.returncode else ""
-            if routed is None or routed.returncode != 0:
-                record["results"][name] = "failed"
-                record.setdefault("result_reasons", {})[name] = reason or "marked request delivery failed"
-                continue
-            correlation = summary_pending_correlation(home, target, ident, name)
-            if correlation:
-                record.setdefault("correlations", {})[name] = correlation
-            else:
-                record["results"][name] = "unavailable"
-                record.setdefault("result_reasons", {})[name] = "marked request was sent but its pending-reply correlation could not be verified"
-        result_values = list(record["results"].values())
-        record["state"] = ("pending" if "pending" in result_values else
-                            "failed" if "failed" in result_values else
-                            "unavailable" if "unavailable" in result_values else "written")
-        atomic_json(reqdir / f"{ident}.json", record)
         print(json.dumps({"status": record["state"], "request": ident, "projects": selected, "attached": attached, "supervisor_availability": availability, "results": record["results"]}))
+        return 0
+    if args.command == "route":
+        if not re.fullmatch(r"[A-Za-z0-9._-]{1,120}", args.target) or not re.fullmatch(r"[a-f0-9]{16}", args.correlation):
+            print("error: invalid route target or correlation", file=sys.stderr)
+            return 2
+        path = reqdir / f"{args.request_id}.json"
+        record = read_json(path)
+        if not isinstance(record, dict) or record.get("schema") != "fm-status-summary-request.v1" or args.project not in record.get("projects", []):
+            print("error: unknown request or project", file=sys.stderr)
+            return 2
+        if int(record.get("expires_epoch", 0)) <= utc_now() or record.get("results", {}).get(args.project) != "pending":
+            print(json.dumps({"status": record.get("results", {}).get(args.project, "expired"), "project": args.project}))
+            return 1
+        verified_correlation = summary_pending_correlation(home, args.target, args.request_id, args.project)
+        if verified_correlation != args.correlation:
+            print("error: correlation does not match the durable pending-reply record", file=sys.stderr)
+            return 2
+        prior = record.setdefault("correlations", {}).get(args.project)
+        if prior and prior != args.correlation:
+            print("error: project already has a different pending correlation", file=sys.stderr)
+            return 2
+        record.setdefault("routes", {})[args.project] = {"route": "secondmate", "target": args.target, "state": "pending"}
+        record["correlations"][args.project] = args.correlation
+        atomic_json(path, record)
+        invalidate_projection_cache(home, args.project)
+        print(json.dumps({"status": "pending", "project": args.project, "correlation": args.correlation}))
         return 0
     if args.command == "put":
         path = reqdir / f"{args.request_id}.json"
@@ -1285,21 +1188,23 @@ def summary_command(home: Path, argv: list[str]) -> int:
             print("error: summary must be nonempty and at most 16384 bytes", file=sys.stderr)
             return 2
         current = make_projection(home, args.project)
-        outdated = current["fingerprint"] != args.basis_fingerprint
-        written_epoch = utc_now()
-        summary = {"schema": "fm-status-summary.v1", "request": args.request_id, "project": args.project, "author": args.author, "basis_fingerprint": args.basis_fingerprint, "basis_observed_epoch": args.basis_observed_at, "written_epoch": written_epoch, "text": text, "state": "outdated" if outdated else "written", "current_fingerprint": current["fingerprint"], "invalidated_epoch": written_epoch if outdated else None, "invalidated_change": current.get("project_changed") if outdated else None, "evidence": {"basis_fingerprint": args.basis_fingerprint, "basis_observed_epoch": args.basis_observed_at, "comparison_fingerprint": current["fingerprint"], "comparison_observed_epoch": current["generated_epoch"], "repository": current["repository"], "catalog_checked_epoch": current["last_checked_epoch"], "snapshot_collected_epoch": current["snapshot"]["collected_epoch"]}}
-        summary_path = sumdir / f"{hashlib.sha256(args.project.encode()).hexdigest()}.json"
-        prior = read_json(summary_path, 1_000_000)
-        history = prior.get("summaries", []) if isinstance(prior, dict) and prior.get("schema") == "fm-status-summaries.v1" and isinstance(prior.get("summaries"), list) else []
-        history.append(summary)
-        atomic_json(summary_path, {"schema": "fm-status-summaries.v1", "project": args.project, "summaries": history[-20:]})
-        record.setdefault("results", {})[args.project] = summary["state"]
-        values = list(record["results"].values())
-        record["state"] = ("pending" if "pending" in values else
-                            "failed" if "failed" in values else
-                            "unavailable" if "unavailable" in values else
-                            "outdated" if "outdated" in values else "written")
-        atomic_json(path, record)
+        with project_summary_lock(home, args.project):
+            outdated = current["fingerprint"] != args.basis_fingerprint
+            written_epoch = utc_now()
+            summary = {"schema": "fm-status-summary.v1", "request": args.request_id, "project": args.project, "author": args.author, "basis_fingerprint": args.basis_fingerprint, "basis_observed_epoch": args.basis_observed_at, "written_epoch": written_epoch, "text": text, "state": "outdated" if outdated else "written", "current_fingerprint": current["fingerprint"], "invalidated_epoch": written_epoch if outdated else None, "invalidated_change": current.get("project_changed") if outdated else None, "evidence": {"basis_fingerprint": args.basis_fingerprint, "basis_observed_epoch": args.basis_observed_at, "comparison_fingerprint": current["fingerprint"], "comparison_observed_epoch": current["generated_epoch"], "repository": current["repository"], "catalog_checked_epoch": current["last_checked_epoch"], "snapshot_collected_epoch": current["snapshot"]["collected_epoch"]}}
+            summary_path = sumdir / f"{hashlib.sha256(args.project.encode()).hexdigest()}.json"
+            prior = read_json(summary_path, 1_000_000)
+            history = prior.get("summaries", []) if isinstance(prior, dict) and prior.get("schema") == "fm-status-summaries.v1" and isinstance(prior.get("summaries"), list) else []
+            history.append(summary)
+            atomic_json(summary_path, {"schema": "fm-status-summaries.v1", "project": args.project, "summaries": history[-20:]})
+            record.setdefault("results", {})[args.project] = summary["state"]
+            values = list(record["results"].values())
+            record["state"] = ("pending" if "pending" in values else
+                                "failed" if "failed" in values else
+                                "unavailable" if "unavailable" in values else
+                                "outdated" if "outdated" in values else "written")
+            atomic_json(path, record)
+        invalidate_projection_cache(home, args.project)
         print(json.dumps({"status": summary["state"], "project": args.project}))
         return 0
     if args.command == "resolve":
@@ -1322,6 +1227,7 @@ def summary_command(home: Path, argv: list[str]) -> int:
         values = record["results"].values()
         record["state"] = "pending" if "pending" in values else "failed" if "failed" in values else "unavailable" if "unavailable" in values else "outdated" if "outdated" in values else "written"
         atomic_json(path, record)
+        invalidate_projection_cache(home, args.project)
         print(json.dumps({"status": args.result, "project": args.project}))
         return 0
     if args.command == "list":
@@ -1343,7 +1249,7 @@ function verification(row){const box=document.createElement('div');for(const tas
 function changed(value){if(value?.class==='event')return `${time(value.at_epoch)} (event)`;if(value?.class==='detected')return `between ${time(value.from_epoch)} and ${time(value.to_epoch)} (detected)`;return 'unknown'}
 function renderRow(row){const tr=document.createElement('tr'),issue=document.createElement('td'),link=document.createElement('a'),stage=document.createElement('td'),next=document.createElement('td'),prs=document.createElement('td'),verify=document.createElement('td'),when=document.createElement('td');link.href=row.url;link.textContent=row.number?`#${row.number} ${row.title}`:row.url;issue.append(link);const count=document.createElement('small');count.textContent=`${row.task_count||0} tasks / ${row.pr_count||0} PRs`;stage.append(text(row.stage+'\n'),count);next.textContent=row.next_step||'Next step not recorded';if(row.conflicts?.length){const conflict=document.createElement('div');conflict.className='conflict';conflict.textContent=row.conflicts.join('; ');next.append(conflict)}for(const task of row.tasks||[])for(const pr of task.prs||[]){const a=document.createElement('a');a.href=pr.url;a.textContent=`${pr.url} (${pr.state||'unknown'})`;prs.append(a,text('\n'))}if(!row.pr_count)prs.textContent='None';verify.append(verification(row));when.textContent=changed(row.changed);tr.append(issue,stage,next,prs,verify,when);return tr}
 async function load(force=false){const url='/api/status?project='+encodeURIComponent(selected)+(force?'&refresh=1':'');try{const response=await fetch(url),data=await response.json();if(!response.ok)throw Error(data.error||'collection unavailable');projects=data.projects||[];el('project').replaceChildren();for(const name of projects){const option=document.createElement('option');option.value=name;option.textContent=name;option.selected=name===selected;el('project').append(option)}const p=data.projection;if(!p)throw Error(data.error||'status unavailable');const cat=p.catalog,observed=cat.observed_known??0,coverage=cat.complete&&!cat.stale?`complete (${observed} observed of ${cat.total} total)`:`partial or unavailable (${cat.known} cached; ${observed} observed; total unknown)`,remote=p.remote_issue_coverage||{},omitted=remote.omitted_scope_unknown?'omitted count unknown':`${remote.omitted_task_records||0} omitted`,remoteCoverage=`Remote summaries ${remote.shown_home_summaries||0}/${remote.registered_homes||0}; ${remote.visible_task_records||0} selected-project issue task records visible, ${omitted}, ${remote.unknown_home_summaries||0} unknown, ${remote.stale_home_summaries||0} stale${remote.complete?'':' (partial)'}`;el('status').className='muted';el('status').textContent=`${p.repository||'Repository unavailable'}; catalog ${coverage}; last checked ${time(p.last_checked_epoch)}. ${remoteCoverage}. Supervisor ${p.supervisor.session_lock_present?'session lock held':'no session lock'}; watcher beat ${time(p.supervisor.watcher_beat_epoch)}. ${cat.error||p.snapshot.error||''}`;el('rows').replaceChildren(...p.rows.map(renderRow));el('unlinked').replaceChildren(...p.unlinked_tasks.map(task=>{const li=document.createElement('li');li.textContent=`${task.id}: ${task.stage}; ${task.next_step||'Next step not recorded'}`;li.append(verification({tasks:[task]}));return li}));const fingerprintKey='fm-issues-fingerprint:'+selected,prior=localStorage.getItem(fingerprintKey);el('changed').textContent=prior&&prior!==p.fingerprint?'Project status changed since you last looked.':'';localStorage.setItem(fingerprintKey,p.fingerprint);renderSummary(p.summary);renderRequests(p.summary_requests)}catch(error){el('status').className='error';el('status').textContent='Unavailable: '+error.message}}
-function renderSummary(summary){const root=el('summary');root.replaceChildren();if(!summary)return;const evidence=summary.evidence||{},basis=`Basis ${summary.basis_fingerprint||'unknown'} observed ${time(summary.basis_observed_epoch)}; repository ${evidence.repository||'unknown'}; snapshot ${time(evidence.snapshot_collected_epoch)}; catalog ${time(evidence.catalog_checked_epoch)}`;if(summary.state==='written'){root.textContent=`Written summary by ${summary.author}, based on status as of ${time(summary.basis_observed_epoch)}, written ${time(summary.written_epoch)}:\n${basis}\n${summary.text}`;return}if(summary.state==='outdated'){const details=document.createElement('details'),title=document.createElement('summary'),body=document.createElement('p'),basisLine=document.createElement('small');title.textContent=`Summary outdated since ${time(summary.invalidated_epoch)}; historical text retained`;basisLine.textContent=basis;body.textContent=summary.text;details.append(title,basisLine,body);root.append(details)}}
+function renderSummary(summary){const root=el('summary');root.replaceChildren();if(!summary)return;const evidence=summary.evidence||{},basis=`Basis ${summary.basis_fingerprint||'unknown'} observed ${time(summary.basis_observed_epoch)}; repository ${evidence.repository||'unknown'}; snapshot ${time(evidence.snapshot_collected_epoch)}; catalog ${time(evidence.catalog_checked_epoch)}`;if(summary.state==='written'){root.textContent=`AI-written summary by ${summary.author}, based on status as of ${time(summary.basis_observed_epoch)}, written ${time(summary.written_epoch)}:\n${basis}\n${summary.text}`;return}if(summary.state==='outdated'){const details=document.createElement('details'),title=document.createElement('summary'),body=document.createElement('p'),basisLine=document.createElement('small');title.textContent=`AI-written summary outdated since ${time(summary.invalidated_epoch)}; historical text retained`;basisLine.textContent=basis;body.textContent=summary.text;details.append(title,basisLine,body);root.append(details)}}
 function renderRequests(requests){if(!requests.length)return;const states=requests.map(item=>{const projects=(item.project_results||[]).map(result=>`${result.project} ${result.state}${result.route?` via ${result.route}`:''}${result.correlation?` (${result.correlation})`:''}${result.reason?`: ${result.reason}`:''}`).join(', ');return `${item.id}: ${item.display_state||item.state}; supervisor ${item.supervisor_availability||'unknown'}${projects?`; ${projects}`:''}${item.error?` (${item.error})`:''}`}).join('; ');el('changed').textContent+=(el('changed').textContent?' ':'')+`Manual update requests: ${states}.`}
 el('project').addEventListener('change',event=>{selected=event.target.value;localStorage.setItem('fm-issues-project',selected);load()});el('refresh').onclick=()=>load(true);el('request').onclick=async()=>{try{const response=await fetch('/api/summary-requests',{method:'POST',headers:{'Content-Type':'application/json','X-FM-Token':token},body:JSON.stringify({projects})}),result=await response.json();el('status').textContent=result.status==='pending'?`Manual update request ${result.request||Object.values(result.requests||{})[0]||'already queued'}; supervisor ${result.supervisor_availability||'unknown'}.`:result.error||result.status}catch(error){el('status').textContent='Request failed: '+error.message}};load();setInterval(()=>{if(!document.hidden)load()},15000);
 </script></html>"""

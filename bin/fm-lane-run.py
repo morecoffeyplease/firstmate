@@ -17,6 +17,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from fm_project_lanes import read_project_lanes
+from fm_lane_receipts import repository_identity, valid_receipt
 SCHEMA = "fm-lane-receipt.v1"
 LANES = {"focused", "full", "verify"}
 MAX_RECEIPTS_PER_LANE = 20
@@ -71,6 +72,9 @@ def process_identity(pid: int) -> str | None:
 def project_for_home(home: Path) -> str | None:
     try:
         origin = subprocess.run(["git", "config", "--get", "remote.origin.url"], capture_output=True, text=True, timeout=3, check=True).stdout.strip()
+        expected = repository_identity(origin)
+        if not expected or not _origin_is_registered_safe(origin):
+            return None
         repos = {}
         registry = home / "data" / "projects.md"
         for line in registry.read_text(encoding="utf-8").splitlines():
@@ -79,9 +83,34 @@ def project_for_home(home: Path) -> str | None:
                 name = fields[1]
                 path = home / "projects" / name
                 value = subprocess.run(["git", "-C", str(path), "config", "--get", "remote.origin.url"], capture_output=True, text=True, timeout=3)
-                if value.returncode == 0:
-                    repos[value.stdout.strip().removesuffix(".git")] = name
-        return repos.get(origin.removesuffix(".git"))
+                if value.returncode == 0 and _origin_is_registered_safe(value.stdout.strip()):
+                    identity = repository_identity(value.stdout.strip())
+                    if identity:
+                        repos[identity.lower()] = name
+        return repos.get(expected.lower())
+    except (OSError, subprocess.SubprocessError):
+        return None
+
+
+def _origin_is_registered_safe(origin: str) -> bool:
+    try:
+        result = subprocess.run(["/bin/bash", "-c", 'source "$1"; fm_project_origin_safe "$2"',
+                                 "fm-origin", str(ROOT / "bin" / "fm-project-origin-lib.sh"), origin],
+                                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=3)
+        return result.returncode == 0
+    except (OSError, subprocess.SubprocessError):
+        return False
+
+
+def registered_repository_identity(home: Path | None, project: str | None) -> str | None:
+    if home is None or project is None or not project or "/" in project or project in (".", ".."):
+        return None
+    try:
+        origin = subprocess.run(["git", "-C", str(home / "projects" / project), "config", "--get", "remote.origin.url"],
+                                capture_output=True, text=True, timeout=3, check=True).stdout.strip()
+        if not _origin_is_registered_safe(origin):
+            return None
+        return repository_identity(origin)
     except (OSError, subprocess.SubprocessError):
         return None
 
@@ -165,6 +194,7 @@ def main(argv: list[str]) -> int:
     identity = process_identity(os.getpid())
     receipt_id = f"{start_epoch}-{secrets.token_hex(8)}"
     project = project_for_home(home) if home else None
+    expected_repository = registered_repository_identity(home, project)
     validated_receipt_dir: Path | None = None
     if receipt_dir and task and generation:
         try:
@@ -176,6 +206,8 @@ def main(argv: list[str]) -> int:
             receipt_dir.mkdir(parents=True, exist_ok=True)
             receipt_path = receipt_dir / f"{lane}-{receipt_id}.json"
             receipt = {"schema": SCHEMA, "phase": "start", "id": receipt_id, "lane": lane, "argv": command, "task": task, "generation": generation, "project": project, "repository": git("remote", "get-url", "origin"), "head_before": start_head, "dirty_before": start_dirty, "dirty_source_hash_before": start_dirty_hash, "started_epoch": start_epoch, "started_order_ns": start_order_ns, "os": os.uname().sysname + " " + os.uname().release + " " + os.uname().machine, "runtime": "python " + sys.version.split()[0], "pid": os.getpid(), "process_start": identity, "artifact": artifact, "log": "not retained" if artifact is None else artifact}
+            if not valid_receipt(receipt, receipt_path, lane, task, generation, project or "", expected_repository):
+                write_error(receipt_dir, task, generation, lane, "start receipt did not satisfy the shared schema")
             atomic_json(receipt_path, receipt)
         except OSError as exc:
             if validated_receipt_dir:
@@ -259,6 +291,8 @@ def main(argv: list[str]) -> int:
     if receipt_path:
         try:
             receipt.update(finish)
+            if not valid_receipt(receipt, receipt_path, lane, task, generation, project or "", expected_repository):
+                write_error(validated_receipt_dir or receipt_dir, task, generation, lane, "finish receipt did not satisfy the shared schema")
             atomic_json(receipt_path, receipt)
             completed = []
             for candidate in receipt_dir.glob(f"{lane}-*.json"):
