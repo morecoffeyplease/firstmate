@@ -309,7 +309,8 @@ A local standalone-clone home cannot receive a primary-local commit through that
 ## Project Firstmates and repository capacity
 
 A project Firstmate is the sole persistent authority for exactly one registered repository.
-Its session-start digest prints a `PROJECT SHIP CONTRACT` section with pointers to that repository's `AGENTS.md`, `CLAUDE.md`, and recognized ADR directories when present, so the supervising agent can reload the repository's own shipping guidance after startup and context rebuilds.
+Project Firstmates and registered secondmates see repository ship-contract pointers in the session-start digest and on harness-supported context re-emits, including `AGENTS.md`, `CLAUDE.md`, `CONTRIBUTING.md`, and recognized ADR directories when present.
+Codex's interactive TUI has no compaction re-emit channel today; issue #41 tracks that harness limitation.
 Root may seed project Firstmates or root-level ordinary secondmates, while only a project Firstmate may seed ordinary child secondmates for the same repository.
 Ordinary secondmates may remain project-less or domain-scoped as before, but cannot seed any child homes.
 Root routes all work for the project Firstmate's repository through that authority, even when ordinary secondmate clone lists overlap.
