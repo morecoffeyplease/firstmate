@@ -94,8 +94,8 @@ build_fixture() {  # <dir>
   printf '# Core for Codex\n\nNever rename the widget.\n' > "$repo/AGENTS.md"
   printf '# Map\n\nThe apps live under apps/.\n' > "$repo/CLAUDE.md"
   printf '# Core for Claude\n\nNever rename the widget.\n' > "$repo/.claude/rules/core.md"
-  printf '# Plugin rule, Claude copy\n\nKeep queries bounded.\n' > "$repo/.claude/rules/standin.md"
   printf '# Plugin rule\n\nKeep queries bounded.\n' > "$repo/vendor/rules/standin.md"
+  { printf '<!-- generated from vendor/rules/standin.md -->\n'; cat "$repo/vendor/rules/standin.md"; } > "$repo/.claude/rules/standin.md"
   printf '# Web area\n\nWeb pages use the shared frame.\n' > "$repo/apps/web/CLAUDE.md"
   printf '{"name":"web"}\n' > "$repo/apps/web/package.json"
   printf '#!/bin/sh\ntouch .prepared\n' > "$repo/tools/prepare.sh"
@@ -311,7 +311,10 @@ const fs=require("fs"),path=require("path"),crypto=require("crypto");
 const [record,ruleDirs,skillDirs]=process.argv.slice(1);
 const R=JSON.parse(record);const sha=(f)=>crypto.createHash("sha256").update(fs.readFileSync(f)).digest("hex");
 const have=new Set(R.rules.map(r=>r.sha));const names=new Set(R.skills.map(s=>s.name.split(":").pop()));const missing=[];
-for(const dir of ruleDirs.split(":").filter(Boolean))for(const f of fs.readdirSync(dir).filter(f=>f.endsWith(".md")))if(!have.has(sha(path.join(dir,f))))missing.push("rule "+f);
+// A pinned rule is covered by the same bytes, or by a declared file that holds every line of it in order (a generated native copy).
+const lines=(f)=>{let fm=false;return fs.readFileSync(f,"utf8").split("\n").map(l=>l.trim()).filter((l,i)=>{if(i===0&&l==="---"){fm=true;return false}if(fm){fm=l!=="---";return false}return l&&!l.startsWith("<!--")})};
+const held=(f)=>R.rules.some(r=>{const t=fs.readFileSync(r.file,"utf8");let at=0;return lines(f).every(l=>{const i=t.indexOf(l,at);if(i<0)return false;at=i+l.length;return true})});
+for(const dir of ruleDirs.split(":").filter(Boolean))for(const f of fs.readdirSync(dir).filter(f=>f.endsWith(".md")))if(!have.has(sha(path.join(dir,f)))&&!held(path.join(dir,f)))missing.push("rule "+f);
 for(const dir of skillDirs.split(":").filter(Boolean))for(const d of fs.readdirSync(dir)){const f=path.join(dir,d,"SKILL.md");if(!fs.existsSync(f))continue;const t=fs.readFileSync(f,"utf8");if(/^disable-model-invocation:\s*true/m.test(t))continue;const n=(t.match(/^name:\s*["\x27]?([^"\x27\n]+)/m)||[,d])[1].trim();if(!names.has(n)&&!names.has(d))missing.push("skill "+n)}
 if(missing.length){console.error(missing.join(", "));process.exit(1)}' "$("$PR" status "$STATE" "$ID")" "${FM_PROJECT_RULES_ACCEPT_PLUGIN_RULE_DIRS:-}" "${FM_PROJECT_RULES_ACCEPT_SKILL_DIRS:-}" \
     || fail "$TOOL: the declared list leaves out pinned rules or model-invocable skills"
