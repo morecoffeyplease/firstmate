@@ -29,6 +29,15 @@
 #     so does a run with fewer than 2 sessions per leg
 #   FM_PROJECT_RULES_LIVE_CLAUDE_ARGS / FM_PROJECT_RULES_LIVE_CODEX_ARGS   extra
 #     fm-spawn arguments, for example "--model gpt-6.1-sol --effort medium"
+#   FM_PROJECT_RULES_ACCEPT_CANARY_PATHS=<regex>  declared paths that may carry a
+#     canary line; a project whose prepare step refuses a changed generated
+#     file names only its hand-written ones here
+#   FM_PROJECT_RULES_ACCEPT_AFTER_CANARY=<cmd>  run in the throwaway clone after
+#     the canaries are added, to regenerate what the project generates
+#   FM_PROJECT_RULES_ACCEPT_CHILD_PROBE_CLAUDE / _CODEX=<path>  a declared rule
+#     with no canary; a child must quote its second line from its own context
+#   FM_PROJECT_RULES_ACCEPT_TAMPER_FILE=<path in the plugin store>  the pinned
+#     file to change in the scratch copy of the store
 #   FM_PROJECT_RULES_ACCEPT_PLUGIN_RULE_DIRS / FM_PROJECT_RULES_ACCEPT_SKILL_DIRS
 #     colon-separated folders of the pinned plugin rules and skills, checked
 #     against the declared list independently of it
@@ -159,10 +168,14 @@ if(missing.length){console.error("left off the declared list: "+missing.join(", 
 const rows=[];
 // In the built-in fixture the resolved file is ours, so it carries a canary too.
 if(process.env.FM_PROJECT_RULES_FIXTURE){fs.appendFileSync(path.join(repo,"vendor/rules/standin.md"),"\nContext audit line: FMQ-PLUGIN-9001\n");rows.push(["codex","plugin","FMQ-PLUGIN-9001","inline","vendor/rules/standin.md"].join("\t"))}
-L.rules.filter(r=>r.path).forEach((r,i)=>{const token="FMQ-"+r.id.replace(/[^a-z]/g,"").toUpperCase()+"-"+(1000+i*37);fs.appendFileSync(path.join(repo,r.path),"\nContext audit line: "+token+"\n");for(const tool of r.tools||["claude","codex"])rows.push([tool,r.id,token,(r.native||[]).includes(tool)?"native":"inline",r.path].join("\t"))});
+const may=new RegExp(process.env.FM_PROJECT_RULES_ACCEPT_CANARY_PATHS||".");
+L.rules.filter(r=>r.path&&may.test(r.path)).forEach((r,i)=>{const token="FMQ-"+r.id.replace(/[^a-z]/g,"").toUpperCase()+"-"+(1000+i*37);fs.appendFileSync(path.join(repo,r.path),"\nContext audit line: "+token+"\n");for(const tool of r.tools||["claude","codex"])rows.push([tool,r.id,token,(r.native||[]).includes(tool)?"native":"inline",r.path].join("\t"))});
 fs.writeFileSync(out,rows.join("\n")+"\n");
 ' "$PROJECT" "$CANARIES" || fail "the declared list does not cover every tracked instruction file"
 unset FM_PROJECT_RULES_FIXTURE
+if [ -n "${FM_PROJECT_RULES_ACCEPT_AFTER_CANARY:-}" ]; then
+  (cd "$PROJECT" && sh -c "$FM_PROJECT_RULES_ACCEPT_AFTER_CANARY") > "$TMP/after-canary.log" 2>&1 || fail "the project's regenerate command failed after the canaries were added: $(tail -3 "$TMP/after-canary.log" | tr '\n' ' ')"
+fi
 commit_all "$PROJECT" "context audit canaries (throwaway copy only)"
 fm_git_add_origin "$PROJECT" "$PROJECT.origin.git" 2>/dev/null || true
 AREA_RULE=$(awk -F'\t' '$1=="claude" && $4=="inline" && $5 ~ /\/CLAUDE\.md$/ {print $5; exit}' "$CANARIES")
@@ -204,11 +217,22 @@ wait_status() {  # <line> <seconds>
   fail "$TOOL $VERSION: the worker never reported '$1' (pane: $(lab pane read "$PANE" --source recent --lines 30 2>/dev/null | tail -12 | tr '\n' ' '))"
 }
 
+# probe_lines <tool>: the first two significant lines of the no-canary rule a
+# child is asked about, tab-separated; empty when none is named.
+probe_lines() {
+  local var file
+  var="FM_PROJECT_RULES_ACCEPT_CHILD_PROBE_$(printf '%s' "$1" | tr '[:lower:]' '[:upper:]')"; file=${!var:-}
+  [ -n "$file" ] || return 0
+  node -e 'const l=require("fs").readFileSync(process.argv[1],"utf8").split("\n").map(x=>x.trim()).filter(x=>x.length>30&&!x.startsWith("<!--")&&!x.startsWith("#")&&!/[\x27"`]/.test(x));if(l.length>1)process.stdout.write(l[0]+"\t"+l[1])' "$PROJECT/$file"
+}
 children_task() {
+  local probe first=
+  probe=$(probe_lines "$TOOL"); first=${probe%%$'\t'*}
+  [ -z "$first" ] || first=" Then quote the one line that directly follows this line in your own context, or say NOT-PRESENT: $first"
   if [ "$TOOL" = claude ]; then
-    printf '%s' "Then try to launch one Explore child agent with the task 'say hi' and append one line beginning EXPLORE: saying whether it was allowed or refused. Then launch one general-purpose child agent with exactly this task and nothing added: 'Before using any tool, list every token of the form FMQ-<LETTERS>-<digits> literally visible in your own context, one per line, or NONE. Then read only the first 3 lines of ${AREA_FILE:-README.md} and list every such token visible now.' and append its reply verbatim under a heading '## CHILD \$STAGE'."
+    printf '%s' "Then try to launch one Explore child agent with the task 'say hi' and append one line beginning EXPLORE: saying whether it was allowed or refused. Then launch one general-purpose child agent with exactly this task and nothing added: 'Before using any tool, list every token of the form FMQ-<LETTERS>-<digits> literally visible in your own context, one per line, or NONE. Then read only the first 3 lines of ${AREA_FILE:-README.md} and list every such token visible now.$first' and append its reply verbatim under a heading '## CHILD \$STAGE'."
   else
-    printf '%s' "Then spawn one sub-agent with exactly this task and nothing added: 'Before using any tool, list every token of the form FMQ-<LETTERS>-<digits> literally visible in your own context, one per line, or NONE.' and append its reply verbatim under a heading '## CHILD \$STAGE'."
+    printf '%s' "Then spawn one sub-agent with exactly this task and nothing added: 'Before using any tool, list every token of the form FMQ-<LETTERS>-<digits> literally visible in your own context, one per line, or NONE.$first' and append its reply verbatim under a heading '## CHILD \$STAGE'."
   fi
 }
 stage_task() {  # <stage letter>
@@ -248,7 +272,7 @@ spawn_worker() {  # <tool> <run>
 
 # check_stage <letter> <generation>: the worker's report and the tool's own log must agree.
 check_stage() {
-  local stage=$1 gen=$2 section child token kind alarms
+  local stage=$1 gen=$2 section child token kind alarms probe
   local waited=0
   wait_status "working: $stage written" 600
   # A Codex compaction is steered at the turn end, so give the refresh time to land.
@@ -269,6 +293,8 @@ check_stage() {
     fi
   done < "$CANARIES"
   [ "$TOOL" != claude ] || [ -z "$AREA_FILE" ] || assert_contains "$child" "$AREA_TOKEN" "$TOOL $VERSION stage $stage: a child that touches an area must hold that area's rule"
+  probe=$(probe_lines "$TOOL")
+  [ -z "$probe" ] || assert_contains "$child" "${probe#*$'\t'}" "$TOOL $VERSION stage $stage: a child must hold a plugin rule that carries no canary"
   assert_contains "$section" "$BRIEF_TOKEN" "$TOOL $VERSION stage $stage: the worker must hold its launch brief"
   if [ -n "$TRIGGER" ]; then
     assert_equals true "$(field 'skills.some((s) => s.required && s.required.before_commands && answers[s.name] && answers[s.name].gen === compactions)')" "$TOOL $VERSION stage $stage: the skill for the triggered command must be read in this generation"
@@ -373,8 +399,14 @@ check_prepare() {
   store=${FM_PROJECT_RULES_ACCEPT_PLUGINS_DIR:-}
   if [ -z "$store" ]; then note "tampered plugin bytes: not applicable, no plugin store named"; return 0; fi
   tampered="$TMP/tampered-plugins"; rm -rf "$tampered"; cp -R "$store" "$tampered"
-  node -e 'const fs=require("fs");const R=JSON.parse(process.argv[1]);const [from,to]=process.argv.slice(2);const f=R.rules.map(r=>fs.realpathSync(r.file)).find(f=>f.startsWith(fs.realpathSync(from)));if(!f)process.exit(3);const t=f.replace(fs.realpathSync(from),to);fs.appendFileSync(t,"x")' "$("$PR" status "$STATE" "$ID")" "$store" "$tampered" \
-    || { note "tampered plugin bytes: no declared rule resolves into $store"; return 0; }
+  if [ -n "${FM_PROJECT_RULES_ACCEPT_TAMPER_FILE:-}" ]; then
+    [ -f "$tampered/$FM_PROJECT_RULES_ACCEPT_TAMPER_FILE" ] || fail "$TOOL: $FM_PROJECT_RULES_ACCEPT_TAMPER_FILE is not in the plugin store copy"
+    printf 'x' >> "$tampered/$FM_PROJECT_RULES_ACCEPT_TAMPER_FILE"
+  else
+    node -e 'const fs=require("fs");const R=JSON.parse(process.argv[1]);const [from,to]=process.argv.slice(2);const f=R.rules.map(r=>fs.realpathSync(r.file)).find(f=>f.startsWith(fs.realpathSync(from)));if(!f)process.exit(3);const t=f.replace(fs.realpathSync(from),to);fs.appendFileSync(t,"x")' "$("$PR" status "$STATE" "$ID")" "$store" "$tampered" \
+      || { note "tampered plugin bytes: no declared rule resolves into $store"; return 0; }
+  fi
+  cmp -s "$store/${FM_PROJECT_RULES_ACCEPT_TAMPER_FILE:-installed_plugins.json}" "$tampered/${FM_PROJECT_RULES_ACCEPT_TAMPER_FILE:-installed_plugins.json}" && [ -n "${FM_PROJECT_RULES_ACCEPT_TAMPER_FILE:-}" ] && fail "$TOOL: the scratch copy of the plugin store was not changed"
   CLAUDE_PLUGINS_DIR="$tampered" node -e 'const {spawnSync}=require("child_process");const L=JSON.parse(require("fs").readFileSync(process.argv[1]+"/.agents/project-rules.json","utf8"));process.exit(spawnSync(L.prepare.argv[0],L.prepare.argv.slice(1),{cwd:process.argv[1],stdio:"ignore",timeout:L.prepare.timeout_s*1000}).status??1)' "$wt" || rc=$?
   [ "$rc" -ne 0 ] || fail "$TOOL: prepare accepted a plugin store with one changed byte"
   pass "$TOOL: prepare refuses a plugin store with one changed byte"
