@@ -97,7 +97,7 @@ DEFAULT=$(default_branch) || { echo "error: cannot determine default branch for 
 
 # A task whose project declares rules lands only once nothing is owed for its
 # current generation (docs/project-rules.md).
-"$SCRIPT_DIR/fm-project-rules.sh" ready "$STATE" "$ID" || {
+[ ! -e "$STATE/$ID.project-rules" ] || "$SCRIPT_DIR/fm-project-rules.sh" ready "$STATE" "$ID" || {
   echo "error: task $ID still owes a project-rules receipt or a required skill read; refusing to merge" >&2
   exit 1
 }

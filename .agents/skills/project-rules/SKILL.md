@@ -30,6 +30,7 @@ The worker must take those from its own context, or the receipt proves nothing.
 | `worked-before-admission`, `worked-before-refresh` | A Codex worker acted before answering a stage. Steer it to run `next`, and review what it did in that window. |
 | `same-turn-calls` | Informational: note the count beside the task and review that window if the work touched an area with a required skill. |
 | `receipt-table-exhausted` | Relaunch the worker; a relaunch renders a new table. |
+| `scan-error`, `scan-failed` | The check itself could not run. Read the reason in the alarm, confirm `node` is on the watcher's PATH and the task's record is intact, and relaunch the worker if its record is unreadable. |
 | `unqualified-version` | Run `../../../tests/fm-project-rules-live-e2e.test.sh` with its opt-in variable on this machine, then relaunch workers that need children. |
 
 ## Refusals

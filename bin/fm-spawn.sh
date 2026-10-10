@@ -4117,11 +4117,14 @@ fi
 # rules gets them prepared, resolved and rendered here, on the copy's final
 # base and before any per-task wiring exists; a refusal launches nothing. A raw
 # launch command cannot carry the block, so it is admitted as an unsupported
-# tool and refused whenever the project declares rules. Exit 3 means the
-# project declares none, and nothing below changes for it.
+# tool and refused whenever the project declares rules. A copy with no declared
+# list is not admitted at all, so nothing below changes for it and it needs
+# nothing this step depends on.
 PROJECT_RULES=0
 RULES_STATE=$(mkdir -p "$STATE" && cd "$STATE" && pwd -P)
-if [ "$KIND" != secondmate ]; then
+if [ "$KIND" != secondmate ] && [ ! -e "$WT/.agents/project-rules.json" ]; then
+  rm -rf -- "$RULES_STATE/$ID.project-rules" "$RULES_STATE/$ID.project-rules.d"
+elif [ "$KIND" != secondmate ]; then
   rules_tool=$HARNESS
   [ "$RAW_LAUNCH" -eq 0 ] || rules_tool=rawcommand
   rules_rc=0

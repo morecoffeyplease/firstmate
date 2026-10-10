@@ -5,6 +5,7 @@ Firstmate then delivers them to every Claude and Codex worker it launches in tha
 `bin/fm-project-rules.sh` implements this, and its `--help` owns the command syntax.
 
 A project that declares nothing is untouched: no block, no gate, no record, and no alarm.
+That is decided in shell before anything else runs, so such a project never depends on `node`.
 
 ## Why it exists
 
@@ -61,7 +62,8 @@ Admission runs `prepare`, then each `resolve`, in the copy with stdin closed, a 
 
 The launch is refused, and no agent starts, when:
 
-- the prepare step fails, times out, or leaves the copy with uncommitted changes;
+- the prepare step fails or times out;
+- the prepare step or any resolve command changes the copy's working tree, compared with how it was before they ran, so a relaunch of a copy holding the worker's own uncommitted work is still admitted;
 - a declared file is missing or is not a readable regular file;
 - an inlined file contains an `@path` import line, which a verbatim copy cannot expand;
 - the rendered block is larger than 79,000 bytes;
@@ -125,6 +127,7 @@ A read is recorded for the current compaction generation and lapses at the next 
 
 Claude runs Firstmate's `SessionStart` hook, which opens the next stage and tells the worker to run `next`.
 While a stage is open, Claude's `PreToolUse` hook refuses every tool except the helper's own commands and file reads.
+Any failure inside that hook, such as a locked or unreadable record or a missing `node`, also refuses the call, because Claude treats only exit 2 as a refusal.
 
 Codex has no hooks, so nothing can refuse a tool call.
 A compaction is detected from the `compacted` record in the session log, at each turn end and on the watcher's cadence.
@@ -137,7 +140,7 @@ A project call in a later turn, before the stage is answered, is reported as a v
 A child agent does not receive the block.
 A Claude general-purpose child loads the same native files as its parent, so anything a child must hold has to be declared `native` for Claude.
 Every other Claude child type is refused until the live guard qualifies it for the installed version.
-A command that triggers a required skill is refused inside a Claude child and must run in the worker itself.
+A command or an edit that triggers a required skill is refused inside a Claude child and must be done by the worker itself, because a child never inherits the worker's read.
 A Codex child receives the block and the root `AGENTS.md`.
 A child's own compaction is not measured.
 
@@ -151,7 +154,8 @@ A child's own compaction is not measured.
 | `no-delivery-evidence` | the tool's own log does not hold the block for a generation |
 | `native-missing` | a file declared native is not in what the tool recorded as loaded |
 | `witness-mismatch` | the two compaction signals for the tool disagree |
-| `rules-changed` | a declared file changed on disk after the session was given it |
+| `rules-changed` | the declaration, a rule file, or a skill body or reference changed on disk after the session was given it; a changed skill also loses its recorded read |
+| `scan-error`, `scan-failed` | the tool's own log, or the task's record, could not be read |
 | `trigger-skipped` | Codex ran a triggering command without the required skill |
 | `worked-before-admission`, `worked-before-refresh` | Codex made a project call before a stage was answered |
 | `same-turn-calls` | the count of calls between a compaction inside a turn and its refresh |
@@ -162,7 +166,14 @@ The two compaction signals are the hook and the transcript's `compact_boundary` 
 
 ## Readiness
 
-`bin/fm-pr-check.sh` and `bin/fm-merge-local.sh` refuse while the task has an open stage, a command that ran without its required skill and has not been followed by reading it, or changed files under a required skill's paths with that skill never read.
+`bin/fm-pr-check.sh` and `bin/fm-merge-local.sh` refuse while any of these holds for the task:
+
+- a stage is open;
+- the tool's own log does not show the block, or a file declared native, for the current generation;
+- a declared source changed on disk, or the last log read failed;
+- a violation has been recorded but has not yet reached the supervisor as an alarm;
+- a command ran without its required skill and the skill has not been read since;
+- the work changed files under a required skill's paths and that skill was never read.
 
 ## Qualification (`config/project-rules-qualified`)
 

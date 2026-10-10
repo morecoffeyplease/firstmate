@@ -980,6 +980,10 @@ test_claude_secondmate_launch_omits_task_control_channel_authority() {
   read_case_record "$rec"
   sm="$CASE_DIR/secondmate-home"
   make_seeded_secondmate_home "$sm" "$id"
+  # A secondmate is a supervisor, not a worker, so a declared rules list in its
+  # home is never admitted; an unparsable one would refuse a worker launch.
+  mkdir -p "$sm/.agents"
+  printf '{' > "$sm/.agents/project-rules.json"
 
   out=$(FM_TEST_CLAUDE_CONFIG_DIR="$CASE_DIR/claude-work" \
     run_spawn "$HOME_DIR" "$WT_DIR" "$FAKEBIN_DIR" "$LAUNCH_LOG" "$id" "$sm" --secondmate)
@@ -988,6 +992,7 @@ test_claude_secondmate_launch_omits_task_control_channel_authority() {
   launch=$(cat "$LAUNCH_LOG")
   assert_not_contains "$launch" "--append-system-prompt" \
     "persistent secondmate launch received a task-worker control-channel statement"
+  assert_absent "$HOME_DIR/state/$id.project-rules" "a secondmate launch must not be admitted for project rules"
   pass "a persistent claude secondmate keeps its supervisor contract without a task-worker authority overlay"
 }
 

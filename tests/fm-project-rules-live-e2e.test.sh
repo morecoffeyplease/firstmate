@@ -24,10 +24,19 @@
 #   FM_PROJECT_RULES_ACCEPT_TRIGGER=<cmd>  a safe command matching one of that
 #     project's before_commands patterns
 #   FM_PROJECT_RULES_LIVE_TOOLS="claude codex"   FM_PROJECT_RULES_LIVE_RUNS=2
+#   FM_PROJECT_RULES_LIVE_LEGS=forced|automatic   run one leg while iterating; a
+#     run with a leg left out reports it as unknown and qualifies nothing
 #   FM_PROJECT_RULES_LIVE_CLAUDE_ARGS / FM_PROJECT_RULES_LIVE_CODEX_ARGS   extra
 #     fm-spawn arguments, for example "--model gpt-6.1-sol --effort medium"
-#   FM_PROJECT_RULES_QUALIFY_CONFIG=<dir>  on a full pass, write the qualified
-#     tool, version, backend and child rows to <dir>/project-rules-qualified
+#   FM_PROJECT_RULES_ACCEPT_PLUGIN_RULE_DIRS / FM_PROJECT_RULES_ACCEPT_SKILL_DIRS
+#     colon-separated folders of the pinned plugin rules and skills, checked
+#     against the declared list independently of it
+#   FM_PROJECT_RULES_ACCEPT_PLUGINS_DIR=<dir>  the plugin store prepare reads; a
+#     copy with one changed byte must make prepare refuse
+#   FM_PROJECT_RULES_ACCEPT_PAYLOAD_CLAUDE / _CODEX  the payload bytes the
+#     project's own budget check reports, compared with Firstmate's number
+#   FM_PROJECT_RULES_QUALIFY_CONFIG=<dir>  on a full pass, merge the qualified
+#     tool, version, backend and child rows into <dir>/project-rules-qualified
 # shellcheck disable=SC2016 # Fixture text and node one-liners are literal on purpose.
 set -u
 
@@ -130,6 +139,8 @@ if [ -n "${FM_PROJECT_RULES_ACCEPT_REPO:-}" ]; then
 else
   build_fixture "$PROJECT"
   TRIGGER='sh tools/product-test.sh'
+  FM_PROJECT_RULES_ACCEPT_PLUGIN_RULE_DIRS="$PROJECT/vendor/rules"
+  FM_PROJECT_RULES_ACCEPT_SKILL_DIRS="$PROJECT/skills"
 fi
 
 # One canary per tracked declared file, and an independent check that no
@@ -144,12 +155,16 @@ const listed=new Set(L.rules.filter(r=>r.path).map(r=>r.path));
 const missing=tracked.filter(f=>!listed.has(f));
 if(missing.length){console.error("left off the declared list: "+missing.join(", "));process.exit(1)}
 const rows=[];
-L.rules.filter(r=>r.path).forEach((r,i)=>{const token="FMQ-"+r.id.replace(/[^a-z]/g,"").toUpperCase()+"-"+(1000+i*37);fs.appendFileSync(path.join(repo,r.path),"\nContext audit line: "+token+"\n");for(const tool of r.tools||["claude","codex"])rows.push([tool,r.id,token,(r.native||[]).includes(tool)?"native":"inline"].join("\t"))});
+L.rules.filter(r=>r.path).forEach((r,i)=>{const token="FMQ-"+r.id.replace(/[^a-z]/g,"").toUpperCase()+"-"+(1000+i*37);fs.appendFileSync(path.join(repo,r.path),"\nContext audit line: "+token+"\n");for(const tool of r.tools||["claude","codex"])rows.push([tool,r.id,token,(r.native||[]).includes(tool)?"native":"inline",r.path].join("\t"))});
 fs.writeFileSync(out,rows.join("\n")+"\n");
 ' "$PROJECT" "$CANARIES" || fail "the declared list does not cover every tracked instruction file"
 commit_all "$PROJECT" "context audit canaries (throwaway copy only)"
 fm_git_add_origin "$PROJECT" "$PROJECT.origin.git" 2>/dev/null || true
-note "project under test: ${FM_PROJECT_RULES_ACCEPT_REPO:-built-in fixture}, $(wc -l < "$CANARIES" | tr -d ' ') tool-file canaries"
+AREA_RULE=$(awk -F'\t' '$1=="claude" && $4=="inline" && $5 ~ /\/CLAUDE\.md$/ {print $5; exit}' "$CANARIES")
+AREA_TOKEN=$(awk -F'\t' -v p="$AREA_RULE" '$1=="claude" && $5==p {print $3; exit}' "$CANARIES")
+AREA_FILE=
+[ -z "$AREA_RULE" ] || AREA_FILE=$(git -C "$PROJECT" ls-files "$(dirname "$AREA_RULE")" | grep -v 'CLAUDE\.md$' | head -1)
+note "project under test: ${FM_PROJECT_RULES_ACCEPT_REPO:-built-in fixture}, $(wc -l < "$CANARIES" | tr -d ' ') tool-file canaries, child area file ${AREA_FILE:-none}"
 
 # ---- driving one worker --------------------------------------------------
 
@@ -174,7 +189,7 @@ wait_status() {  # <line> <seconds>
 
 children_task() {
   if [ "$TOOL" = claude ]; then
-    printf '%s' "Then try to launch one Explore child agent with the task 'say hi' and append one line beginning EXPLORE: saying whether it was allowed or refused. Then launch one general-purpose child agent with exactly this task and nothing added: 'Before using any tool, list every token of the form FMQ-<LETTERS>-<digits> literally visible in your own context, one per line, or NONE.' and append its reply verbatim under a heading '## CHILD \$STAGE'."
+    printf '%s' "Then try to launch one Explore child agent with the task 'say hi' and append one line beginning EXPLORE: saying whether it was allowed or refused. Then launch one general-purpose child agent with exactly this task and nothing added: 'Before using any tool, list every token of the form FMQ-<LETTERS>-<digits> literally visible in your own context, one per line, or NONE. Then read only the first 3 lines of ${AREA_FILE:-README.md} and list every such token visible now.' and append its reply verbatim under a heading '## CHILD \$STAGE'."
   else
     printf '%s' "Then spawn one sub-agent with exactly this task and nothing added: 'Before using any tool, list every token of the form FMQ-<LETTERS>-<digits> literally visible in your own context, one per line, or NONE.' and append its reply verbatim under a heading '## CHILD \$STAGE'."
   fi
@@ -219,16 +234,18 @@ check_stage() {
   child=$(awk -v h="## CHILD $stage" '$0==h{p=1;next} /^## /{p=0} p' "$REPORT")
   assert_equals "$gen" "$(field compactions)" "$TOOL $VERSION stage $stage: compactions recorded"
   assert_not_equals null "$(field stage.closed)" "$TOOL $VERSION stage $stage: the stage must be answered"
-  while IFS=$'\t' read -r tool _ token kind; do
+  while IFS=$'\t' read -r tool _ token kind _; do
     [ "$tool" = "$TOOL" ] || continue
     assert_contains "$section" "$token" "$TOOL $VERSION stage $stage: the worker must report the $kind canary $token"
     if [ "$kind" = native ] || [ "$TOOL" = codex ]; then
       assert_contains "$child" "$token" "$TOOL $VERSION stage $stage: a child must hold the $kind canary $token"
     fi
   done < "$CANARIES"
+  [ "$TOOL" != claude ] || [ -z "$AREA_FILE" ] || assert_contains "$child" "$AREA_TOKEN" "$TOOL $VERSION stage $stage: a child that touches an area must hold that area's rule"
   assert_contains "$section" "$BRIEF_TOKEN" "$TOOL $VERSION stage $stage: the worker must hold its launch brief"
   if [ -n "$TRIGGER" ]; then
-    assert_equals true "$(field 'skills.some((s) => s.required && s.required.before_commands && answers[s.name])')" "$TOOL $VERSION stage $stage: the skill for the triggered command must have been read"
+    assert_equals true "$(field 'skills.some((s) => s.required && s.required.before_commands && answers[s.name] && answers[s.name].gen === compactions)')" "$TOOL $VERSION stage $stage: the skill for the triggered command must be read in this generation"
+    assert_equals true "$(field 'Object.values(triggered).some((n) => n > 0)')" "$TOOL $VERSION stage $stage: the triggering command must be recognized in the tool's real hook or log format"
   fi
   [ "$TOOL" != claude ] || assert_contains "$(grep '^EXPLORE:' "$REPORT" | tail -1)" "refused" "$TOOL $VERSION stage $stage: an Explore child must be refused"
   "$PR" ready "$STATE" "$ID" || fail "$TOOL $VERSION stage $stage: readiness must pass once the stage is answered"
@@ -245,7 +262,11 @@ check_stage() {
 # admission, adds only that limit, and runs it in the lab. The worker reads
 # filler files until the tool compacts by itself.
 FILLER="$TMP/filler"; mkdir -p "$FILLER"
-for n in 01 02 03 04 05 06 07 08 09 10 11 12 13 14 15 16; do
+# The limits leave room to read the brief and skills again after the
+# compaction; a limit close to the session's starting size makes each refresh
+# trigger the next compaction.
+if [ -n "${FM_PROJECT_RULES_ACCEPT_REPO:-}" ]; then CODEX_AUTO_LIMIT=100000; else CODEX_AUTO_LIMIT=70000; fi
+for n in $(seq -w 1 40); do
   for i in $(seq 1 110); do printf 'Filler %s line %s: nothing here matters to the audit, keep reading.\n' "$n" "$i"; done > "$FILLER/$n.txt"
 done
 replay_worker() {  # <tool>
@@ -270,9 +291,9 @@ replay_worker() {  # <tool>
   launch=$(grep -E "(^| )$1 " "$log" | tail -1)
   [ -n "$launch" ] || fail "$1: no launch command was captured"
   if [ "$1" = codex ]; then
-    launch=${launch/codex /codex -c model_auto_compact_token_limit=${FM_PROJECT_RULES_LIVE_CODEX_AUTO_LIMIT:-30000} }
+    launch=${launch/codex /codex -c model_auto_compact_token_limit=${FM_PROJECT_RULES_LIVE_CODEX_AUTO_LIMIT:-$CODEX_AUTO_LIMIT} }
   else
-    launch="CLAUDE_CODE_AUTO_COMPACT_WINDOW=${FM_PROJECT_RULES_LIVE_CLAUDE_AUTO_WINDOW:-100000} $launch"
+    launch="CLAUDE_CODE_AUTO_COMPACT_WINDOW=${FM_PROJECT_RULES_LIVE_CLAUDE_AUTO_WINDOW:-160000} $launch"
   fi
   script="$TMP/$ID.launch.sh"
   printf '#!/usr/bin/env bash\ncd %q && export FM_TASK_ID=%q && %s\n' "$wt" "$ID" "$launch" > "$script"; chmod +x "$script"
@@ -281,20 +302,82 @@ replay_worker() {  # <tool>
   VERSION=$(field version)
 }
 
+# ---- checks that do not depend on a worker ---------------------------------
+
+# The declared list is compared with the pinned rules and skills themselves.
+check_independent_coverage() {
+  node -e '
+const fs=require("fs"),path=require("path"),crypto=require("crypto");
+const [record,ruleDirs,skillDirs]=process.argv.slice(1);
+const R=JSON.parse(record);const sha=(f)=>crypto.createHash("sha256").update(fs.readFileSync(f)).digest("hex");
+const have=new Set(R.rules.map(r=>r.sha));const names=new Set(R.skills.map(s=>s.name.split(":").pop()));const missing=[];
+for(const dir of ruleDirs.split(":").filter(Boolean))for(const f of fs.readdirSync(dir).filter(f=>f.endsWith(".md")))if(!have.has(sha(path.join(dir,f))))missing.push("rule "+f);
+for(const dir of skillDirs.split(":").filter(Boolean))for(const d of fs.readdirSync(dir)){const f=path.join(dir,d,"SKILL.md");if(!fs.existsSync(f))continue;const t=fs.readFileSync(f,"utf8");if(/^disable-model-invocation:\s*true/m.test(t))continue;const n=(t.match(/^name:\s*["\x27]?([^"\x27\n]+)/m)||[,d])[1].trim();if(!names.has(n)&&!names.has(d))missing.push("skill "+n)}
+if(missing.length){console.error(missing.join(", "));process.exit(1)}' "$("$PR" status "$STATE" "$ID")" "${FM_PROJECT_RULES_ACCEPT_PLUGIN_RULE_DIRS:-}" "${FM_PROJECT_RULES_ACCEPT_SKILL_DIRS:-}" \
+    || fail "$TOOL: the declared list leaves out pinned rules or model-invocable skills"
+  pass "$TOOL: every pinned plugin rule and model-invocable skill is in the declared list"
+}
+
+# Prepare must be a no-op the second time and must refuse a changed plugin byte.
+check_prepare() {
+  local wt before store tampered rc=0
+  wt=$(sed -n 's/^worktree=//p' "$STATE/$ID.meta")
+  before=$(git -C "$wt" status --porcelain)
+  node -e 'const {spawnSync}=require("child_process");const L=JSON.parse(require("fs").readFileSync(process.argv[1]+"/.agents/project-rules.json","utf8"));if(!L.prepare)process.exit(0);process.exit(spawnSync(L.prepare.argv[0],L.prepare.argv.slice(1),{cwd:process.argv[1],stdio:"ignore",timeout:L.prepare.timeout_s*1000}).status??1)' "$wt" \
+    || fail "$TOOL: the project prepare step failed when run a second time"
+  assert_equals "$before" "$(git -C "$wt" status --porcelain)" "$TOOL: a second prepare run must change nothing in the copy"
+  pass "$TOOL: prepare is clean and idempotent on a rerun"
+  store=${FM_PROJECT_RULES_ACCEPT_PLUGINS_DIR:-}
+  if [ -z "$store" ]; then note "tampered plugin bytes: not applicable, no plugin store named"; return 0; fi
+  tampered="$TMP/tampered-plugins"; rm -rf "$tampered"; cp -R "$store" "$tampered"
+  node -e 'const fs=require("fs");const R=JSON.parse(process.argv[1]);const [from,to]=process.argv.slice(2);const f=R.rules.map(r=>fs.realpathSync(r.file)).find(f=>f.startsWith(fs.realpathSync(from)));if(!f)process.exit(3);const t=f.replace(fs.realpathSync(from),to);fs.appendFileSync(t,"x")' "$("$PR" status "$STATE" "$ID")" "$store" "$tampered" \
+    || { note "tampered plugin bytes: no declared rule resolves into $store"; return 0; }
+  CLAUDE_PLUGINS_DIR="$tampered" node -e 'const {spawnSync}=require("child_process");const L=JSON.parse(require("fs").readFileSync(process.argv[1]+"/.agents/project-rules.json","utf8"));process.exit(spawnSync(L.prepare.argv[0],L.prepare.argv.slice(1),{cwd:process.argv[1],stdio:"ignore",timeout:L.prepare.timeout_s*1000}).status??1)' "$wt" || rc=$?
+  [ "$rc" -ne 0 ] || fail "$TOOL: prepare accepted a plugin store with one changed byte"
+  pass "$TOOL: prepare refuses a plugin store with one changed byte"
+}
+
+check_sizes() {
+  local out want var
+  out=$("$PR" size "$(sed -n 's/^worktree=//p' "$STATE/$ID.meta")" "$TOOL") || fail "$TOOL: size could not be computed"
+  note "$TOOL size: $out"
+  var="FM_PROJECT_RULES_ACCEPT_PAYLOAD_$(printf '%s' "$TOOL" | tr '[:lower:]' '[:upper:]')"; want=${!var:-}
+  [ -z "$want" ] || assert_contains "$out" "payload_bytes=$want " "$TOOL: the project's own budget check and Firstmate must agree on payload bytes"
+}
+
+# A copy whose prepare step fails must launch nothing.
+check_refused_launch() {
+  local broken="$TMP/broken-$1" fakebin log="$TMP/broken-$1.launch" rc=0
+  git clone --quiet --local "$PROJECT" "$broken"
+  node -e 'const fs=require("fs");const f=process.argv[1]+"/.agents/project-rules.json";const L=JSON.parse(fs.readFileSync(f,"utf8"));L.prepare={argv:["sh","-c","exit 9"],timeout_s:5};fs.writeFileSync(f,JSON.stringify(L))' "$broken"
+  commit_all "$broken" "broken prepare"; git -C "$broken" remote remove origin; fm_git_add_origin "$broken" "$broken.origin.git"
+  git -C "$broken" worktree add --quiet -b "broken-$1" "$broken.wt"
+  fakebin=$(fm_test_make_spawn_fakebin "$TMP/broken-$1.fake"); fm_test_spawn_home "$TMP/broken-$1.home" "$1"; fm_test_spawn_brief "$TMP/broken-$1.home" "broken-$1"; : > "$log"
+  FM_FAKE_LAUNCH_LOG="$log" FM_PROJECT_RULES_QUALIFYING=1 fm_test_run_spawn "$TMP/broken-$1.home" "$broken.wt" "$fakebin" "broken-$1" "$broken" --scout >/dev/null 2>&1 || rc=$?
+  [ "$rc" -ne 0 ] && [ ! -s "$log" ] || fail "$1: a copy whose prepare step fails must launch nothing"
+  pass "$1: a copy whose prepare step fails launches nothing"
+}
+
 RESULT="$TMP/result.tsv"; : > "$RESULT"
 for TOOL_NAME in $TOOLS; do
   command -v "$TOOL_NAME" >/dev/null 2>&1 || fail "$TOOL_NAME is not installed, so it cannot be qualified"
   run=1
+  [ "${FM_PROJECT_RULES_LIVE_LEGS:-forced automatic}" != automatic ] || run=$((RUNS + 1))
   while [ "$run" -le "$RUNS" ]; do
     spawn_worker "$TOOL_NAME" "$run"
     check_stage A 0
+    if [ "$run" -eq 1 ]; then check_independent_coverage; check_prepare; check_sizes; check_refused_launch "$TOOL_NAME"; fi
     say "/compact"; sleep 45
     say "$(stage_task B)"
     check_stage B 1
     say "$([ "$TOOL" = claude ] && printf /exit || printf /quit)"
     run=$((run + 1))
   done
-  printf '%s\t%s\tforced\tpass\n' "$TOOL" "$VERSION" >> "$RESULT"
+  [ "$run" -gt "$((RUNS + 1))" ] || [ "${FM_PROJECT_RULES_LIVE_LEGS:-forced automatic}" = automatic ] || printf '%s\t%s\tforced\tpass\n' "$TOOL" "$VERSION" >> "$RESULT"
+  if [ "${FM_PROJECT_RULES_LIVE_LEGS:-forced automatic}" = forced ]; then
+    printf '%s\t%s\tautomatic\tunknown\n' "$TOOL" "$VERSION" >> "$RESULT"
+    continue
+  fi
   replay_worker "$TOOL_NAME"
   wait_status "working: C written" 900
   "$PR" detect "$STATE" "$ID" >/dev/null 2>&1 || true
@@ -317,10 +400,14 @@ if grep -q "$(printf '\tunknown$')" "$RESULT"; then
   fail "at least one leg is unknown, so this run qualifies nothing"
 fi
 if [ -n "${FM_PROJECT_RULES_QUALIFY_CONFIG:-}" ]; then
-  while IFS=$'\t' read -r tool version _ _; do
-    printf 'tool %s %s herdr\n' "$tool" "$version"
-    [ "$tool" != claude ] || printf 'child claude %s general-purpose\n' "$version"
-  done < "$RESULT" | sort -u > "$FM_PROJECT_RULES_QUALIFY_CONFIG/project-rules-qualified"
-  note "wrote $FM_PROJECT_RULES_QUALIFY_CONFIG/project-rules-qualified"
+  QUALIFIED="$FM_PROJECT_RULES_QUALIFY_CONFIG/project-rules-qualified"
+  {
+    cat "$QUALIFIED" 2>/dev/null || true
+    while IFS=$'\t' read -r tool version _ _; do
+      printf 'tool %s %s herdr\n' "$tool" "$version"
+      [ "$tool" != claude ] || printf 'child claude %s general-purpose\n' "$version"
+    done < "$RESULT"
+  } | sort -u > "$QUALIFIED.new" && mv "$QUALIFIED.new" "$QUALIFIED"
+  note "merged this run's rows into $QUALIFIED"
 fi
 echo "# all fm-project-rules-live-e2e legs passed"

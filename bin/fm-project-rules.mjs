@@ -21,7 +21,10 @@ const HELPER = process.env.FM_PROJECT_RULES_HELPER || "";
 const HELPERS = ["fm-project-rules.sh", "fm-task-heartbeat.sh", "fm-captain-hold.sh"].map((name) => path.join(path.dirname(HELPER), name));
 const HELPER_ENV = ["FM_HOME", "FM_ROOT_OVERRIDE", "FM_STATE_OVERRIDE"];
 
-const die = (message, code = 1) => {
+// Claude treats only exit 2 from a tool hook as a refusal, so every failure
+// inside that hook, including a locked or corrupt record, must exit 2.
+let failCode = 1;
+const die = (message, code = failCode) => {
   process.stderr.write(`fm-project-rules: ${message}\n`);
   process.exit(code);
 };
@@ -287,7 +290,8 @@ function renderBlock(R, resolved, table) {
     "",
     `- Before your first project command or edit, and again right after any context compaction, run: ${helperCommand(R, "next")}`,
     "  Do what it prints before anything else.",
-    "- Load a required skill only through that helper; it says when one is required.",
+    `- Your launch brief can be read again at any time with: ${helperCommand(R, "serve", "brief")}`,
+    "- Load a required skill only through its command below, at the moment named.",
     "- A child agent does not receive this block. Use only general-purpose children, and run required-skill commands such as product tests yourself, not in a child.",
   ];
   for (const rule of resolved.rules.filter((entry) => !entry.native)) {
@@ -339,7 +343,7 @@ function toolVersion(tool) {
 
 // ---- admission -----------------------------------------------------------
 
-function refuseCodexConfig(copy, resolved) {
+function refuseCodexConfig(copy) {
   const home = process.env.CODEX_HOME || path.join(process.env.HOME ?? "", ".codex");
   let limit = 32768;
   for (const file of [path.join(home, "config.toml"), path.join(copy, ".codex", "config.toml")]) {
@@ -352,8 +356,6 @@ function refuseCodexConfig(copy, resolved) {
   const chain = ["AGENTS.override.md", "AGENTS.md"].map((name) => path.join(copy, name)).find((file) => fs.existsSync(file));
   const bytes = chain ? fs.statSync(chain).size : 0;
   if (bytes > limit) die(`${chain} is ${bytes} bytes, over Codex's ${limit}-byte project instruction limit; Codex would truncate it silently`);
-  const agents = resolved.rules.find((rule) => rule.native && rule.file === chain);
-  return agents ? agents.id : null;
 }
 
 function admit(args) {
@@ -374,17 +376,27 @@ function admit(args) {
   }
   const qualifying = Boolean(process.env.FM_PROJECT_RULES_QUALIFYING);
   const versionQualified = qualifying || rows.some((row) => row[0] === "tool" && row[1] === tool && row[2] === version && row[3] === backend);
+  // A relaunch admits a copy that holds the worker's own uncommitted work, so
+  // only a change these commands themselves make is refused.
+  const porcelain = () => spawnSync("git", ["-C", copy, "status", "--porcelain", "--untracked-files=all"], { encoding: "utf8" }).stdout.split("\n").filter(Boolean);
+  const before = new Set(porcelain());
   if (L.prepare) {
     const result = runIn(copy, L.prepare.argv, L.prepare.timeout_s);
     if (result.status !== 0) {
       die(`project prepare step failed (exit ${result.status ?? "timeout"}): ${String(result.stderr || result.stdout || "").trim().slice(-600)}`);
     }
-    const dirty = spawnSync("git", ["-C", copy, "status", "--porcelain"], { encoding: "utf8" }).stdout.trim();
-    if (dirty) die(`project prepare step left the copy with uncommitted changes:\n${dirty.split("\n").slice(0, 10).join("\n")}`);
   }
   const resolved = resolveList(copy, L, tool);
+  const dirty = porcelain().filter((line) => !before.has(line));
+  if (dirty.length) die(`the project's prepare or resolve commands left the copy with uncommitted changes:\n${dirty.slice(0, 10).join("\n")}`);
   const R = { v: 1, task: id, state, copy, tool, version, backend, version_qualified: versionQualified };
-  if (tool === "codex") refuseCodexConfig(copy, resolved);
+  if (tool === "codex") refuseCodexConfig(copy);
+  let prior = null;
+  try {
+    prior = JSON.parse(fs.readFileSync(recordPath(state, id), "utf8"));
+  } catch {
+    prior = null;
+  }
   const table = newTable();
   const block = renderBlock(R, resolved, table);
   const bytes = Buffer.byteLength(block);
@@ -397,9 +409,11 @@ function admit(args) {
   fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
   fs.writeFileSync(path.join(dir, "block.txt"), block, { mode: 0o600 });
   Object.assign(R, {
-    gen: option("--gen") || crypto.randomUUID(),
     brief: option("--brief"),
-    head: spawnSync("git", ["-C", copy, "rev-parse", "HEAD"], { encoding: "utf8" }).stdout.trim(),
+    // A relaunch keeps the first admission's base, so work committed before it is still checked at readiness.
+    head: prior?.copy === copy && prior.head ? prior.head : spawnSync("git", ["-C", copy, "rev-parse", "HEAD"], { encoding: "utf8" }).stdout.trim(),
+    dispatched: L.dispatched_child_types ?? [],
+    list_sha: sha(fs.readFileSync(path.join(copy, ".agents", "project-rules.json"))),
     block_sha: sha(block),
     block_bytes: bytes,
     payload_bytes: payloadBytes(resolved),
@@ -417,6 +431,8 @@ function admit(args) {
     compactions: 0,
     answers: {},
     violations: [],
+    triggered: {},
+    drift: [],
     same_turn_calls: 0,
     alarms: {},
     log: { offset: 0, compactions: 0, events: 0, evidence: {}, native: {}, turn: 0 },
@@ -474,7 +490,7 @@ function next([state, id]) {
     }
     process.stdout.write("Project rules: nothing is owed right now.\n");
     for (const skill of R.skills.filter((entry) => entry.required && !entry.required.at && !answered(R, entry.name))) {
-      const when = skill.required.before_commands ? "running its trigger commands" : `editing ${skill.required.on_paths.join(", ")}`;
+      const when = skill.required.before_commands ? `running any command matching ${skill.required.before_commands.join(" or ")}` : `editing any path matching ${skill.required.on_paths.join(", ")}`;
       process.stdout.write(`Before ${when}, load ${skill.name}: ${helperCommand(R, "serve", q(skill.name))}\n`);
     }
   });
@@ -560,6 +576,7 @@ function hook([state, id, event]) {
     });
     return;
   }
+  failCode = 2;
   const deny = (message) => {
     process.stderr.write(`${message}\n`);
     process.exit(2);
@@ -577,7 +594,8 @@ function hook([state, id, event]) {
       const type = input.subagent_type || "general-purpose";
       if (!R.children.includes(type)) {
         const allowed = R.children.length ? `Use one of: ${R.children.join(", ")}.` : "No child type is qualified for this tool version, so do the work yourself.";
-        return `Child agent type ${type} has not been shown to load this project's rules, so it is refused. ${allowed}`;
+        const asked = R.dispatched.includes(type) ? " This project's skills do dispatch it, so tell your supervisor it needs qualifying." : "";
+        return `Child agent type ${type} has not been shown to load this project's rules, so it is refused. ${allowed}${asked}`;
       }
     }
     for (const skill of R.skills.filter((entry) => entry.required && !entry.required.at)) {
@@ -586,7 +604,9 @@ function hook([state, id, event]) {
         ? Boolean(command) && !ours && commandMatches(skill.required.before_commands, command)
         : Boolean(rel) && skill.required.on_paths.some((glob) => pathPattern(glob).test(rel));
       if (!matched) continue;
-      if (payload.agent_id && skill.required.before_commands) return `This command requires skill ${skill.name}, which a child agent cannot be shown to hold. Run it from the main worker.`;
+      R.triggered[skill.name] = (R.triggered[skill.name] ?? 0) + 1;
+      // A child never inherits the worker's own read of a skill.
+      if (payload.agent_id) return `This requires skill ${skill.name}, which a child agent cannot be shown to hold. Do it from the main worker.`;
       if (!answered(R, skill.name)) return `This requires skill ${skill.name}, not yet loaded since the last compaction. Run: ${helperCommand(R, "serve", q(skill.name))}`;
     }
     return "";
@@ -657,6 +677,39 @@ function noteNative(R, text, gen, wanted) {
   }
 }
 
+// Every shell command one Codex tool call carries: JSON arguments of a function
+// call, each exec_command in a batched script, or a local shell action. A call
+// whose shape is not recognized is returned whole, so it is still inspected.
+function codexCommands(payload) {
+  const found = [];
+  const add = (value) => {
+    if (Array.isArray(value)) found.push(value.join(" "));
+    else if (typeof value === "string" && value) found.push(value);
+  };
+  let args = payload.arguments;
+  if (typeof args === "string") {
+    try {
+      args = JSON.parse(args);
+    } catch {
+      args = null;
+    }
+  }
+  for (const source of [args, payload.action]) {
+    if (source && typeof source === "object") for (const key of ["cmd", "command", "commands"]) add(source[key]);
+  }
+  for (const match of String(payload.input ?? "").matchAll(/\b(?:cmd|command)\s*:\s*("(?:[^"\\]|\\.)*"|'(?:[^'\\]|\\.)*'|`(?:[^`\\]|\\.)*`)/g)) {
+    try {
+      add(match[1].startsWith('"') ? JSON.parse(match[1]) : match[1].slice(1, -1));
+    } catch {
+      add(match[1]);
+    }
+  }
+  // A command built from a variable has no literal to read, so the whole call
+  // text is inspected as well unless every literal was one of Firstmate's own.
+  if (!found.length || !found.every(helperCall)) add(strings([payload.input, payload.arguments, payload.action]).join(" "));
+  return found;
+}
+
 function scanCodex(R, block, file) {
   for (const entry of newLines(R, file)) {
     const payload = entry.payload && typeof entry.payload === "object" ? entry.payload : {};
@@ -677,22 +730,17 @@ function scanCodex(R, block, file) {
       if (payload.role === "developer" && text.includes(block)) R.log.evidence[gen] = true;
       if (payload.role === "user" && text.startsWith("# AGENTS.md instructions")) noteNative(R, text, gen, () => true);
     } else if (entry.type === "response_item" && /_call$/.test(payload.type ?? "")) {
-      const raw = strings([payload.input, payload.arguments, payload.action]).join(" ");
-      let command = raw;
-      try {
-        command = JSON.parse(raw.match(/cmd:\s*("(?:[^"\\]|\\.)*")/)?.[1] ?? "null") ?? raw;
-      } catch {
-        command = raw;
-      }
-      if (helperCall(command)) continue;
       const at = Date.parse(entry.timestamp ?? "") || Date.now();
       const closed = Date.parse(R.closed?.[gen] ?? "") || Infinity;
+      const commands = codexCommands(payload).filter((command) => !helperCall(command));
+      if (!commands.length) continue;
       if (at < closed) {
         if (gen > 0 && R.log.turn === 0) R.same_turn_calls += 1;
         else violate(R, gen === 0 ? "worked-before-admission" : "worked-before-refresh", `stage ${gen === 0 ? "start" : `c${gen}`}`);
       }
       for (const skill of R.skills.filter((item) => item.required?.before_commands)) {
-        if (!commandMatches(skill.required.before_commands, command)) continue;
+        if (!commands.some((command) => commandMatches(skill.required.before_commands, command))) continue;
+        R.triggered[skill.name] = (R.triggered[skill.name] ?? 0) + 1;
         const answer = R.answers[skill.name];
         if (!(answer?.gen === gen && Date.parse(answer.at) <= at)) violate(R, "trigger-skipped", `${skill.name} c${gen}`);
       }
@@ -716,6 +764,22 @@ function scanClaude(R, block) {
   while (R.compactions < R.log.compactions) openStage(R, "compact");
 }
 
+// Every declared source is compared with what this session was admitted on:
+// the declaration itself, each rule file, and each skill body and reference.
+// A changed skill also loses its recorded read.
+function noteDrift(R) {
+  const same = (file, digest) => fs.existsSync(file) && sha(fs.readFileSync(file)) === digest;
+  const drift = [];
+  if (!same(path.join(R.copy, ".agents", "project-rules.json"), R.list_sha)) drift.push("declared-list");
+  for (const rule of R.rules) if (!same(rule.file, rule.sha)) drift.push(rule.id);
+  for (const skill of R.skills) {
+    if (skill.files.every((entry) => same(entry.file, entry.sha))) continue;
+    drift.push(`skill:${skill.name}`);
+    delete R.answers[skill.name];
+  }
+  R.drift = drift;
+}
+
 function scanOne(state, id, rollout, report = true) {
   const out = [];
   let steer = "";
@@ -726,9 +790,11 @@ function scanOne(state, id, rollout, report = true) {
     try {
       if (R.tool === "codex" && rollout) scanCodex(R, block, rollout);
       if (R.tool === "claude") scanClaude(R, block);
+      delete R.scan_error;
     } catch (error) {
-      out.push(`scan-error ${String(error.message).slice(0, 160)}`);
+      R.scan_error = String(error.message).slice(0, 160);
     }
+    noteDrift(R);
     // Codex has no hook to tell the worker, so the caller steers it once per
     // newly detected compaction.
     if (R.tool === "codex" && R.compactions > before) {
@@ -761,10 +827,8 @@ function scanOne(state, id, rollout, report = true) {
     if (R.log.mismatch && now() - R.log.mismatch >= GRACE_SECS) {
       alarm(`witness:${R.log.compactions}:${other}`, `witness-mismatch the log shows ${R.log.compactions} compaction(s), the ${R.tool === "codex" ? "compaction events" : "compaction hook"} ${other} (${where})`);
     }
-    for (const rule of R.rules) {
-      const data = fs.existsSync(rule.file) ? fs.readFileSync(rule.file) : null;
-      if (!data || sha(data) !== rule.sha) alarm(`changed:${rule.id}`, `rules-changed ${rule.id} differs on disk from what this session was given; relaunch needed`);
-    }
+    if (R.scan_error) alarm(`scan-error:${R.scan_error}`, `scan-error ${R.scan_error} (${where})`);
+    for (const label of R.drift) alarm(`changed:${label}`, `rules-changed ${label} differs on disk from what this session was given; relaunch needed`);
     for (const entry of R.violations) alarm(`violation:${entry.kind}:${entry.detail}`, `${entry.kind} ${entry.detail} (${where})`);
     if (R.same_turn_calls && stage.closed) alarm(`same-turn:${stage.gen}`, `same-turn-calls ${R.same_turn_calls} tool call(s) ran between a mid-turn compaction and its refresh (${where})`);
   });
@@ -778,6 +842,16 @@ function ready([state, id]) {
   const reasons = withRecord(state, id, (R) => {
     if (!R) return [];
     const open = owed(R).map((step) => `owed: ${step}`);
+    const stage = R.stage;
+    if (R.scan_error) open.push(`the last read of the tool's own log failed (${R.scan_error})`);
+    for (const label of R.drift) open.push(`${label} changed on disk after this session was given it; the task needs a relaunch`);
+    if (stage.closed && !R.log.evidence[stage.gen]) open.push("the tool's own log does not show the rules block for the current generation");
+    for (const rule of R.rules.filter((entry) => entry.native)) {
+      if (stage.closed && R.log.native[`${stage.gen}:${rule.id}`] !== true) open.push(`the tool's own log does not show ${rule.label}, which the project declares it loads by itself`);
+    }
+    for (const entry of R.violations) {
+      if (!R.alarms[`violation:${entry.kind}:${entry.detail}`]) open.push(`${entry.kind} ${entry.detail} has not reached the supervisor yet; it is reported on the next scan`);
+    }
     const changed = [
       ...spawnSync("git", ["-C", R.copy, "diff", "--name-only", R.head, "HEAD"], { encoding: "utf8" }).stdout.split("\n"),
       ...spawnSync("git", ["-C", R.copy, "status", "--porcelain", "--untracked-files=all"], { encoding: "utf8" }).stdout.split("\n").map((line) => line.slice(3)),
@@ -848,4 +922,9 @@ const verbs = {
   detect: ([state, id, rollout]) => scanOne(state, id, rollout, false),
 };
 if (!verbs[verb]) die(`unknown verb ${verb ?? ""}`);
-verbs[verb](args);
+if (verb === "hook" && args[2] !== "session-start") failCode = 2;
+try {
+  verbs[verb](args);
+} catch (error) {
+  die(`internal failure: ${error.message}`);
+}

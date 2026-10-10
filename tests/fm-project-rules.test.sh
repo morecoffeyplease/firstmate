@@ -77,6 +77,14 @@ read_all() {
 close_stage() { "$PR" ack "$STATE" t1 "$(row_code)" >/dev/null && read_all brief >/dev/null && read_all flow >/dev/null; }
 edit_list() { node -e 'const fs=require("fs");const f=process.argv[1];const L=JSON.parse(fs.readFileSync(f,"utf8"));eval(process.argv[2]);fs.writeFileSync(f,JSON.stringify(L))' "$1/.agents/project-rules.json" "$2"; git -C "$1" -c user.name=t -c user.email=t@example.invalid commit -qam edit; }
 hook() { printf '%s' "$2" | "$PR" hook "$STATE" t1 "$1"; }
+# claude_evidence [boundary]: give the task a transcript that holds the block
+# and the native file for its current generation.
+claude_evidence() {
+  local log="$STATE/t1.transcript.jsonl"
+  [ -f "$log" ] || hook session-start "{\"source\":\"startup\",\"transcript_path\":\"$log\"}" >/dev/null
+  [ -z "${1:-}" ] || claude_log "$log" '[{type:"system",subtype:"compact_boundary"}]'
+  claude_log "$log" '[{type:"attachment",attachment:{type:"instructions",files:[{path:copy+"/CLAUDE.md",content:"# Root map\n\nAlways use the gizmo.\n"}]}},{type:"attachment",attachment:{type:"prompt_snapshot",systemPrompt:["intro\n\n"+block]}}]'
+}
 
 test_no_declared_list_changes_nothing() {
   local copy="$TMP/plain" state="$TMP/plain.state" rc=0
@@ -104,6 +112,7 @@ test_admission_refusals() {
   copy=$(new_copy r-missing); edit_list "$copy" 'L.rules.push({id:"gone",path:"nope.md"})'; refused "an unreadable path" claude "not a readable regular file"
   copy=$(new_copy r-prep); edit_list "$copy" 'L.prepare={argv:["sh","-c","echo broken >&2; exit 7"],timeout_s:5}'; refused "a failed prepare step" claude "prepare step failed (exit 7)"
   copy=$(new_copy r-dirty); edit_list "$copy" 'L.prepare={argv:["sh","-c","echo x > stray.txt"],timeout_s:5}'; refused "a prepare step that dirties the copy" claude "uncommitted changes"
+  copy=$(new_copy r-resolve); printf '#!/bin/sh\necho x > stray.txt\nprintf "%%s/CLAUDE.md\\n" "$(pwd -P)"\n' > "$copy/res.sh"; git -C "$copy" add res.sh; edit_list "$copy" 'L.rules.push({id:"res",resolve:["sh","res.sh"]})'; refused "a resolve command that dirties the copy" claude "uncommitted changes"
   copy=$(new_copy r-slow); edit_list "$copy" 'L.prepare={argv:["sleep","5"],timeout_s:1}'; refused "a prepare step that times out" claude "prepare step failed (exit timeout)"
   copy=$(new_copy r-import); printf '@docs/more.md\n' >> "$copy/apps/web/CLAUDE.md"; git -C "$copy" -c user.name=t -c user.email=t@example.invalid commit -qam i; refused "an import line in an inlined file" claude "@ import line"
   copy=$(new_copy r-big); head -c 80000 /dev/zero | tr '\0' 'x' > "$copy/apps/web/CLAUDE.md"; git -C "$copy" -c user.name=t -c user.email=t@example.invalid commit -qam big; refused "an oversized block" claude "over the 79000-byte size"
@@ -120,7 +129,9 @@ test_prepare_runs_scrubbed() {
   STATE="$TMP/scrub.state"; mkdir -p "$STATE"; COPY=$(new_copy scrub.copy)
   edit_list "$COPY" 'L.prepare={argv:["sh","-c","test -z \"${FM_SECRET_PROBE:-}\" && test -n \"$HOME\""],timeout_s:5}'
   FM_SECRET_PROBE=leak "$PR" admit "$STATE" t1 "$COPY" claude --backend herdr >/dev/null || fail "prepare must run without the launcher's other variables and with HOME"
-  pass "the project prepare step runs with a reduced environment that keeps HOME"
+  edit_list "$COPY" 'L.prepare={argv:["sh","-c","test \"$CLAUDE_PLUGINS_DIR\" = /p && test \"$CLAUDE_CONFIG_DIR\" = /c"],timeout_s:5}'
+  CLAUDE_PLUGINS_DIR=/p CLAUDE_CONFIG_DIR=/c "$PR" admit "$STATE" t1 "$COPY" claude --backend herdr >/dev/null || fail "prepare must keep the two Claude store variables when the launcher has them"
+  pass "the project prepare step runs with a reduced environment that keeps HOME and the Claude store variables"
 }
 
 test_block_receipt_and_chained_reads() {
@@ -134,6 +145,7 @@ test_block_receipt_and_chained_reads() {
   assert_contains "$block" "- tests (auto; required before certain commands): How to run product tests." "the catalog must list every declared skill"
   assert_contains "$block" '- tests: before you run any command matching `(^|[;&| ])bun run test( |$)`. Load it with: ' "the block must say when a required skill is due and how to load it"
   assert_equals 64 "$(printf '%s\n' "$block" | grep -c '^row[0-9][0-9]=[A-Z2-9]\{6\}$')" "the block must end with a 64-row receipt table"
+  assert_contains "$block" "Your launch brief can be read again at any time with: " "the block must say how to read the brief again"
   out=$("$PR" next "$STATE" t1)
   assert_contains "$out" "stage start) is OPEN" "next must report the open start stage"
   assert_contains "$out" "Load required skill flow" "next must list the start skill"
@@ -147,7 +159,9 @@ test_block_receipt_and_chained_reads() {
   read_all brief >/dev/null || fail "the brief must be readable to the end"
   read_all flow >/dev/null || fail "the start skill must be readable to the end"
   assert_not_equals null "$(field stage.closed)" "the stage must close once the row, brief and start skill are done"
-  assert_contains "$("$PR" next "$STATE" t1)" "nothing is owed right now" "next must report a closed stage"
+  out=$("$PR" next "$STATE" t1)
+  assert_contains "$out" "nothing is owed right now" "next must report a closed stage"
+  assert_contains "$out" 'Before running any command matching (^|[;&| ])bun run test( |$), load tests: ' "next must name the exact trigger of a skill not yet read"
   parts=$(read_all tests) || fail "a long skill must be readable to the end"
   [ "$parts" -ge 3 ] || fail "a long skill must be served in several parts, got $parts"
   assert_equals 0 "$(field 'answers.tests.gen')" "a completed skill read is recorded for the current generation"
@@ -192,15 +206,19 @@ test_claude_hook_verdicts() {
   read_all tests >/dev/null
   allowed '{"tool_name":"Bash","tool_input":{"command":"bun run test"}}' "a triggered command must be allowed once its skill is read"
   denied '{"agent_id":"a1","tool_name":"Bash","tool_input":{"command":"bun run test"}}' "a triggered command inside a child" "main worker"
+  read_all audit >/dev/null
+  allowed "{\"tool_name\":\"Edit\",\"tool_input\":{\"file_path\":\"$COPY/apps/api/src/server/a.ts\"}}" "an edit on a triggered path must be allowed once the worker read its skill"
+  denied "{\"agent_id\":\"a1\",\"tool_name\":\"Edit\",\"tool_input\":{\"file_path\":\"$COPY/apps/api/src/server/a.ts\"}}" "an edit on a triggered path inside a child, after the worker's own read" "main worker"
+  denied '{"tool_name":"Agent","tool_input":{"subagent_type":"Explore"}}' "a child type the project dispatches but nobody qualified" "needs qualifying"
   allowed '{"tool_name":"Bash","tool_input":{"command":"bun run tests-unrelated"}}' "a command that only resembles the trigger must be allowed"
   pass "the Claude hook refuses work before admission, unqualified children, and triggered work before its skill"
 }
 
 test_compaction_reopens_and_ages_answers() {
   local first out rc=0
-  admit compact claude >/dev/null; close_stage; read_all tests >/dev/null
+  admit compact claude >/dev/null; claude_evidence; close_stage; read_all tests >/dev/null
   first=$(field stage.row)
-  out=$(hook session-start '{"source":"compact","transcript_path":"/nonexistent"}')
+  out=$(hook session-start '{"source":"compact"}')
   assert_contains "$out" "stage c1) is open" "the compaction hook must tell the worker a stage is open"
   assert_not_equals "$first" "$(field stage.row)" "a new stage must ask for a row no earlier stage used"
   out=$("$PR" next "$STATE" t1)
@@ -210,6 +228,8 @@ test_compaction_reopens_and_ages_answers() {
   close_stage
   rc=0; hook pretool '{"tool_name":"Bash","tool_input":{"command":"bun run test"}}' >/dev/null 2>&1 || rc=$?
   expect_code 2 "$rc" "a triggered command after a compaction, before the skill is read again"
+  "$PR" ready "$STATE" t1 2>/dev/null && fail "a closed stage with no block in the tool's own log must not be ready"
+  claude_evidence boundary
   "$PR" ready "$STATE" t1 || fail "a skill read before its earlier use is not owed again until its next use"
   pass "a compaction opens a new stage with a fresh row and makes earlier skill reads stale"
 }
@@ -319,11 +339,33 @@ test_codex_scan_between_turn_compaction_and_triggers() {
   codex_log '[started(),dev(block),agents()]'; close_stage
   assert_equals "" "$("$PR" scan "$STATE" t1)" "the block re-sent at the next turn start is delivery evidence"
   codex_log '[call("ls "+bin+"/fm-project-rules.sh && bun run test")]'
+  "$PR" detect "$STATE" t1
+  read_all tests >/dev/null
+  out=$("$PR" ready "$STATE" t1 2>&1) && fail "a violation the supervisor has not been told about must block readiness, even after the skill is read"
+  assert_contains "$out" "has not reached the supervisor yet" "the readiness refusal must say the violation is unreported"
   out=$("$PR" scan "$STATE" t1)
   assert_contains "$out" "trigger-skipped tests c1" "a triggered command without its skill must alarm on Codex, even when it mentions the helper"
-  "$PR" ready "$STATE" t1 2>/dev/null && fail "a skipped trigger must block readiness until the skill is read"
-  read_all tests >/dev/null; "$PR" ready "$STATE" t1 || fail "readiness must pass once the skill is read"
+  "$PR" ready "$STATE" t1 || fail "readiness must pass once the violation is reported and the skill was read after it"
   pass "the Codex scan accepts next-turn evidence and catches a triggered command run without its skill"
+}
+
+test_codex_scan_reads_every_command_shape() {
+  local shape n=0
+  for shape in \
+    '[{type:"response_item",payload:{type:"function_call",name:"shell",arguments:JSON.stringify({cmd:"bun run test"})}}]' \
+    '[{type:"response_item",payload:{type:"function_call",name:"shell",arguments:JSON.stringify({command:["bun","run","test"]})}}]' \
+    '[{type:"response_item",payload:{type:"custom_tool_call",name:"exec",input:"await tools.exec_command({cmd:\"pwd\"});\nawait tools.exec_command({cmd:\"bun run test\"});"}}]' \
+    '[{type:"response_item",payload:{type:"custom_tool_call",name:"exec",input:"await tools.exec_command({cmd:`bun run test`});"}}]' \
+    '[{type:"response_item",payload:{type:"custom_tool_call",name:"exec",input:"await tools.exec_command({cmd:'"'"'bun run test'"'"'});"}}]' \
+    '[{type:"response_item",payload:{type:"custom_tool_call",name:"exec",input:"const c = \"bun run test\"; await tools.exec_command({cmd:c});"}}]' \
+    '[{type:"response_item",payload:{type:"local_shell_call",action:{command:["sh","-c","bun run test"]}}}]'; do
+    n=$((n + 1))
+    admit "xshape$n" codex >/dev/null; codex_fixture "xshape$n"
+    codex_log '[started(),dev(block),agents()]'; close_stage
+    codex_log "$shape"
+    assert_contains "$("$PR" scan "$STATE" t1)" "trigger-skipped tests c0" "Codex command shape $n must be recognized"
+  done
+  pass "the Codex scan finds a triggering command in every call shape: JSON arguments, batches, each quote style, a variable, and a shell action"
 }
 
 test_codex_scan_is_idempotent_and_cursor_safe() {
@@ -366,8 +408,79 @@ test_a_slow_pattern_counts_as_a_match() {
   pass "a project pattern that runs out of time is treated as a match instead of stalling or letting the command through"
 }
 
+test_drift_covers_skills_and_the_declaration() {
+  local out
+  admit skilldrift claude >/dev/null; claude_evidence; close_stage
+  printf 'edited\n' >> "$COPY/skills/flow/SKILL.md"
+  out=$("$PR" scan "$STATE" t1)
+  assert_contains "$out" "rules-changed skill:flow" "a changed skill body must alarm"
+  assert_contains "$out" "rules-changed skill:audit" "every skill that uses the changed file must alarm"
+  assert_equals undefined "$(field answers.flow)" "a changed skill must lose its recorded read"
+  "$PR" ready "$STATE" t1 2>/dev/null && fail "drift must block readiness"
+  printf ' ' >> "$COPY/.agents/project-rules.json"
+  assert_contains "$("$PR" scan "$STATE" t1)" "rules-changed declared-list" "a changed declaration must alarm"
+  pass "drift is watched on rule files, skill bodies and the declaration, and blocks readiness"
+}
+
+test_failures_inside_the_hook_and_scan_are_never_silent() {
+  local rc=0 out nonode="$TMP/nonode"
+  admit infra claude >/dev/null; close_stage
+  mkdir -p "$nonode"; for tool in dirname basename sed ls rm cat head cut; do ln -sf "$(command -v "$tool")" "$nonode/$tool"; done
+  printf '{}' | PATH="$nonode" /bin/bash "$PR" hook "$STATE" t1 pretool >/dev/null 2>&1 || rc=$?
+  expect_code 2 "$rc" "the tool hook with node missing"
+  mkdir "$STATE/t1.project-rules.lock"
+  rc=0; hook pretool '{"tool_name":"Bash","tool_input":{"command":"ls"}}' >/dev/null 2>&1 || rc=$?
+  expect_code 2 "$rc" "the tool hook while the record is locked"
+  rmdir "$STATE/t1.project-rules.lock" 2>/dev/null || true
+  printf '{broken' > "$STATE/t1.project-rules"
+  rc=0; hook pretool '{"tool_name":"Bash","tool_input":{"command":"ls"}}' >/dev/null 2>&1 || rc=$?
+  expect_code 2 "$rc" "the tool hook with a corrupt record"
+  out=$("$PR" scan "$STATE")
+  assert_contains "$out" "project-rules: t1 scan-failed" "a scan that cannot read a record must raise an alarm"
+  assert_equals "" "$("$PR" scan "$STATE")" "the same scan failure is reported once"
+  pass "a failure inside the tool hook refuses the call, and a failed scan raises one alarm"
+}
+
+test_no_node_is_needed_without_declared_rules() {
+  local nonode="$TMP/nonode2" copy="$TMP/nonode.copy" state="$TMP/nonode.state" rc=0
+  mkdir -p "$nonode" "$state"; fm_git_init_commit "$copy"
+  for tool in dirname basename sed ls rm cat head cut; do ln -sf "$(command -v "$tool")" "$nonode/$tool"; done
+  PATH="$nonode" /bin/bash "$PR" admit "$state" t1 "$copy" claude >/dev/null 2>&1 || rc=$?
+  expect_code 3 "$rc" "admission of an undeclared copy with node missing"
+  PATH="$nonode" /bin/bash "$PR" ready "$state" t1 || fail "readiness of an unrecorded task must pass with node missing"
+  assert_equals "" "$(PATH="$nonode" /bin/bash "$PR" scan "$state")" "a scan with no records must be silent with node missing"
+  pass "a project with no declared rules never needs node"
+}
+
+test_version_drift_launches_with_children_denied() {
+  local out rc=0
+  STATE="$TMP/vdrift.state"; COPY=$(new_copy vdrift.copy); mkdir -p "$STATE" "$TMP/vdrift.config" "$TMP/vdrift.bin"
+  printf '#!/bin/sh\necho "9.9.9 (Claude Code)"\n' > "$TMP/vdrift.bin/claude"; chmod +x "$TMP/vdrift.bin/claude"
+  printf 'tool claude 1.0.0 herdr\nchild claude 1.0.0 general-purpose\n' > "$TMP/vdrift.config/project-rules-qualified"
+  printf 'Brief.\n' > "$TMP/vdrift.brief"
+  out=$(PATH="$TMP/vdrift.bin:$PATH" FM_PROJECT_RULES_QUALIFYING='' "$PR" admit "$STATE" t1 "$COPY" claude --brief "$TMP/vdrift.brief" --backend herdr --config "$TMP/vdrift.config" 2>&1) || fail "a qualified pair on a new tool version must still launch: $out"
+  assert_contains "$out" "notice: claude 9.9.9 has not passed" "a new tool version must be announced"
+  close_stage
+  hook pretool '{"tool_name":"Agent","tool_input":{"subagent_type":"general-purpose"}}' >/dev/null 2>&1 || rc=$?
+  expect_code 2 "$rc" "a child of any type on an unqualified tool version"
+  assert_contains "$("$PR" scan "$STATE" t1)" "unqualified-version claude 9.9.9" "an unqualified tool version must alarm"
+  printf 'tool claude 9.9.9 herdr\nchild claude 9.9.9 general-purpose\n' >> "$TMP/vdrift.config/project-rules-qualified"
+  PATH="$TMP/vdrift.bin:$PATH" FM_PROJECT_RULES_QUALIFYING='' "$PR" admit "$STATE" t1 "$COPY" claude --brief "$TMP/vdrift.brief" --backend herdr --config "$TMP/vdrift.config" >/dev/null 2>&1 || fail "a qualified version must be admitted"
+  close_stage
+  hook pretool '{"tool_name":"Agent","tool_input":{"subagent_type":"general-purpose"}}' >/dev/null 2>&1 || fail "a qualified child type on a qualified version must be allowed"
+  pass "a tool version the live guard has not seen launches with children denied until it is qualified"
+}
+
+test_relaunch_admits_a_copy_with_uncommitted_work() {
+  admit dirty claude >/dev/null
+  printf 'work in progress\n' > "$COPY/unsaved.txt"; printf 'more\n' >> "$COPY/README.md"
+  "$PR" admit "$STATE" t1 "$COPY" claude --backend herdr >/dev/null || fail "a second admission must accept the worker's own uncommitted work"
+  assert_equals start "$(field stage.name)" "a relaunch starts a fresh start stage"
+  pass "admission refuses only what the project's own commands change, so a relaunch of a dirty copy is admitted"
+}
+
 test_readiness_on_touched_paths() {
-  admit paths claude >/dev/null; close_stage
+  admit paths claude >/dev/null; claude_evidence; close_stage
   "$PR" ready "$STATE" t1 || fail "readiness must pass when nothing triggered"
   mkdir -p "$COPY/apps/api/src/server"; printf 'x\n' > "$COPY/apps/api/src/server/q.ts"
   "$PR" ready "$STATE" t1 2>/dev/null && fail "a diff that touches a triggered path must block readiness until its skill is read"
@@ -466,9 +579,15 @@ test_claude_scan_evidence_and_witness
 test_claude_scan_reports_changed_rules_and_stale_stage
 test_codex_scan_start_and_mid_turn_compaction
 test_codex_scan_between_turn_compaction_and_triggers
+test_codex_scan_reads_every_command_shape
 test_codex_scan_is_idempotent_and_cursor_safe
 test_codex_missing_evidence_and_witness
 test_a_slow_pattern_counts_as_a_match
+test_drift_covers_skills_and_the_declaration
+test_failures_inside_the_hook_and_scan_are_never_silent
+test_no_node_is_needed_without_declared_rules
+test_version_drift_launches_with_children_denied
+test_relaunch_admits_a_copy_with_uncommitted_work
 test_readiness_on_touched_paths
 test_merge_settings_preserves_existing_content
 test_size_and_emit

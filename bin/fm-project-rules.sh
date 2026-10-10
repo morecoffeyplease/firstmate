@@ -26,7 +26,19 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 case "${1:-}" in
   -h | --help | '') sed -n '2,/^set -u$/{/^set -u$/d;s/^# \{0,1\}//;p;}' "$0"; exit 0 ;;
 esac
-command -v node >/dev/null 2>&1 || { echo "fm-project-rules: node is required and was not found on PATH" >&2; exit 1; }
+# Whether anything is declared is decided here, in shell, so a project that
+# declares no rules never depends on the engine or on node.
+case "$1" in
+  admit) [ -e "${4:-}/.agents/project-rules.json" ] || { rm -rf -- "${2:-/nonexistent}/${3:-x}.project-rules" "${2:-/nonexistent}/${3:-x}.project-rules.d"; exit 3; } ;;
+  next | ready | detect | hook | status | serve | ack) [ -e "${2:-}/${3:-}.project-rules" ] || { [ "$1" != next ] || echo "Project rules: nothing is declared for this task."; exit 0; } ;;
+  scan) [ -n "${3:-}" ] || ls "${2:-${FM_STATE_OVERRIDE:-${FM_HOME:-$SCRIPT_DIR/..}/state}}"/*.project-rules >/dev/null 2>&1 || exit 0 ;;
+esac
+if ! command -v node >/dev/null 2>&1; then
+  echo "fm-project-rules: node is required and was not found on PATH" >&2
+  # Claude treats only exit 2 from a tool hook as a refusal.
+  [ "$1" = hook ] && [ "${4:-}" != session-start ] && exit 2
+  exit 1
+fi
 export FM_PROJECT_RULES_HELPER="$SCRIPT_DIR/fm-project-rules.sh"
 engine() { node "$SCRIPT_DIR/fm-project-rules.mjs" "$@"; }
 
@@ -40,16 +52,30 @@ rollout_for() {  # <state> <id>
 # Read one task's log. A newly detected Codex compaction comes back as one
 # "fm-steer:" line, which is delivered through the task's steering inbox since
 # Codex has no hook that could tell the worker itself.
+# A read that fails outright is reported once per distinct failure, so a locked
+# or corrupt record reaches the supervisor instead of vanishing.
 read_log() {  # <scan|detect> <state> <id>
-  local line
-  engine "$1" "$2" "$3" "$(rollout_for "$2" "$3")" | while IFS= read -r line; do
+  local line out rc=0 failed="$2/$3.project-rules.scan-failed" reason
+  out=$(engine "$1" "$2" "$3" "$(rollout_for "$2" "$3")" 2>"$failed.new") || rc=$?
+  if [ "$rc" -ne 0 ]; then
+    reason=$(head -1 "$failed.new" | cut -c1-200)
+    [ "$1" != scan ] || [ "$(cat "$failed" 2>/dev/null)" = "$reason" ] || printf 'project-rules: %s scan-failed %s\n' "$3" "${reason:-exit $rc}"
+    [ "$1" != scan ] || printf '%s\n' "$reason" > "$failed"
+  else
+    rm -f -- "$failed"
+  fi
+  rm -f -- "$failed.new"
+  while IFS= read -r line; do
     case "$line" in
       "fm-steer: "*)
         FM_HOME="${FM_HOME:-$(dirname "$2")}" "${FM_PROJECT_RULES_SEND:-$SCRIPT_DIR/fm-send.sh}" "$3" "${line#fm-steer: }" >/dev/null 2>&1 || true
         ;;
+      '') ;;
       *) printf '%s\n' "$line" ;;
     esac
-  done
+  done <<EOF_LOG
+$out
+EOF_LOG
 }
 
 verb=$1

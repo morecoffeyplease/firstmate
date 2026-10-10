@@ -1095,6 +1095,25 @@ test_spawn_relaunch_without_a_harness_reuses_the_recorded_one() {
   pass "fm-spawn --relaunch: with no explicit harness it reuses the task's recorded one, never the crew default"
 }
 
+test_spawn_relaunch_admits_a_dirty_copy_that_declares_rules() {
+  local dir out wt
+  dir=$(new_case rulesdirty rl22)
+  add_ship_task "$dir" rl22 claude
+  wt="$dir/wt"
+  mkdir -p "$wt/.agents"
+  printf '# Rules\n\nKeep it small.\n' > "$wt/RULES.md"
+  printf '{"version":1,"rules":[{"id":"rules","path":"RULES.md"}]}\n' > "$wt/.agents/project-rules.json"
+  git -C "$wt" add -A
+  git -C "$wt" -c user.name='Firstmate Tests' -c user.email='tests@example.invalid' commit -qm rules
+  printf 'work in progress\n' > "$wt/unsaved.txt"
+  printf 'zsh' > "$dir/fake/command"
+  out=$(FM_PROJECT_RULES_QUALIFYING=1 run_spawn "$dir" rl22 --relaunch)
+  assert_contains "$out" "spawned rl22 harness=claude" "a relaunch of a copy holding the worker's uncommitted work must be admitted: $out"
+  [ -f "$dir/home/state/rl22.project-rules" ] || fail "the relaunch must admit the copy for project rules"
+  [ -f "$wt/unsaved.txt" ] || fail "the relaunch must leave the worker's uncommitted work in place"
+  pass "fm-spawn --relaunch: a copy that declares rules is admitted with the worker's uncommitted work intact"
+}
+
 test_promoted_scout_relaunch_receives_the_current_delivery_contract() {
   local dir home id brief launch out mode rule
   for mode in direct-PR local-only; do
@@ -1840,6 +1859,7 @@ test_secondmate_relaunch_onto_a_crewmate_only_adapter_refuses_before_stop
 test_explicit_secondmate_harness_ignores_configured_profile_axes
 test_ship_relaunch_ignores_the_crew_harness_config
 test_spawn_relaunch_without_a_harness_reuses_the_recorded_one
+test_spawn_relaunch_admits_a_dirty_copy_that_declares_rules
 test_promoted_scout_relaunch_receives_the_current_delivery_contract
 test_prefixed_prior_harness_wiring_is_still_retired
 test_muse_session_binding_is_retired_on_a_harness_switch
