@@ -471,11 +471,16 @@ EOF
           bash "$dir/bin/fm-turnend-guard.sh" 2>&1); status=$?
     fi
     expect_code 0 "$status" "$mode session refused the live fleet lock must allow its stop"
-    [ -z "$out" ] || fail "$mode read-only lock-refused stop should be silent, got: $out"
+    if [ "$mode" = claude ]; then
+      assert_contains "$out" "SUPERVISION IS OWNED BY ANOTHER LIVE SESSION" \
+        "Claude lock-refused stop must explain the verified ownership boundary"
+    else
+      [ -z "$out" ] || fail "$mode read-only lock-refused stop should be silent, got: $out"
+    fi
   done
   kill "$owner" 2>/dev/null || true
   wait "$owner" 2>/dev/null || true
-  pass "fm-turnend-guard: default and Claude modes allow stops when another live firstmate session owns the fleet lock"
+  pass "fm-turnend-guard: default lock-refused stops stay silent and Claude reports verified foreign ownership"
 }
 
 test_hook_blocks_lock_owner_without_watcher() {
@@ -1697,9 +1702,9 @@ test_hook_claude_mode_integrated_monotonic_fail_open() {
 }
 
 # The auto-arm's ledger epoch advances only when the hook reaches its
-# generation claim. An unowned hook with no session lock stays inert, so the
-# ledger stays at the exhausted-failure epoch the hook wrote before it went
-# quiet. This test keeps that foreign lock in place for each auto-arm attempt,
+# generation claim. An unowned hook stays inert while a live foreign harness
+# owns state/.lock, so the ledger stays at the exhausted-failure epoch the hook
+# wrote before it went quiet. This test keeps that foreign lock in place for each auto-arm attempt,
 # then clears it before invoking the guard so it can test that repeated
 # re-blocks against an unchanged epoch still reach the attended fail-open.
 hold_session_lock_from_foreign_harness() {  # sets FOREIGN_LOCK_HOLDER
@@ -1713,7 +1718,7 @@ hold_session_lock_from_foreign_harness() {  # sets FOREIGN_LOCK_HOLDER
   printf '%s\n' "$FOREIGN_LOCK_HOLDER" > "$dir/state/.lock"
 }
 test_hook_claude_mode_frozen_epoch_reaches_bounded_fail_open() {
-  local dir out status guard_out guard_status i pid identity count epoch_line
+  local dir out status guard_out guard_status holder i pid identity count epoch_line
   dir=$(make_primary_dir "$TMP_ROOT/hook-claude-frozen-epoch")
   : > "$dir/state/task1.meta"
   install_integrated_autoarm "$dir"
@@ -1725,9 +1730,8 @@ test_hook_claude_mode_frozen_epoch_reaches_bounded_fail_open() {
   expect_code 0 "$guard_status" "the first failed epoch must own its Stop handoff"
   epoch_line=$(sed -n '1p' "$dir/state/.claude-autoarm-epoch")
 
-  # Remove the dead lock left by the fixture arm so this case isolates the
-  # frozen-ledger accounting path rather than the live foreign-owner escape.
-  rm -f "$dir/state/.lock"
+  hold_session_lock_from_foreign_harness "$dir"
+  holder=$FOREIGN_LOCK_HOLDER
   for i in 1 2 3 4; do
     printf '%s\n' "$holder" > "$dir/state/.lock"
     out=$(run_integrated_autoarm_unowned "$dir"); status=$?
@@ -1750,6 +1754,8 @@ test_hook_claude_mode_frozen_epoch_reaches_bounded_fail_open() {
       assert_present "$dir/state/.claude-autoarm-failure-alarmed" "the frozen-epoch fail-open did not consume its episode alarm"
     fi
   done
+  kill "$holder" 2>/dev/null || true
+  wait "$holder" 2>/dev/null || true
 
   guard_out=$(FM_CLAUDE_AUTOARM_SYNC_WAIT_MS=100 run_hook_claude "$dir" true); guard_status=$?
   expect_code 2 "$guard_status" "a later unhealthy stop after the frozen-epoch alarm must remain attended"

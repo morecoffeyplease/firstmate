@@ -172,10 +172,6 @@ fm_primary_scope_matches "$FM_ROOT" "$STATE" || exit 0
 # --- the actual predicate ----------------------------------------------------
 # shellcheck source=bin/fm-wake-lib.sh
 . "$SCRIPT_DIR/fm-wake-lib.sh"
-if [ "$CLAUDE_MODE" -eq 1 ]; then
-  # shellcheck source=bin/fm-session-lock-lib.sh
-  . "$SCRIPT_DIR/fm-session-lock-lib.sh"
-fi
 
 BUDGET_FILE="$STATE/.turnend-claude-blocks"
 BUDGET_LOCK="$STATE/.turnend-claude-blocks.lock"
@@ -191,18 +187,25 @@ budget_reset() {
 }
 
 fm_supervision_status "$STATE" "$GRACE"
-if [ "$FM_SUP_NEEDED" = false ]; then
-  [ -e "$FAILURE_NOTICE" ] || budget_reset
+if [ "$CLAUDE_MODE" -eq 1 ] && fm_session_lock_foreign_owner_live "$STATE"; then
+  # Preserve the normal silent healthy-watcher path, but never let this
+  # read-only session reset turn-end state or block on recovery it cannot own.
+  if [ "$FM_SUP_NEEDED" = false ] || fm_watcher_healthy "$STATE" "$WATCH" "$GRACE" "$FM_HOME"; then
+    exit 0
+  fi
+  printf '{"systemMessage":"FIRSTMATE SUPERVISION IS OWNED BY ANOTHER LIVE SESSION: this read-only session cannot and should not arm or repair the watcher (lock owner pid %s). Allowing this turn to end safely; the owning session must restore supervision."}\n' \
+    "$FM_SESSION_LOCK_FOREIGN_OWNER_PID"
   exit 0
 fi
-# A live firstmate session that owns the fleet lock is responsible for watcher
-# continuity. This hook may run in another session that was refused that lock;
-# that session is read-only and cannot repair supervision, so let its stop pass.
-if ! fm_session_lock_owned_by_self "$STATE"; then
+if [ "$CLAUDE_MODE" -eq 0 ] && ! fm_session_lock_owned_by_self "$STATE"; then
   session_lock_pid=$(cat "$STATE/.lock" 2>/dev/null || true)
   if [ -n "$session_lock_pid" ] && fm_harness_pid_alive "$session_lock_pid"; then
     exit 0
   fi
+fi
+if [ "$FM_SUP_NEEDED" = false ]; then
+  [ -e "$FAILURE_NOTICE" ] || budget_reset
+  exit 0
 fi
 # One owner of the "supervision is on, let this turn end" exit contract, shared
 # by every proof of supervision below.
@@ -263,17 +266,6 @@ block_stop() {
   } >&2
   exit 2
 }
-
-# A live session outside this process's harness ancestry owns the home lock.
-# This session is read-only and cannot arm or repair supervision without
-# stealing ownership, so blocking its Stop would create an impossible loop.
-# Report the ownership conflict as a diagnostic and let this turn end safely;
-# the owning session remains responsible for restoring the watcher.
-if [ "$CLAUDE_MODE" -eq 1 ] && fm_session_lock_foreign_owner_live "$STATE"; then
-  printf '{"systemMessage":"FIRSTMATE SUPERVISION IS OWNED BY ANOTHER LIVE SESSION: this read-only session cannot and should not arm or repair the watcher (lock owner pid %s). Allowing this turn to end safely; the owning session must restore supervision."}\n' \
-    "$FM_SESSION_LOCK_FOREIGN_OWNER_PID"
-  exit 0
-fi
 
 if [ "$CLAUDE_MODE" -eq 0 ]; then
   block_stop

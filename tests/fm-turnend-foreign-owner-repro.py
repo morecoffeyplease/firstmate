@@ -228,6 +228,17 @@ try:
     require(not (root / "state/.turnend-claude-blocks").exists(), "foreign-owner guard must not consume its block budget")
     print("FIXED repeated non-owner Stops: all five ended safely", flush=True)
 
+    task_meta = root / "state/task.meta"
+    task_meta.unlink()
+    budget = root / "state/.turnend-claude-blocks"
+    budget.write_text("owner-state-must-stay-untouched\n")
+    idle = guard(env, "idle nonowner stop")
+    require(idle.returncode == 0, "an idle non-owner Stop must end safely")
+    require(not idle.stdout, "an idle non-owner Stop should remain silent")
+    require(budget.read_text() == "owner-state-must-stay-untouched\n",
+            "an idle non-owner Stop reset owner turn-end state")
+    task_meta.write_text("project=synthetic\n")
+
     beat.touch()
     fresh = guard(env, "fresh-beat-only counterfactual")
     require(fresh.returncode == 0, "a fresh leftover beat must not restore foreign-owner blocking")
