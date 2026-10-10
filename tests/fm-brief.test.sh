@@ -723,6 +723,33 @@ test_ship_and_scout_teach_validation_round_pause() {
   pass "fm-brief.sh: ship and scout scaffolds teach validation-round pauses"
 }
 
+test_ship_brief_teaches_review_escalation_and_lane_checks() {
+  local home brief
+  home="$TMP_ROOT/review-escalation-home"
+  mkdir -p "$home/data"
+  FM_HOME="$home" "$ROOT/bin/fm-brief.sh" brief-review-escalation firstmate --mode direct-PR >/dev/null 2>&1
+  brief="$home/data/brief-review-escalation/brief.md"
+  assert_grep "supervising Firstmate runs the full review-round ladder" "$brief" \
+    "ship brief did not assign the full review-round ladder to supervising Firstmate"
+  assert_grep "Firstmate's" "$brief" \
+    "ship brief did not identify Firstmate's shared guidance"
+  assert_grep 'AGENTS.md` under **Review rounds**' "$brief" \
+    "ship brief did not name the shared review-round section"
+  assert_grep "name competing explanations, test them with the cheapest discriminating observation, and check proportionality" "$brief" \
+    "ship brief did not retain the inline differential-diagnosis method"
+  assert_grep "/suspicious skill" "$brief" \
+    "ship brief did not point to the suspicious skill"
+  assert_no_grep "larger-model shape review at round 3" "$brief" \
+    "ship brief duplicated the shared shape-review escalation rule"
+  assert_no_grep "must-not-trigger cases" "$brief" \
+    "ship brief duplicated the shared cross-cutting plan rule"
+  assert_grep "compare screenshots against main on the same fixture" "$brief" \
+    "ship brief did not require the UI screenshot self-check"
+  assert_grep "rerun the shared test helpers" "$brief" \
+    "ship brief did not require rerunning shared UI test helpers"
+  pass "fm-brief.sh: ship briefs teach the review ladder and lane-specific checks"
+}
+
 test_scout_and_secondmate_load_decision_hold_policy() {
   local home scout charter
   home="$TMP_ROOT/decision-policy-home"
@@ -891,6 +918,7 @@ test_secondmate_marked_request_reporting_contract
 test_secondmate_directory_paths_are_absolute_and_output_is_stable
 test_pause_verb_override_renders_all_brief_scaffolds
 test_ship_and_scout_teach_validation_round_pause
+test_ship_brief_teaches_review_escalation_and_lane_checks
 test_scout_and_secondmate_load_decision_hold_policy
 test_scout_and_secondmate_scaffold
 test_scout_lavish_line_follows_presentation_floor

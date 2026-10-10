@@ -501,6 +501,11 @@ $ASK_USER_BLOCK
    Firstmate's reply normally writes that closing line at answer time; when a blocker or wait clears WITHOUT a firstmate reply, append \`resolved: {how it cleared}\` yourself (same \`[key=<slug>]\` if you opened it with one) as you resume.
 $INBOX_SECTION
 
+# Review rounds
+The supervising Firstmate runs the full review-round ladder in Firstmate's \`AGENTS.md\` under **Review rounds**.
+After the second failed review round or a repeated failure, before another fix run the inline differential diagnosis with a mid-size model: name competing explanations, test them with the cheapest discriminating observation, and check proportionality; load the /suspicious skill when available.
+Before UI review, compare screenshots against main on the same fixture and rerun the shared test helpers.
+
 # Project memory
 If \`AGENTS.md\` or \`CLAUDE.md\` already exists, or if this task produced durable project-intrinsic knowledge, run \`$FM_ROOT/bin/fm-ensure-agents-md.sh .\` in the worktree.
 Record only project knowledge useful to almost every future session.

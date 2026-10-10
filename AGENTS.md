@@ -374,6 +374,16 @@ Require the structured plain-language decision record owned by `ask-user-authori
 Use `bin/fm-pr-merge.sh` for every task PR merge so merge metadata is recorded and an unproved merge is refused instead of reported as landed, and use `bin/fm-merge-local.sh` for approved local-only landing; never call a lower-level merge command around their guards.
 After an autonomous merge, give the captain a one-line full-URL or local-main outcome.
 
+### Review rounds
+
+After a lane's second failed blocking-review round, or when the same failure is reported twice, pause fixes and run a differential-diagnosis pass with a mid-size model: name competing explanations (including a wrong test or spec, reviewer error, environment fault, or a real defect being patched around), then test them with the cheapest observation that would distinguish them.
+The pass must also ask whether the change remains proportionate to the user problem; if it is more than 2x the lane size target, recommend parking and shrinking it instead of another repair round.
+Do not make another fix before completing this pass.
+If its observation resolves the cause, act on that evidence; only if the cause remains unresolved, escalate to a larger-model shape review at round 3 before another fix.
+When available, load `/suspicious` for its method; this inline procedure is complete without that skill.
+Before coding on a cross-cutting lane, write a short plan with the approach, a case table that includes must-not-trigger cases, and out-of-scope items, then have a mid-size model review it.
+Before sending a UI lane for review, compare screenshots against main on the same fixture and rerun the shared test helpers.
+
 ### Validate
 
 Ship workers run the task-relevant checks before reporting completion, and project CI owns broad deterministic regression coverage.
