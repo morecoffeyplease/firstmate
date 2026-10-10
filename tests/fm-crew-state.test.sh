@@ -80,7 +80,8 @@ SH
 }
 
 run_codex_state() {  # <case-dir> <id> [pane-capture]
-  PATH="$1/fakebin:$PATH" \
+  TZ=America/Los_Angeles \
+    PATH="$1/fakebin:$PATH" \
     FM_STATE_OVERRIDE="$1/state" \
     CODEX_HOME="$1/codex" \
     FM_TEST_CODEX_CAPTURE="${3:-}" \
@@ -271,8 +272,8 @@ test_codex_reused_worktree_selects_latest_rollout_after_spawn_read_only() {
     "{\"type\":\"session_meta\",\"payload\":{\"cwd\":\"$dir/worktree\"}}" \
     '{"type":"event_msg","payload":{"type":"task_started","turn_id":"restart"}}' \
     '{"type":"event_msg","payload":{"type":"task_complete","turn_id":"restart"}}' > "$newer"
-  touch -t 202610090000.01 "$current"
-  touch -t 202610090000.02 "$newer"
+  TZ=America/Los_Angeles touch -t 202610090000.01 "$current"
+  TZ=America/Los_Angeles touch -t 202610090000.02 "$newer"
   out=$(run_codex_state "$dir" codex-reused)
   assert_contains "$out" 'state: idle' 'the newest restarted Codex rollout wins for a reused worktree'
   [ ! -e "$binding" ] || fail 'reading current state must not create a Codex binding sidecar'
@@ -291,7 +292,7 @@ test_codex_simultaneous_rollouts_stay_unknown() {
   printf '%s\n%s\n' \
     "{\"type\":\"session_meta\",\"payload\":{\"cwd\":\"$dir/worktree\"}}" \
     '{"type":"event_msg","payload":{"type":"task_started","turn_id":"second"}}' > "$second"
-  touch -t 202610090000.05 "$first" "$second"
+  TZ=America/Los_Angeles touch -t 202610090000.05 "$first" "$second"
   out=$(run_codex_state "$dir" codex-simultaneous)
   assert_contains "$out" 'state: unknown' 'equally recent eligible rollouts are ambiguous'
   assert_not_contains "$out" 'state: idle' 'ambiguous rollouts cannot claim idle'
