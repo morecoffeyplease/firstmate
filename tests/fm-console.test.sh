@@ -114,6 +114,8 @@ snapshot = {
     "generated": datetime.datetime.now(datetime.timezone.utc).isoformat(),
     "tasks": [
         {"id": "worker", "issue": issue_url, "project": "alpha", "decision_keys": [], "endpoint": {"exists": True}, "paths": {"worktree": {"path": str(home / "projects" / "alpha"), "present": True}}, "backlog": {"repo": "alpha", "state": "in_flight", "links": [], "pr_url": pr_url}, "current_state": {"state": "working"}},
+        {"id": "ready-from-metadata", "kind": "feature", "pr": "https://github.com/example/alpha/pull/10", "current_state": {"state": "working"}},
+        {"id": "merge-word", "kind": "feature", "pr": "https://github.com/example/alpha/pull/11", "current_state": {"state": "working"}},
         {"id": "unknown-worker", "project": "alpha", "backlog": {"repo": "alpha", "state": "queued"}, "current_state": {"state": "unknown"}},
         {"id": "unlinked", "project": "alpha", "backlog": {"repo": "alpha", "state": "in_flight"}, "current_state": {"state": "working"}},
         {"id": "mate", "kind": "secondmate", "project": "alpha", "endpoint": {"exists": True}, "backlog": {"repo": "alpha", "state": "in_flight"}, "current_state": {"state": "working"}},
@@ -129,6 +131,18 @@ snapshot = {
         {"id": "unknown-worker", "title": "Queued prerequisite", "repo": "alpha", "state": "queued", "links": [], "blocked_by_ids": [], "unresolved_blocker_ids": []},
         {"id": "waiting-on-queued", "title": "Wait for queued prerequisite", "repo": "alpha", "state": "queued", "links": [], "blocked_by_ids": ["unknown-worker"], "unresolved_blocker_ids": ["unknown-worker"]},
         {"id": "closed-pr", "title": "Closed pull request", "repo": "alpha", "state": "in_flight", "links": [issue_url], "pr_url": "https://github.com/example/alpha/pull/9"},
+        {"id": "planned-up-next", "title": "Choose guest arrival flow", "repo": "alpha", "kind": "feature", "state": "queued", "links": ["https://github.com/example/alpha/issues/11"]},
+        {"id": "waiting-captain", "title": "Choose the default guest route", "repo": "alpha", "kind": "feature", "state": "queued", "hold_bucket": "live", "hold_kind": "captain", "links": ["https://github.com/example/alpha/issues/12"]},
+        {"id": "ready-from-metadata", "title": "Publish the guest route", "repo": "alpha", "kind": "feature", "state": "in_flight"},
+        {"id": "merge-word", "title": "Approve the guest route release", "repo": "alpha", "kind": "feature", "state": "in_flight", "hold_kind": "merge"},
+        {"id": "done-recent", "title": "Ship guest arrival copy", "repo": "alpha", "kind": "feature", "state": "done", "done": datetime.date.today().isoformat(), "links": ["https://github.com/example/alpha/issues/13"]},
+        {"id": "done-old", "title": "Earlier guest copy", "repo": "alpha", "kind": "feature", "state": "done", "done": (datetime.date.today() - datetime.timedelta(days=8)).isoformat(), "links": ["https://github.com/example/alpha/issues/15"]},
+        {"id": "scout-linked", "title": "Check guest route options", "repo": "alpha", "kind": "scout", "state": "queued", "links": ["https://github.com/example/alpha/issues/14"]},
+        {"id": "hidden-scout", "title": "Scout an unplanned cleanup", "repo": "alpha", "kind": "scout", "state": "queued", "links": []},
+        {"id": "review-private", "title": "Review an unplanned route", "repo": "alpha", "kind": "review", "state": "queued", "links": []},
+        {"id": "rv-private", "title": "Worker-only route notes", "repo": "alpha", "kind": "feature", "state": "queued", "links": []},
+        {"id": "ops-private", "title": "Refresh local tool cache", "repo": "alpha", "kind": "ops", "state": "queued", "links": []},
+        {"id": "tooling-private", "title": "Update internal test runner", "repo": "alpha", "kind": "tooling", "state": "queued", "links": []},
     ]},
     "main_inventory": {"valid": True, "reason": None},
     "secondmate_current": {"truncated": 0, "records": [
@@ -192,17 +206,31 @@ snapshot["secondmate_current"]["records"][0]["decisions_open"].append({
 snapshot_path.write_text(json.dumps(snapshot))
 fake_gh = tmp / "fake-bin" / "gh"
 fake_gh.write_text(r'''#!/usr/bin/env python3
-import json, sys
+import json, re, sys
 args = sys.argv[1:]
 path = next((arg for arg in args if arg.startswith("repos/")), "")
-if "/issues/7" in path:
-    out = {"number": 7, "title": "Exact issue title", "state": "open", "html_url": "https://github.com/example/alpha/issues/7", "milestone": {"title": "Spring release"}}
+issue_path = re.fullmatch(r"repos/([^/]+)/([^/]+)/issues/(\d+)", path)
+if issue_path:
+    owner, repo, number = issue_path.groups()
+    if number in ("99", "8147"):
+        sys.exit("issue is unavailable")
+    out = {"number": int(number), "title": "Exact issue title", "state": "open", "html_url": f"https://github.com/{owner}/{repo}/issues/{number}", "milestone": {"title": "Spring release"}}
 elif "graphql" in args:
     query = next(arg.split("=", 1)[1] for arg in args if arg.startswith("query="))
     if "issue(number:" in query:
         import re
         if re.search(r'issue\(number:99\)', query):
             sys.exit("issue 99 is unavailable")
+        matches = re.findall(r'(issue\d+):repository\(owner:"([^"]+)",name:"([^"]+)"\)\{issue\(number:(\d+)\)', query)
+        if len(matches) > 1:
+            if any(number == "99" for _, _, _, number in matches):
+                sys.exit("issue 99 is unavailable")
+            data = {}
+            for alias, owner, repo, number in matches:
+                issue = None if number == "8147" else {"number": int(number), "url": f"https://github.com/{owner}/{repo}/issues/{number}", "title": "Exact issue title", "milestone": {"title": "Spring release"}}
+                data[alias] = {"issue": issue}
+            print(json.dumps({"data": data}))
+            sys.exit(0)
         if re.search(r'issue\(number:8147\)', query):
             match = re.search(r'(issue\d+):repository', query)
             print(json.dumps({"data": {match.group(1): {"issue": None}}}))
@@ -230,8 +258,9 @@ elif "graphql" in args:
     number = int(next(arg.split("=", 1)[1] for arg in args if arg.startswith("number=")))
     url = f"https://github.com/example/alpha/pull/{number}"
     state = "CLOSED" if number == 9 else "OPEN"
+    title = "Closed PR title" if number == 9 else "Ready to merge PR title"
     out = {"data": {"repository": {"pullRequest": {"number": number, "url": url, "state": state,
-        "isDraft": False, "merged": False, "mergedAt": None, "reviewDecision": "APPROVED",
+        "title": title, "isDraft": False, "merged": False, "mergedAt": None, "reviewDecision": "APPROVED",
         "commits": {"nodes": [{"commit": {"statusCheckRollup": {"state": "SUCCESS", "contexts": {
             "totalCount": 2, "pageInfo": {"hasNextPage": False}, "nodes": [
                 {"__typename": "CheckRun", "name": "ci", "status": "COMPLETED", "conclusion": "SUCCESS"},
@@ -270,7 +299,7 @@ try:
     page = urllib.request.urlopen(base + "/", timeout=3).read().decode()
     assert all(f">{tab}<" in page for tab in ("Status", "Open decisions", "Queue"))
     assert "white-space:pre-wrap;overflow-wrap:anywhere" in page
-    data = json.load(urllib.request.urlopen(base + "/api/data", timeout=3))
+    data = json.load(urllib.request.urlopen(base + "/api/data", timeout=15))
     rows = data["status"]["rows"]
     assert any(row["title"] == "Exact issue title" and row["issue_state"] == "open" for row in rows), rows
     issue_row = next(row for row in rows if row["title"] == "Exact issue title")
@@ -309,14 +338,14 @@ try:
     assert structured["branch"] == "feature/guest-route", structured
     assert {(work["kind"], work["url"]) for work in structured["work_links"]} == {
         ("issue", issue_url), ("pull request", pr_url)}
-    assert legacy["answerable"] is False and legacy["decision"] is None
+    assert legacy["answerable"] is False and legacy["decision"] is None, legacy
     assert "this incoming event is retained for supervision" in page
     mate_decision = next(item for item in decisions if item["key"] == "mate-choice")
     assert mate_decision["answerable"] is True
     assert mate_decision["project"] == "alpha" and mate_decision["task_title"] == "Guest route follow-up", mate_decision
     assert mate_decision["branch"] == "Unavailable", mate_decision
     assert {(work["kind"], work["url"]) for work in mate_decision["work_links"]} == {
-        ("issue", issue_url), ("pull request", pr_url)}
+        ("issue", issue_url), ("pull request", pr_url)}, mate_decision
     mate_route = next(item for item in decisions if item["key"] == "mate-route")
     assert (mate_route["owner"], mate_route["task"], mate_route["key"], mate_route["answerable"]) == (
         "mate", "mate-child", "mate-route", True)
@@ -324,6 +353,27 @@ try:
     orphan_mate = next(item for item in decisions if item["key"] == "mate-orphan-hold")
     assert orphan_mate["answerable"] is True and orphan_mate["direct_hold"] is True
     queue = data["queue"]
+    board = {column["name"]: column["cards"] for column in data["board"]["columns"]}
+    def board_card(column, kind, suffix):
+        return next(card for card in board[column] if card["kind"] == kind and card["url"].endswith(suffix))
+    assert board_card("Up next", "issue", "/issues/11")["title"] == "Exact issue title", board
+    assert board_card("In progress", "issue", "/issues/7")["title"] == "Exact issue title", board
+    assert board_card("Waiting on you", "issue", "/issues/12")["title"] == "Exact issue title", board
+    assert board_card("Ready to merge", "pull_request", "/pull/8")["title"] == "Ready to merge PR title", board
+    assert board_card("Ready to merge", "pull_request", "/pull/10")["title"] == "Ready to merge PR title", board
+    assert board_card("Waiting on you", "pull_request", "/pull/11")["title"] == "Ready to merge PR title", board
+    assert board_card("Done (last 7 days)", "issue", "/issues/13")["title"] == "Exact issue title", board
+    assert not any(card["url"].endswith("/issues/15") for cards in board.values() for card in cards)
+    linked_scout = board_card("Up next", "issue", "/issues/14")
+    assert "Check guest route options" in linked_scout["backlog_titles"]
+    worker_titles = {item["title"] for item in data["board"]["worker_tasks"]}
+    assert worker_titles == {"Scout an unplanned cleanup", "Review an unplanned route", "Worker-only route notes",
+                             "Refresh local tool cache", "Update internal test runner"}, worker_titles
+    all_cards = [card for cards in board.values() for card in cards]
+    entity_urls = [card["url"] for card in all_cards]
+    assert len(entity_urls) == len(set(entity_urls)), entity_urls
+    assert not any(card["title"] in worker_titles for card in all_cards), all_cards
+    assert all("id" not in card and "repo" not in card for card in all_cards), all_cards
     next_row = next(row for row in queue if row["id"] == "next")
     assert next_row["unresolved_blocker_ids"] == ["worker"]
     assert next_row["start_reason"] == "Waiting for dependencies: worker (working)"
