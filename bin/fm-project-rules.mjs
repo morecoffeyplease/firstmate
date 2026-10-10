@@ -10,7 +10,7 @@ import vm from "node:vm";
 import { spawnSync } from "node:child_process";
 
 const CAP = 79000;
-const PART = 6000;
+const PART = 10000;
 const ROWS = 64;
 const STAGE_SECS = Number(process.env.FM_PROJECT_RULES_STAGE_SECS || 900);
 const GRACE_SECS = Number(process.env.FM_PROJECT_RULES_GRACE_SECS ?? 60);
@@ -19,7 +19,6 @@ const EDIT_TOOLS = ["Edit", "Write", "MultiEdit", "NotebookEdit"];
 const HELPER = process.env.FM_PROJECT_RULES_HELPER || "";
 // The worker-facing Firstmate commands a worker may run while a stage is open.
 const HELPERS = ["fm-project-rules.sh", "fm-task-heartbeat.sh", "fm-captain-hold.sh"].map((name) => path.join(path.dirname(HELPER), name));
-const HELPER_ENV = ["FM_HOME", "FM_ROOT_OVERRIDE", "FM_STATE_OVERRIDE"];
 
 // Claude treats only exit 2 from a tool hook as a refusal, so every failure
 // inside that hook, including a locked or corrupt record, must exit 2.
@@ -494,16 +493,27 @@ function settle(R) {
   R.closed[stage.gen] = stage.closed;
 }
 
+// Each run of the worker's own helper is noted on the record, so the scan can
+// tell a Codex call that ran the helper from one that did other work without
+// having to read how the call spelled its command.
+function noteHelper(R) {
+  const at = new Date().toISOString();
+  (R.first_helper ??= {})[R.compactions] ??= at;
+  R.helper_runs = [...(R.helper_runs ?? []).slice(-200), at];
+}
+
 function owed(R) {
   const stage = R.stage;
   const steps = [];
   if (!stage.closed) {
     if (stage.row < 0) steps.push("The receipt table is used up; tell your supervisor this task needs a relaunch.");
     else if (!stage.acked) steps.push(`Quote receipt row ${String(stage.row).padStart(2, "0")} from the end of your project rules block: ${helperCommand(R, "ack")} <the 6-character code>`);
-    if (!stage.brief) steps.push(`Read your launch brief again: ${helperCommand(R, "serve", "brief")}`);
     for (const skill of startSkills(R).filter((entry) => !answered(R, entry.name))) {
       steps.push(`Load required skill ${skill.name}: ${helperCommand(R, "serve", q(skill.name))}`);
     }
+    // The brief comes last and only once everything else is recorded, so a
+    // worker that has not finished its reads has no task to start on.
+    if (!steps.length && !stage.brief) steps.push(`${stage.gen ? "Read your task brief again" : "Everything required is recorded. Receive your task brief"}: ${helperCommand(R, "serve", "brief")}`);
   }
   return steps;
 }
@@ -511,10 +521,12 @@ function owed(R) {
 function next([state, id]) {
   withRecord(state, id, (R) => {
     if (!R) return process.stdout.write("Project rules: nothing is declared for this task.\n");
+    noteHelper(R);
     const steps = owed(R);
     if (steps.length) {
       process.stdout.write(`Project rules admission (stage ${R.stage.name}) is OPEN. Do these now, in order, before any other action:\n`);
       steps.forEach((step, index) => process.stdout.write(`${index + 1}. ${step}\n`));
+      process.stdout.write("Each read is finished only when the helper prints RECORDED. Admission stays OPEN until this command prints that nothing is owed, so run it again when you think you are done.\n");
       return;
     }
     process.stdout.write("Project rules: nothing is owed right now.\n");
@@ -528,6 +540,7 @@ function next([state, id]) {
 function ack([state, id, code]) {
   withRecord(state, id, (R) => {
     if (!R) die("no project rules are declared for this task");
+    noteHelper(R);
     const stage = R.stage;
     if (stage.closed || stage.acked) return process.stdout.write("That receipt row is already recorded.\n");
     if (stage.row < 0 || String(code ?? "").trim().toUpperCase() !== R.table[stage.row]) {
@@ -566,6 +579,10 @@ function partsOf(R, what) {
 function serve([state, id, what, given]) {
   withRecord(state, id, (R) => {
     if (!R) die("no project rules are declared for this task");
+    noteHelper(R);
+    if (what === "brief" && !R.stage.closed && (!R.stage.acked || !startSkills(R).every((skill) => answered(R, skill.name)))) {
+      die(`your task brief is handed over once the receipt row and every required skill are recorded; run: ${helperCommand(R, "next")}`);
+    }
     const parts = partsOf(R, what);
     const code = (part) => crypto.createHmac("sha256", R.secret).update(`${what}|${R.compactions}|${part}`).digest("hex").slice(0, 8);
     let done = 0;
@@ -577,10 +594,11 @@ function serve([state, id, what, given]) {
       if (what === "brief") R.stage.brief = true;
       else R.answers[what] = { gen: R.compactions, at: new Date().toISOString() };
       settle(R);
-      return process.stdout.write(`${what}: all ${parts.length} part(s) delivered and recorded.${owed(R).length ? ` Next: ${helperCommand(R, "next")}` : ""}\n`);
+      return process.stdout.write(`RECORDED: ${what} is fully read (${parts.length} part(s)).${owed(R).length ? ` Next: ${helperCommand(R, "next")}` : ""}\n`);
     }
     const part = done + 1;
-    process.stdout.write(`--- ${what} part ${part} of ${parts.length} ---\n${parts[part - 1]}--- end of part ${part} of ${parts.length}; continue with: ${helperCommand(R, "serve", q(what), code(part))} ---\n`);
+    const run = helperCommand(R, "serve", q(what), code(part));
+    process.stdout.write(`=== ${what}: PART ${part} OF ${parts.length}. NOT FINISHED until the helper prints RECORDED; the exact next command is on the last line. ===\n${parts[part - 1]}=== PART ${part} OF ${parts.length} - NOT FINISHED. Nothing is recorded yet. Run this exact command now: ${run} ===\n`);
   });
 }
 
@@ -749,23 +767,6 @@ function codexCommands(payload) {
   return { literals: found, bare, raw };
 }
 
-// Following Firstmate's own doorbell means listing, reading and moving files
-// in the task's inbox, which a worker must be able to do before it has
-// answered the stage that doorbell announces. Each part must be one plain
-// ls, cat, head, tail, mv or mkdir whose every path lies inside that inbox.
-function inboxOnly(R, command) {
-  const inbox = `${path.join(R.state, R.task)}.inbox`;
-  return String(command).split(/&&|;/).every((part) => {
-    const words = simpleWords(part, "*");
-    if (!words || !["ls", "cat", "head", "tail", "mv", "mkdir"].includes(words[0])) return false;
-    const paths = words.slice(1).filter((word) => !/^-[A-Za-z0-9]+$/.test(word));
-    return paths.length > 0 && paths.every((word) => {
-      const resolved = path.resolve(word.replace(/\*/g, "x"));
-      return resolved === inbox || resolved.startsWith(`${inbox}/`);
-    });
-  });
-}
-
 function scanCodex(R, block, file) {
   for (const entry of newLines(R, file)) {
     const payload = entry.payload && typeof entry.payload === "object" ? entry.payload : {};
@@ -796,9 +797,14 @@ function scanCodex(R, block, file) {
       const plain = !/\$\{/.test(raw) || [...raw.replace(/`[^`]*`/g, "").matchAll(/"((?:[^"\\]|\\.)*)"|'((?:[^'\\]|\\.)*)'/g)].every((match) => /^[\w:.-]*$/.test(match[1] ?? match[2] ?? ""));
       const helper = (command) => (command.includes("${") ? plain && helperCall(command.replace(/\$\{[^}]*\}/g, "x"), R) : helperCall(command, R));
       const all = raw ? [...literals, raw] : literals;
-      const isWork = (command, index) => (index < literals.length ? !helper(command) && !inboxOnly(R, command) : bare);
+      const isWork = (command, index) => (index < literals.length ? !helper(command) : bare);
       const firstWork = all.findIndex(isWork);
       if (firstWork < 0) continue;
+      // After a compaction a worker first follows Firstmate's doorbell, in
+      // whatever shell it likes. Work before its refresh is counted from its
+      // first helper run in that generation; a worker that never starts one is
+      // caught by the unanswered stage and by readiness.
+      const refreshing = gen === 0 || Date.parse(R.first_helper?.[gen] ?? "") <= at;
       // One call can finish a stage and then go on to work. That is in order
       // only when Firstmate's own commands come first in the call, so it is
       // judged when the call's output is logged.
@@ -808,8 +814,12 @@ function scanCodex(R, block, file) {
         if (gen > 0 && R.log.turn === 0) R.same_turn_calls += 1;
         else violate(R, gen === 0 ? "worked-before-admission" : "worked-before-refresh", `stage ${gen === 0 ? "start" : `c${gen}`}`);
       };
-      if (at < closed) {
-        if (payload.call_id && literals.slice(0, firstWork).some((command) => helper(command))) defer({ gen, turn: R.log.turn });
+      if (at < closed && refreshing) {
+        // A command the scan could not read may be the helper itself, spelled
+        // through a variable; that too is judged at the call's output, against
+        // the helper runs the engine noted.
+        const unread = literals.every((command) => helper(command));
+        if (payload.call_id && (unread || literals.slice(0, firstWork).some((command) => helper(command)))) defer({ gen, turn: R.log.turn, at, unread });
         else early();
       }
       for (const skill of R.skills.filter((item) => item.required?.before_commands)) {
@@ -834,6 +844,8 @@ function scanCodex(R, block, file) {
         if (item.skill) {
           const answer = R.answers[item.skill];
           if (!(answer?.gen === item.gen && Date.parse(answer.at) <= done)) violate(R, "trigger-skipped", `${item.skill} c${item.gen}`);
+        } else if (item.unread && (R.helper_runs ?? []).some((run) => Date.parse(run) >= item.at - 1000 && Date.parse(run) <= done + 1000)) {
+          continue;
         } else if (!(Date.parse(R.closed?.[item.gen] ?? "") <= done)) {
           if (item.gen > 0 && item.turn === 0) R.same_turn_calls += 1;
           else violate(R, item.gen === 0 ? "worked-before-admission" : "worked-before-refresh", `stage ${item.gen === 0 ? "start" : `c${item.gen}`}`);

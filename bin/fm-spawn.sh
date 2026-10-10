@@ -4121,6 +4121,7 @@ fi
 # list is not admitted at all, so nothing below changes for it and it needs
 # nothing this step depends on.
 PROJECT_RULES=0
+LAUNCH_PROMPT=${BRIEF:-}
 RULES_STATE=$(mkdir -p "$STATE" && cd "$STATE" && pwd -P)
 if [ "$KIND" != secondmate ] && [ ! -e "$WT/.agents/project-rules.json" ]; then
   rm -rf -- "$RULES_STATE/$ID.project-rules" "$RULES_STATE/$ID.project-rules.d"
@@ -4134,6 +4135,10 @@ elif [ "$KIND" != secondmate ]; then
   0)
     PROJECT_RULES=1
     fm_brief_project_rules_gate "$FM_ROOT/bin/fm-project-rules.sh" "$RULES_STATE" "$ID" >>"$BRIEF"
+    # The worker is launched on the admission message alone; the helper hands
+    # the brief over once every required read is recorded.
+    LAUNCH_PROMPT="$DATA/$ID/admission-brief.md"
+    fm_brief_project_rules_admission "$FM_ROOT/bin/fm-project-rules.sh" "$RULES_STATE" "$ID" >"$LAUNCH_PROMPT"
     ;;
   3) ;;
   *)
@@ -4830,7 +4835,7 @@ fi
 "$SCRIPT_DIR/fm-home-summary-refresh.sh" --best-effort || true
 [ "$BACKEND" = orca ] && ORCA_ABORT_CLEANUP=0
 
-sq_brief=$(shell_quote "$BRIEF")
+sq_brief=$(shell_quote "${LAUNCH_PROMPT:-$BRIEF}")
 sq_turnend=$(shell_quote "$TURNEND")
 sq_piext=$(shell_quote "$STATE/$ID.pi-ext.ts")
 sq_piturnend=$(shell_quote "$PROJ_ABS/.pi/extensions/fm-primary-turnend-guard.ts")

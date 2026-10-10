@@ -24,6 +24,8 @@
 #   FM_PROJECT_RULES_ACCEPT_TRIGGER=<cmd>  a safe command matching one of that
 #     project's before_commands patterns
 #   FM_PROJECT_RULES_LIVE_TOOLS="claude codex"   FM_PROJECT_RULES_LIVE_RUNS=2
+#   FM_PROJECT_RULES_LIVE_LEGS=smoke   only launch each tool and require its
+#     admission to be answered within FM_PROJECT_RULES_LIVE_SMOKE_SECS (90)
 #   FM_PROJECT_RULES_LIVE_LEGS=forced|automatic   run one leg while iterating; a
 #     run with a leg left out reports it as unknown and qualifies nothing, and
 #     so does a run with fewer than 2 sessions per leg
@@ -192,7 +194,7 @@ STATE=$(cd "$HOME_DIR/state" && pwd -P)
 BRIEF_TOKEN="FMQ-BRIEF-4242"
 ID=; TOOL=; PANE=; REPORT=; VERSION=
 
-say() { lab pane send-text "$PANE" "$1" >/dev/null && sleep 1.5 && lab pane send-keys "$PANE" Enter >/dev/null; sleep 4; lab pane send-keys "$PANE" Enter >/dev/null 2>&1 || true; }
+say() { lab pane send-text "$PANE" "$1" >/dev/null && sleep 1.5 && lab pane send-keys "$PANE" Enter >/dev/null; sleep 2; lab pane send-keys "$PANE" Enter >/dev/null 2>&1 || true; }
 # field evaluates an expression written in this file over the task record;
 # no outside input reaches it.
 field() { "$PR" status "$STATE" "$ID" | node -e 'let s="";process.stdin.on("data",d=>s+=d).on("end",()=>{const r=JSON.parse(s);let v;try{v=new Function(...Object.keys(r),"return ("+process.argv[1]+")")(...Object.values(r))}catch{v=undefined}process.stdout.write(String(v))})' "$1"; }
@@ -203,8 +205,8 @@ wait_compactions() {  # <count>
   local waited=0
   while [ "$waited" -lt 300 ]; do
     "$PR" detect "$STATE" "$ID" >/dev/null 2>&1 || true
-    [ "$(field compactions)" -lt "$1" ] 2>/dev/null || { sleep 20; return 0; }
-    sleep 5; waited=$((waited + 5))
+    [ "$(field compactions)" -lt "$1" ] 2>/dev/null || { sleep 5; return 0; }
+    sleep 2; waited=$((waited + 2))
   done
   fail "$TOOL $VERSION: the forced compaction never appeared on record"
 }
@@ -212,7 +214,7 @@ wait_status() {  # <line> <seconds>
   local waited=0
   while [ "$waited" -lt "$2" ]; do
     grep -qF "$1" "$STATE/$ID.status" 2>/dev/null && return 0
-    sleep 5; waited=$((waited + 5))
+    sleep 2; waited=$((waited + 2))
   done
   fail "$TOOL $VERSION: the worker never reported '$1' (pane: $(lab pane read "$PANE" --source recent --lines 30 2>/dev/null | tail -12 | tr '\n' ' '))"
 }
@@ -279,12 +281,12 @@ check_stage() {
   while [ "$waited" -lt 300 ]; do
     "$PR" detect "$STATE" "$ID" >/dev/null 2>&1 || true
     [ "$(field stage.closed)" = null ] || break
-    sleep 5; waited=$((waited + 5))
+    sleep 2; waited=$((waited + 2))
   done
   section=$(awk -v h="## $stage" '$0==h{p=1;next} /^## /{p=0} p' "$REPORT")
   child=$(awk -v h="## CHILD $stage" '$0==h{p=1;next} /^## /{p=0} p' "$REPORT")
   assert_equals "$gen" "$(field compactions)" "$TOOL $VERSION stage $stage: compactions recorded"
-  assert_not_equals null "$(field stage.closed)" "$TOOL $VERSION stage $stage: the stage must be answered"
+  [ "$(field stage.closed)" != null ] || fail "$TOOL $VERSION stage $stage: the stage must be answered; still owed: $("$PR" next "$STATE" "$ID" 2>&1 | tr '\n' ' ' | cut -c1-900) | pane: $(lab pane read "$PANE" --source recent --lines 40 2>/dev/null | grep -v '^[[:space:]]*$' | tail -14 | tr '\n' ' ' | cut -c1-1500)"
   while IFS=$'\t' read -r tool _ token kind _; do
     [ "$tool" = "$TOOL" ] || continue
     assert_contains "$section" "$token" "$TOOL $VERSION stage $stage: the worker must report the $kind canary $token"
@@ -448,6 +450,18 @@ quit_worker() { say "$([ "$TOOL" = claude ] && printf /exit || printf /quit)"; }
 for TOOL_NAME in $TOOLS; do
   command -v "$TOOL_NAME" >/dev/null 2>&1 || fail "$TOOL_NAME is not installed, so it cannot be qualified"
   VERSION=
+  # A startup-only smoke: admission that is not answered inside the limit is a
+  # failure to diagnose, not something to wait out.
+  if [ "${LEGS#* smoke }" != "$LEGS" ]; then
+    spawn_worker "$TOOL_NAME" smoke
+    waited=0
+    while [ "$waited" -lt "${FM_PROJECT_RULES_LIVE_SMOKE_SECS:-90}" ] && [ "$(field stage.closed)" = null ]; do sleep 5; waited=$((waited + 5)); done
+    [ "$(field stage.closed)" != null ] || fail "$TOOL $VERSION smoke: admission not answered in ${waited}s; still owed: $("$PR" next "$STATE" "$ID" 2>&1 | grep -c '^[0-9]') step(s): $("$PR" next "$STATE" "$ID" 2>&1 | sed -n 's/^[0-9]*\. \([A-Za-z ]*[a-z-]*\):.*/\1/p' | tr '\n' ';') | pane: $(lab pane read "$PANE" --source recent --lines 40 2>/dev/null | grep -v '^[[:space:]]*$' | tail -8 | tr '\n' ' ' | cut -c1-900)"
+    pass "$TOOL $VERSION smoke: admission answered within ${waited}s (block $(field block_bytes) bytes)"
+    quit_worker
+    record smoke pass
+    continue
+  fi
   if [ "${LEGS#* forced }" != "$LEGS" ]; then
     run=1
     while [ "$run" -le "$RUNS" ]; do
@@ -482,7 +496,7 @@ for TOOL_NAME in $TOOLS; do
       done
       auto_gen=$(field compactions)
       if [ "$auto_gen" -ge 1 ] 2>/dev/null; then
-        sleep 20
+        sleep 5
         send_stage C
         wait_status "working: C written" 900
         auto_gen=$(field compactions)

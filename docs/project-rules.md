@@ -97,8 +97,13 @@ Payload bytes are the inlined rule files plus each catalog skill's name and desc
 ## Stages and receipts
 
 A stage is `start` or one compaction, `c1`, `c2`, and so on.
-It closes when the worker has quoted one randomly chosen unused receipt row, read its launch brief again through the helper, and read every skill required at start.
-The launch brief carries a short gate that points the worker at `fm-project-rules.sh next`, which prints exactly what is owed.
+It closes when the worker has quoted one randomly chosen unused receipt row, read every skill required at start, and then read its task brief through the helper.
+
+The worker is launched on an admission message alone: its role, and the instruction to run `fm-project-rules.sh next` and do what it prints.
+Its task is not in that message.
+`next` lists the receipt row and the required reads, and offers the task brief only once those are recorded, so a worker that has not finished reading has no task to start on.
+The brief itself carries a short gate that sends the worker back to `next` after any compaction.
+Every part the helper serves ends with a line saying it is not finished and naming the exact next command, and a read counts only when the helper prints `RECORDED`.
 
 A quoted row shows that the end of the block is in context, or that its text was copied into a summary, so it is supporting evidence only.
 The proof is the tool's own log holding the whole block for that generation, compared after removing trailing newlines:

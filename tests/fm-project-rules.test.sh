@@ -67,14 +67,14 @@ read_all() {
   out=$("$PR" serve "$STATE" t1 "$what") || return 1
   while :; do
     parts=$((parts + 1))
-    code=$(printf '%s\n' "$out" | sed -n "s/.*continue with: .* '$what' \([0-9a-f]\{8\}\) ---\$/\1/p" | tail -1)
+    code=$(printf '%s\n' "$out" | sed -n "s/.*Run this exact command now: .* '$what' \([0-9a-f]\{8\}\) ===\$/\1/p" | tail -1)
     [ -n "$code" ] || return 1
     out=$("$PR" serve "$STATE" t1 "$what" "$code") || return 1
-    case "$out" in *"delivered and recorded"*) break ;; esac
+    case "$out" in RECORDED:*) break ;; esac
   done
   printf '%s\n' "$parts"
 }
-close_stage() { "$PR" ack "$STATE" t1 "$(row_code)" >/dev/null && read_all brief >/dev/null && read_all flow >/dev/null; }
+close_stage() { "$PR" ack "$STATE" t1 "$(row_code)" >/dev/null && read_all flow >/dev/null && read_all brief >/dev/null; }
 edit_list() { node -e 'const fs=require("fs");const f=process.argv[1];const L=JSON.parse(fs.readFileSync(f,"utf8"));eval(process.argv[2]);fs.writeFileSync(f,JSON.stringify(L))' "$1/.agents/project-rules.json" "$2"; git -C "$1" -c user.name=t -c user.email=t@example.invalid commit -qam edit; }
 hook() { printf '%s' "$2" | "$PR" hook "$STATE" t1 "$1"; }
 # claude_evidence [boundary]: give the task a transcript that holds the block
@@ -148,22 +148,26 @@ test_block_receipt_and_chained_reads() {
   assert_contains "$block" "Your launch brief can be read again at any time with: " "the block must say how to read the brief again"
   out=$("$PR" next "$STATE" t1)
   assert_contains "$out" "stage start) is OPEN" "next must report the open start stage"
+  assert_contains "$out" "Admission stays OPEN until this command prints that nothing is owed" "next must say when admission is really over"
   assert_contains "$out" "Load required skill flow" "next must list the start skill"
   assert_not_contains "$out" "Load required skill tests" "a command-triggered skill is not owed at start"
+  assert_not_contains "$out" "serve '$STATE' 't1' brief" "the task brief must not be offered before the required reads are recorded"
+  "$PR" serve "$STATE" t1 brief >/dev/null 2>&1 && fail "the task brief must be refused before the receipt row and start skills are recorded"
   "$PR" ack "$STATE" t1 ZZZZZZ >/dev/null 2>&1 || rc=$?
   expect_code 1 "$rc" "a wrong receipt code"
   "$PR" ack "$STATE" t1 "$(row_code)" >/dev/null || fail "the right receipt code must be accepted"
   "$PR" ready "$STATE" t1 2>/dev/null && fail "readiness must fail while the brief and start skill are owed"
   rc=0; "$PR" serve "$STATE" t1 tests deadbeef >/dev/null 2>&1 || rc=$?
   expect_code 1 "$rc" "a part code that was never issued"
-  read_all brief >/dev/null || fail "the brief must be readable to the end"
   read_all flow >/dev/null || fail "the start skill must be readable to the end"
+  assert_contains "$("$PR" next "$STATE" t1)" "Everything required is recorded. Receive your task brief: " "next must hand over the brief once the required reads are recorded"
+  read_all brief >/dev/null || fail "the brief must be readable to the end"
   assert_not_equals null "$(field stage.closed)" "the stage must close once the row, brief and start skill are done"
   out=$("$PR" next "$STATE" t1)
   assert_contains "$out" "nothing is owed right now" "next must report a closed stage"
   assert_contains "$out" 'Before running any command matching (^|[;&| ])bun run test( |$), load tests: ' "next must name the exact trigger of a skill not yet read"
   parts=$(read_all tests) || fail "a long skill must be readable to the end"
-  [ "$parts" -ge 3 ] || fail "a long skill must be served in several parts, got $parts"
+  [ "$parts" -ge 2 ] || fail "a long skill must be served in several parts, got $parts"
   assert_equals 0 "$(field 'answers.tests.gen')" "a completed skill read is recorded for the current generation"
   pass "the block inlines non-native rules and the catalog, and receipts and chained reads close the start stage"
 }
@@ -172,12 +176,13 @@ test_a_skipped_part_cannot_complete() {
   local out first second
   admit skip claude >/dev/null
   out=$("$PR" serve "$STATE" t1 tests)
-  first=$(printf '%s\n' "$out" | sed -n "s/.*continue with: .* 'tests' \([0-9a-f]\{8\}\) ---\$/\1/p")
+  assert_contains "$out" " - NOT FINISHED. Nothing is recorded yet. Run this exact command now: " "every part must end by saying it is not finished and naming the exact next command"
+  first=$(printf '%s\n' "$out" | sed -n "s/.*Run this exact command now: .* 'tests' \([0-9a-f]\{8\}\) ===\$/\1/p")
   out=$("$PR" serve "$STATE" t1 tests "$first")
-  assert_contains "$out" "part 2 of" "the first code must release exactly the second part"
+  assert_contains "$out" "tests: PART 2 OF" "the first code must release exactly the second part"
   assert_not_contains "$out" "TAIL-OF-TESTS-SKILL" "the second part must not contain the end of a longer skill"
   assert_equals undefined "$(field 'answers.tests')" "a partly read skill must not be recorded"
-  second=$(printf '%s\n' "$out" | sed -n "s/.*continue with: .* 'tests' \([0-9a-f]\{8\}\) ---\$/\1/p")
+  second=$(printf '%s\n' "$out" | sed -n "s/.*Run this exact command now: .* 'tests' \([0-9a-f]\{8\}\) ===\$/\1/p")
   assert_not_equals "$first" "$second" "each part must carry its own code"
   pass "a skill is recorded only after every part was requested in order"
 }
@@ -314,10 +319,14 @@ test_codex_scan_start_and_mid_turn_compaction() {
   close_stage
   codex_log '[call("ls")]'
   assert_equals "" "$("$PR" scan "$STATE" t1)" "a Codex session with the block, the native file, and work only after admission must not alarm"
-  codex_log '[compacted([{type:"message",role:"developer",content:[{text:block}]},{type:"message",role:"user",content:[{text:"# AGENTS.md instructions for x\n\n# Agents core\n\nNever rename the widget.\n"}]}]),event(),call("ls"),call("ls")]'
+  codex_log '[compacted([{type:"message",role:"developer",content:[{text:block}]},{type:"message",role:"user",content:[{text:"# AGENTS.md instructions for x\n\n# Agents core\n\nNever rename the widget.\n"}]}]),event(),call("ls")]'
   printf '#!/bin/sh\nprintf "%%s|%%s\\n" "$1" "$2" >> "%s"\n' "$TMP/xscan.sent" > "$TMP/xscan.send"; chmod +x "$TMP/xscan.send"
   FM_PROJECT_RULES_SEND="$TMP/xscan.send" "$PR" detect "$STATE" t1
   assert_equals c1 "$(field stage.name)" "a compaction record must open a stage"
+  assert_equals 0 "$(field same_turn_calls)" "a call before the worker's first helper run in the new generation is not counted"
+  "$PR" next "$STATE" t1 >/dev/null
+  codex_log '[call("ls"),call("ls")]'
+  "$PR" detect "$STATE" t1
   assert_grep "t1|Your context was compacted (stage c1). Before any other action run: " "$TMP/xscan.sent" "a newly detected Codex compaction must be steered to the worker once"
   FM_PROJECT_RULES_SEND="$TMP/xscan.send" "$PR" detect "$STATE" t1
   assert_equals 1 "$(wc -l < "$TMP/xscan.sent" | tr -d ' ')" "a compaction already seen must not be steered again"
@@ -400,17 +409,29 @@ test_codex_following_the_doorbell_is_not_a_violation() {
   codex_log '[compacted([]),event()]'
   FM_PROJECT_RULES_SEND=true "$PR" ready "$STATE" t1 >/dev/null 2>&1 || true
   assert_equals c1 "$(field stage.name)" "a compaction first seen by a readiness check must open its stage"
-  codex_log "[started(),dev(block),agents(),call(\"ls '$inbox'/*.msg\"),call(\"cat '$inbox/001.msg' && mv '$inbox/001.msg' '$inbox/handled/'\"),{type:'response_item',timestamp:new Date().toISOString(),payload:{type:'function_call',name:'wait',arguments:'{\"timeout_ms\":10000}'}},call(bin+'/fm-project-rules.sh next')]"
+  # The shapes real Codex workers use to follow the doorbell.
+  codex_log "[started(),dev(block),agents(),call(\"find '$inbox' -name '*.msg' -print | sort -V\"),call(\"for f in '$inbox'/*.msg; do cat \\\"\$f\\\"; done\"),call(\"set -e\\ncd '$inbox'\\nls\\ncat 001.msg\\nmv 001.msg handled/\"),call(\"ls '$inbox' 2>/dev/null\"),call(\"sleep 20\"),{type:'response_item',timestamp:new Date().toISOString(),payload:{type:'function_call',name:'wait',arguments:'{\\\"timeout_ms\\\":10000}'}}]"
   close_stage
-  assert_equals "" "$("$PR" scan "$STATE" t1)" "listing, reading and moving the task's own inbox, and a wait, must not count as work before the refresh"
+  assert_equals "" "$("$PR" scan "$STATE" t1)" "whatever a worker runs to follow the doorbell, before its first helper call, is not charged"
   codex_log '[compacted([]),event()]'; "$PR" detect "$STATE" t1
-  codex_log '[started(),dev(block),agents(),{type:"response_item",timestamp:new Date().toISOString(),payload:{type:"custom_tool_call",name:"exec",input:"for (const [s,c] of [[\"brief\",\"aa\"],[\"flow\",\"bb\"]]) text(await tools.exec_command({cmd:`"+q(bin+"/fm-project-rules.sh")+" serve "+q(state)+" t1 ${s} ${c}`}));"}}]'
+  "$PR" next "$STATE" t1 >/dev/null
+  codex_log '[started(),call("touch elsewhere.txt")]'
+  assert_contains "$("$PR" scan "$STATE" t1)" "worked-before-refresh stage c2" "work after the worker's first helper call in that generation, before the refresh is done, still counts"
+  pass "a Codex worker is not charged for following the doorbell in any shell shape, and is charged for work once it has started the refresh"
+}
+
+test_codex_helper_spelled_through_a_variable() {
+  admit xvar codex >/dev/null; codex_fixture xvar
+  codex_log "[started(),dev(block),agents(),{type:'response_item',timestamp:new Date().toISOString(),payload:{type:'custom_tool_call',call_id:'v1',name:'exec',input:'text(await tools.exec_command({cmd:load(\\\"p\\\")+\\\" next\\\"}));'}}]"
+  "$PR" next "$STATE" t1 >/dev/null
+  codex_log "[{type:'response_item',timestamp:new Date(Date.now()+1000).toISOString(),payload:{type:'custom_tool_call_output',call_id:'v1',output:'ok'}}]"
   close_stage
-  assert_equals "" "$("$PR" scan "$STATE" t1)" "helper calls written as a template loop must not count as work before the refresh"
-  codex_log '[compacted([]),event()]'; "$PR" detect "$STATE" t1
-  codex_log "[started(),call(\"cat '$inbox/002.msg' > /tmp/copied.txt\")]"
-  assert_contains "$("$PR" scan "$STATE" t1)" "worked-before-refresh stage c3" "an inbox read redirected somewhere else still counts as work"
-  pass "a Codex worker that follows the compaction doorbell is not charged for it, and other work before the refresh still is"
+  assert_equals "" "$("$PR" scan "$STATE" t1)" "a call whose command could not be read, during which the helper really ran, is the helper"
+  admit xvar2 codex >/dev/null; codex_fixture xvar2
+  codex_log "[started(),dev(block),agents(),{type:'response_item',timestamp:new Date(Date.now()-60000).toISOString(),payload:{type:'custom_tool_call',call_id:'v2',name:'exec',input:'text(await tools.exec_command({cmd:load(\\\"p\\\")}));'}},{type:'response_item',timestamp:new Date(Date.now()-50000).toISOString(),payload:{type:'custom_tool_call_output',call_id:'v2',output:'ok'}}]"
+  close_stage
+  assert_contains "$("$PR" scan "$STATE" t1)" "worked-before-admission stage start" "a call whose command could not be read, with no helper run during it, is work"
+  pass "a helper call spelled through a variable is recognized by the helper run the engine noted, and other unreadable calls still count as work"
 }
 
 test_codex_admission_then_work_in_one_call_is_in_order() {
@@ -615,6 +636,11 @@ test_spawn_delivers_the_block_to_claude() {
   assert_grep "You are a task worker launched by Firstmate" "$prompt" "the rendered prompt must keep the worker statement"
   assert_grep 'Web rule: `keep` the "frame" stable.' "$prompt" "the rendered prompt must carry the rules block"
   assert_grep "# Project rules gate" "$S_HOME/data/rules-sclaude/launch-brief.md" "the launch brief must carry the startup gate"
+  assert_contains "$launch" "admission-brief.md" "the worker must be launched on the admission message, not on its task"
+  assert_grep "Your task is not in this message." "$S_HOME/data/rules-sclaude/admission-brief.md" "the admission message must say the task comes later"
+  assert_grep "# Current worker role contract" "$S_HOME/data/rules-sclaude/admission-brief.md" "the admission message must keep the worker role contract"
+  assert_no_grep "brief for rules-sclaude" "$S_HOME/data/rules-sclaude/admission-brief.md" "the admission message must not contain the task"
+  assert_grep "brief for rules-sclaude" "$S_HOME/data/rules-sclaude/launch-brief.md" "the task stays in the brief the helper hands over"
   assert_equals "1 1 4" "$(node -e 'const h=JSON.parse(require("fs").readFileSync(process.argv[1],"utf8")).hooks;console.log(h.SessionStart.length,h.PreToolUse.length,["UserPromptSubmit","Stop","StopFailure","SessionEnd"].filter(k=>h[k]).length)' "$S_WT/.claude/settings.local.json")" "the worker settings must hold the rules hooks beside the busy hooks"
   assert_equals start "$(node -e 'process.stdout.write(JSON.parse(require("fs").readFileSync(process.argv[1],"utf8")).stage.name)' "$S_HOME/state/rules-sclaude.project-rules")" "admission must leave the start stage open"
   pass "fm-spawn gives a claude worker the block through its system prompt, the gate, and the rules hooks"
@@ -628,6 +654,7 @@ test_spawn_delivers_the_block_to_codex() {
   assert_contains "$launch" "--disable hooks" "a codex worker must keep its hook layer off"
   assert_contains "$launch" "fm-project-rules.sh' emit '" "the codex launch must pass the block as developer instructions"
   assert_contains "$launch" "fm-project-rules.sh' detect '" "the codex turn-end program must also check for a compaction"
+  assert_contains "$launch" "admission-brief.md" "a codex worker must be launched on the admission message, not on its task"
   pass "fm-spawn gives a codex worker the block as developer instructions with hooks still off"
 }
 
@@ -658,6 +685,7 @@ test_codex_scan_between_turn_compaction_and_triggers
 test_codex_scan_reads_every_command_shape
 test_codex_read_then_run_in_one_call_is_in_order
 test_codex_following_the_doorbell_is_not_a_violation
+test_codex_helper_spelled_through_a_variable
 test_codex_admission_then_work_in_one_call_is_in_order
 test_codex_scan_is_idempotent_and_cursor_safe
 test_codex_missing_evidence_and_witness
