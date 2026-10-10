@@ -369,7 +369,7 @@ test_codex_scan_reads_every_command_shape() {
 }
 
 test_codex_read_then_run_in_one_call_is_in_order() {
-  local read_cmd='"await tools.exec_command({cmd:"+JSON.stringify(q(bin+"/fm-project-rules.sh")+" serve "+q(state)+" "+q("t1")+" "+q("tests")+" abc")+"});"'
+  local read_cmd='"await tools.exec_command({cmd:"+JSON.stringify(q(bin+"/fm-project-rules.sh")+" serve "+q(state)+" "+q("t1")+" tests abc")+"});"'
   local run_cmd='"await tools.exec_command({cmd:\"bun run test\"});"'
   admit xbatch codex >/dev/null; codex_fixture xbatch
   codex_log '[started(),dev(block),agents()]'; close_stage

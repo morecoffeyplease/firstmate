@@ -177,20 +177,21 @@ function commandPattern(pattern) {
 // redirections anywhere, and no environment prefix beyond Firstmate's own.
 // A command that merely mentions the path, or chains something after it, is
 // an ordinary project command.
-function helperCall(command) {
+function helperWords(command) {
   const words = [];
   let rest = String(command).trim();
   while (rest) {
     const word = rest.match(/^(?:'[^']*'|"[^"$`\\]*"|[A-Za-z0-9_@%+=:,./-]+)+/);
-    if (!word) return false;
+    if (!word) return null;
     words.push(word[0].replace(/'([^']*)'|"([^"]*)"/g, "$1$2"));
     rest = rest.slice(word[0].length);
-    if (rest && !/^[ \t]/.test(rest)) return false;
+    if (rest && !/^[ \t]/.test(rest)) return null;
     rest = rest.replace(/^[ \t]+/, "");
   }
   while (words.length && HELPER_ENV.includes(words[0].split("=")[0]) && words[0].includes("=")) words.shift();
-  return words.length > 0 && HELPERS.includes(words[0]);
+  return words.length > 0 && HELPERS.includes(words[0]) ? words : null;
 }
+const helperCall = (command) => helperWords(command) !== null;
 
 // A project's pattern is matched under a time limit, and a pattern that runs
 // out of time counts as a match, so a slow pattern cannot stall the hook or
@@ -748,7 +749,10 @@ function scanCodex(R, block, file) {
         // One call can finish reading the skill and then run the command. That
         // is in order only when the read comes first in the same call, so it
         // is judged when the call's output is logged.
-        const readFirst = all.slice(0, hit).some((command) => helperCall(command) && command.includes(` serve `) && command.includes(q(skill.name)));
+        const readFirst = all.slice(0, hit).some((command) => {
+          const words = helperWords(command);
+          return words !== null && words[1] === "serve" && words[4] === skill.name;
+        });
         if (readFirst && payload.call_id) (R.log.pending ??= {})[payload.call_id] = { skill: skill.name, gen };
         else violate(R, "trigger-skipped", `${skill.name} c${gen}`);
       }
