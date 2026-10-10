@@ -685,8 +685,10 @@ function noteNative(R, text, gen, wanted) {
 }
 
 // Every shell command one Codex tool call carries: JSON arguments of a function
-// call, each exec_command in a batched script, or a local shell action. A call
-// whose shape is not recognized is returned whole, so it is still inspected.
+// call, each exec_command in a batched script, or a local shell action.
+// `literals` are the commands that could be read. `bare` says a command site
+// had no literal at all (a variable), and `raw` is the whole call text whenever
+// anything in it was not fully readable, so that text is inspected too.
 function codexCommands(payload) {
   const found = [];
   const add = (value) => {
@@ -719,8 +721,9 @@ function codexCommands(payload) {
   // A call that carries no command at all, such as a wait, is not work. One
   // that edits files without a shell command still is.
   const edits = /patch|edit|write/i.test(String(payload.name ?? ""));
-  if (sites > found.length || (!found.length && edits)) add(strings([payload.input, payload.arguments, payload.action]).join(" "));
-  return found;
+  const bare = sites > found.length || (!found.length && edits);
+  const raw = bare || found.some((command) => command.includes("${")) ? strings([payload.input, payload.arguments, payload.action]).join(" ") : "";
+  return { literals: found, bare, raw };
 }
 
 // Following Firstmate's own doorbell means listing, reading and moving files
@@ -753,15 +756,19 @@ function scanCodex(R, block, file) {
     } else if (entry.type === "response_item" && /_call$/.test(payload.type ?? "")) {
       const at = Date.parse(entry.timestamp ?? "") || Date.now();
       const closed = Date.parse(R.closed?.[gen] ?? "") || Infinity;
-      const all = codexCommands(payload);
-      const commands = all.filter((command) => !helperCall(command) && !inboxOnly(R, command));
-      if (!commands.length) continue;
+      // A helper call written as a template, with its arguments filled from a
+      // loop, is still a helper call; anything else unreadable is work.
+      const { literals, bare, raw } = codexCommands(payload);
+      const helper = (command) => helperCall(command.replace(/\$\{[^}]*\}/g, "x"));
+      const all = raw ? [...literals, raw] : literals;
+      const isWork = (command, index) => (index < literals.length ? !helper(command) && !inboxOnly(R, command) : bare);
+      if (!all.some(isWork)) continue;
       if (at < closed) {
         if (gen > 0 && R.log.turn === 0) R.same_turn_calls += 1;
         else violate(R, gen === 0 ? "worked-before-admission" : "worked-before-refresh", `stage ${gen === 0 ? "start" : `c${gen}`}`);
       }
       for (const skill of R.skills.filter((item) => item.required?.before_commands)) {
-        const hit = all.findIndex((command) => !helperCall(command) && commandMatches(skill.required.before_commands, command));
+        const hit = all.findIndex((command, index) => (index >= literals.length || !helper(command)) && commandMatches(skill.required.before_commands, command));
         if (hit < 0) continue;
         R.triggered[skill.name] = (R.triggered[skill.name] ?? 0) + 1;
         const answer = R.answers[skill.name];
@@ -769,7 +776,7 @@ function scanCodex(R, block, file) {
         // One call can finish reading the skill and then run the command. That
         // is in order only when the read comes first in the same call, so it
         // is judged when the call's output is logged.
-        const readFirst = all.slice(0, hit).some((command) => {
+        const readFirst = literals.slice(0, hit).some((command) => {
           const words = helperWords(command);
           return words !== null && words[1] === "serve" && words[4] === skill.name;
         });

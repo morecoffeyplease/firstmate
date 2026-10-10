@@ -359,7 +359,8 @@ test_codex_scan_reads_every_command_shape() {
     '[{type:"response_item",payload:{type:"custom_tool_call",name:"exec",input:"await tools.exec_command({cmd:'"'"'bun run test'"'"'});"}}]' \
     '[{type:"response_item",payload:{type:"custom_tool_call",name:"exec",input:"const c = \"bun run test\"; await tools.exec_command({cmd:c});"}}]' \
     '[{type:"response_item",payload:{type:"local_shell_call",action:{command:["sh","-c","bun run test"]}}}]' \
-    '[{type:"response_item",payload:{type:"custom_tool_call",name:"exec",input:"const c = \"bun run test\"; await tools.exec_command({cmd:"+JSON.stringify(q(bin+"/fm-project-rules.sh")+" next")+"}); await tools.exec_command({cmd:c});"}}]'; do
+    '[{type:"response_item",payload:{type:"custom_tool_call",name:"exec",input:"const c = \"bun run test\"; await tools.exec_command({cmd:"+JSON.stringify(q(bin+"/fm-project-rules.sh")+" next")+"}); await tools.exec_command({cmd:c});"}}]' \
+    '[{type:"response_item",payload:{type:"custom_tool_call",name:"exec",input:"for (const c of [\"bun run test\"]) await tools.exec_command({cmd:`${c}`});"}}]'; do
     n=$((n + 1))
     admit "xshape$n" codex >/dev/null; codex_fixture "xshape$n"
     codex_log '[started(),dev(block),agents()]'; close_stage
@@ -400,8 +401,12 @@ test_codex_following_the_doorbell_is_not_a_violation() {
   close_stage
   assert_equals "" "$("$PR" scan "$STATE" t1)" "listing, reading and moving the task's own inbox, and a wait, must not count as work before the refresh"
   codex_log '[compacted([]),event()]'; "$PR" detect "$STATE" t1
+  codex_log '[started(),dev(block),agents(),{type:"response_item",timestamp:new Date().toISOString(),payload:{type:"custom_tool_call",name:"exec",input:"for (const [s,c] of [[\"brief\",\"aa\"],[\"flow\",\"bb\"]]) text(await tools.exec_command({cmd:`"+q(bin+"/fm-project-rules.sh")+" serve "+q(state)+" t1 ${s} ${c}`}));"}}]'
+  close_stage
+  assert_equals "" "$("$PR" scan "$STATE" t1)" "helper calls written as a template loop must not count as work before the refresh"
+  codex_log '[compacted([]),event()]'; "$PR" detect "$STATE" t1
   codex_log "[started(),call(\"cat '$inbox/002.msg'; touch elsewhere.txt\")]"
-  assert_contains "$("$PR" scan "$STATE" t1)" "worked-before-refresh stage c2" "an inbox read chained to other work still counts"
+  assert_contains "$("$PR" scan "$STATE" t1)" "worked-before-refresh stage c3" "an inbox read chained to other work still counts"
   pass "a Codex worker that follows the compaction doorbell is not charged for it, and other work before the refresh still is"
 }
 

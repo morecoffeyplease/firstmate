@@ -286,18 +286,24 @@ check_stage() {
 # exact launch fm-spawn builds, captured through a fake pane after a real
 # admission, adds only that limit, and runs it in the lab. The worker reads
 # filler files until the tool compacts by itself.
-# Claude reads whole files, so a few large ones fill its window. Codex cuts
-# long command output short, so it gets many small ones. The limits leave room
-# to read the brief and skills again after the compaction; a limit close to the
-# session's starting size makes each refresh trigger the next compaction.
-FILLER="$TMP/filler"; mkdir -p "$FILLER/claude" "$FILLER/codex"
-if [ -n "${FM_PROJECT_RULES_ACCEPT_REPO:-}" ]; then CODEX_AUTO_LIMIT=100000; CODEX_FILES=200; else CODEX_AUTO_LIMIT=45000; CODEX_FILES=100; fi
-for n in $(seq -w 1 40); do
-  for i in $(seq 1 110); do printf 'Filler %s line %s: nothing here matters to the audit, keep reading.\n' "$n" "$i"; done > "$FILLER/claude/$n.txt"
+# Filler is read one group per turn until the tool compacts by itself, because
+# a tool that batches its reads into one command adds only one command's worth
+# of output to its context. Measured on codex-cli 0.161.0: the fixture session
+# starts near 34,000 tokens and one command adds at most about 10,000. The
+# limits leave room to read the brief and skills again after the compaction; a
+# limit close to the session's starting size makes each refresh trigger the
+# next compaction.
+FILLER="$TMP/filler"; GROUPS_MAX=12
+if [ -n "${FM_PROJECT_RULES_ACCEPT_REPO:-}" ]; then CODEX_AUTO_LIMIT=100000; else CODEX_AUTO_LIMIT=60000; fi
+for g in $(seq -w 1 "$GROUPS_MAX"); do
+  mkdir -p "$FILLER/g$g"
+  for n in 1 2 3 4 5; do
+    for i in $(seq 1 110); do printf 'Filler %s-%s line %s: nothing here matters to the audit, keep reading.\n' "$g" "$n" "$i"; done > "$FILLER/g$g/$n.txt"
+  done
 done
-for n in $(seq -w 1 "$CODEX_FILES"); do
-  for i in $(seq 1 20); do printf 'Filler %s line %s: nothing here matters to the audit, keep reading.\n' "$n" "$i"; done > "$FILLER/codex/$n.txt"
-done
+fill_task() {  # <group number>
+  printf '%s' "Print every file in $FILLER/g$(printf '%02d' "$1"). The files only fill your context: if an output is cut short, move on. Then append the status line 'working: F$1 done' and end your turn."
+}
 replay_worker() {  # <tool> <run>
   local fakebin log launch wt script args_var extra=()
   TOOL=$1; ID="auto-$1-$2"
@@ -306,7 +312,7 @@ replay_worker() {  # <tool> <run>
   FM_HOME="$HOME_DIR" FM_ROOT_OVERRIDE="$ROOT" "$ROOT/bin/fm-brief.sh" "$ID" project --scout >/dev/null || fail "could not scaffold the replay brief"
   node -e 'const fs=require("fs");const [f,task,spec]=process.argv.slice(1);fs.writeFileSync(f,fs.readFileSync(f,"utf8").replace("{TASK}",task).replace("{FIRSTMATE_SPEC}",spec))' \
     "$HOME_DIR/data/$ID/brief.md" "Read-only context audit of this repository copy; change nothing in it. Audit marker: $BRIEF_TOKEN" \
-    "Before stage C, print every file in $FILLER/$1 with its own separate command, one file per command, in name order. The files only fill your context: if an output is cut short, move on to the next file. $(stage_task C) Later stages arrive as messages typed into this session."
+    "First do whatever your project rules gate requires right now. $(fill_task 1) Later steps arrive as messages typed into this session; whenever your context has been compacted, do what your project rules require before anything else."
   wt="$TMP/auto-$1-$2.wt"; git -C "$PROJECT" worktree add --quiet -b "auto-$1-$2" "$wt"
   fakebin=$(fm_test_make_spawn_fakebin "$TMP/auto-$1-$2.fake")
   log="$TMP/auto-$1-$2.launch"; : > "$log"
@@ -429,10 +435,20 @@ for TOOL_NAME in $TOOLS; do
     run=1; automatic=pass
     while [ "$run" -le "$RUNS" ]; do
       replay_worker "$TOOL_NAME" "$run"
-      wait_status "working: C written" 900
-      "$PR" detect "$STATE" "$ID" >/dev/null 2>&1 || true
+      group=1
+      while :; do
+        wait_status "working: F$group done" 600
+        "$PR" detect "$STATE" "$ID" >/dev/null 2>&1 || true
+        [ "$(field compactions)" -lt 1 ] 2>/dev/null || break
+        group=$((group + 1)); [ "$group" -le "$GROUPS_MAX" ] || break
+        say "$(fill_task "$group")"
+      done
       auto_gen=$(field compactions)
       if [ "$auto_gen" -ge 1 ] 2>/dev/null; then
+        sleep 20
+        send_stage C
+        wait_status "working: C written" 900
+        auto_gen=$(field compactions)
         check_stage C "$auto_gen"
         say "/compact"; wait_compactions "$((auto_gen + 1))"
         send_stage D
