@@ -297,6 +297,16 @@ function renderBlock(R, resolved, table) {
   for (const skill of resolved.skills) {
     lines.push(`- ${skill.name} (${skill.invocation === "model" ? "auto" : "manual"}${trigger(skill.required)}): ${skill.description}`);
   }
+  const required = resolved.skills.filter((skill) => skill.required);
+  if (required.length) {
+    lines.push("", "## Required skills", "", "Load each of these through its command at the moment named, and again after any context compaction before the next such moment:", "");
+    for (const skill of required) {
+      let when = "at start, as part of admission";
+      if (skill.required.before_commands) when = `before you run any command matching ${skill.required.before_commands.map((pattern) => `\`${pattern}\``).join(" or ")}`;
+      if (skill.required.on_paths) when = `before you edit any path matching ${skill.required.on_paths.join(", ")}`;
+      lines.push(`- ${skill.name}: ${when}. Load it with: ${helperCommand(R, "serve", q(skill.name))}`);
+    }
+  }
   lines.push("", "## Receipt rows (quote one only when the helper asks for it by number)", "");
   table.forEach((code, index) => lines.push(`row${String(index).padStart(2, "0")}=${code}`));
   return `${lines.join("\n")}\n`;
@@ -406,7 +416,6 @@ function admit(args) {
     used: [],
     compactions: 0,
     answers: {},
-    hits: {},
     violations: [],
     same_turn_calls: 0,
     alarms: {},
@@ -577,7 +586,6 @@ function hook([state, id, event]) {
         ? Boolean(command) && !ours && commandMatches(skill.required.before_commands, command)
         : Boolean(rel) && skill.required.on_paths.some((glob) => pathPattern(glob).test(rel));
       if (!matched) continue;
-      R.hits[skill.name] = true;
       if (payload.agent_id && skill.required.before_commands) return `This command requires skill ${skill.name}, which a child agent cannot be shown to hold. Run it from the main worker.`;
       if (!answered(R, skill.name)) return `This requires skill ${skill.name}, not yet loaded since the last compaction. Run: ${helperCommand(R, "serve", q(skill.name))}`;
     }
@@ -685,7 +693,6 @@ function scanCodex(R, block, file) {
       }
       for (const skill of R.skills.filter((item) => item.required?.before_commands)) {
         if (!commandMatches(skill.required.before_commands, command)) continue;
-        R.hits[skill.name] = true;
         const answer = R.answers[skill.name];
         if (!(answer?.gen === gen && Date.parse(answer.at) <= at)) violate(R, "trigger-skipped", `${skill.name} c${gen}`);
       }
@@ -711,14 +718,21 @@ function scanClaude(R, block) {
 
 function scanOne(state, id, rollout, report = true) {
   const out = [];
+  let steer = "";
   withRecord(state, id, (R) => {
     if (!R) return;
+    const before = R.compactions;
     const block = fs.readFileSync(path.join(dirPath(state, id), "block.txt"), "utf8").trimEnd();
     try {
       if (R.tool === "codex" && rollout) scanCodex(R, block, rollout);
       if (R.tool === "claude") scanClaude(R, block);
     } catch (error) {
       out.push(`scan-error ${String(error.message).slice(0, 160)}`);
+    }
+    // Codex has no hook to tell the worker, so the caller steers it once per
+    // newly detected compaction.
+    if (R.tool === "codex" && R.compactions > before) {
+      steer = `Your context was compacted (stage ${R.stage.name}). Before any other action run: ${helperCommand(R, "next")}`;
     }
     if (!report) return;
     const alarm = (key, text) => {
@@ -755,6 +769,7 @@ function scanOne(state, id, rollout, report = true) {
     if (R.same_turn_calls && stage.closed) alarm(`same-turn:${stage.gen}`, `same-turn-calls ${R.same_turn_calls} tool call(s) ran between a mid-turn compaction and its refresh (${where})`);
   });
   for (const line of out) process.stdout.write(`project-rules: ${id} ${line}\n`);
+  if (steer) process.stdout.write(`fm-steer: ${steer}\n`);
 }
 
 // ---- readiness, size, status ---------------------------------------------
@@ -768,8 +783,11 @@ function ready([state, id]) {
       ...spawnSync("git", ["-C", R.copy, "status", "--porcelain", "--untracked-files=all"], { encoding: "utf8" }).stdout.split("\n").map((line) => line.slice(3)),
     ].filter(Boolean);
     for (const skill of R.skills.filter((entry) => entry.required && !entry.required.at)) {
+      const answer = R.answers[skill.name];
       const touched = skill.required.on_paths?.some((glob) => changed.some((file) => pathPattern(glob).test(file)));
-      if ((touched || R.hits[skill.name]) && !answered(R, skill.name)) open.push(`required skill ${skill.name} is not loaded for the current generation: ${helperCommand(R, "serve", q(skill.name))}`);
+      // A command that ran without its skill stays owed until the skill is read afterwards.
+      const skipped = R.violations.some((entry) => entry.kind === "trigger-skipped" && entry.detail.startsWith(`${skill.name} `) && !(answer && Date.parse(answer.at) >= Date.parse(entry.at)));
+      if ((touched && !answer) || skipped) open.push(`required skill ${skill.name} was due and is not loaded: ${helperCommand(R, "serve", q(skill.name))}`);
     }
     return open;
   });

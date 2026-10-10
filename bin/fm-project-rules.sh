@@ -37,23 +37,38 @@ rollout_for() {  # <state> <id>
   ( . "$SCRIPT_DIR/fm-busy-lib.sh" && fm_busy_codex_rollout_log "$1" "$2" ) 2>/dev/null || true
 }
 
+# Read one task's log. A newly detected Codex compaction comes back as one
+# "fm-steer:" line, which is delivered through the task's steering inbox since
+# Codex has no hook that could tell the worker itself.
+read_log() {  # <scan|detect> <state> <id>
+  local line
+  engine "$1" "$2" "$3" "$(rollout_for "$2" "$3")" | while IFS= read -r line; do
+    case "$line" in
+      "fm-steer: "*)
+        FM_HOME="${FM_HOME:-$(dirname "$2")}" "${FM_PROJECT_RULES_SEND:-$SCRIPT_DIR/fm-send.sh}" "$3" "${line#fm-steer: }" >/dev/null 2>&1 || true
+        ;;
+      *) printf '%s\n' "$line" ;;
+    esac
+  done
+}
+
 verb=$1
 shift
 case "$verb" in
   scan | detect)
     state=${1:-${FM_STATE_OVERRIDE:-${FM_HOME:-$SCRIPT_DIR/..}/state}}
     if [ -n "${2:-}" ]; then
-      engine "$verb" "$state" "$2" "$(rollout_for "$state" "$2")"
+      read_log "$verb" "$state" "$2"
     else
       for record in "$state"/*.project-rules; do
         [ -f "$record" ] || continue
-        id=$(basename "$record" .project-rules)
-        engine scan "$state" "$id" "$(rollout_for "$state" "$id")"
+        read_log scan "$state" "$(basename "$record" .project-rules)"
       done
     fi
     ;;
   next | ready)
-    [ ! -f "$1/$2.project-rules" ] || engine detect "$1" "$2" "$(rollout_for "$1" "$2")" || true
+    # The worker is already asking, so a compaction found here needs no steer.
+    [ ! -f "$1/$2.project-rules" ] || engine detect "$1" "$2" "$(rollout_for "$1" "$2")" >/dev/null || true
     engine "$verb" "$@"
     ;;
   *) engine "$verb" "$@" ;;

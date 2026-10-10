@@ -4860,7 +4860,7 @@ RULES_NOTIFY=
 RULES_BLOCK=
 if [ "$HARNESS" = codex ] && [ "$PROJECT_RULES" -eq 1 ]; then
   sq_rules="$(shell_quote "$FM_ROOT/bin/fm-project-rules.sh")"
-  RULES_NOTIFY="; $sq_rules detect $(shell_quote "$RULES_STATE") $(shell_quote "$ID") >/dev/null 2>&1"
+  RULES_NOTIFY="; FM_HOME=$(shell_quote "$FM_HOME") $sq_rules detect $(shell_quote "$RULES_STATE") $(shell_quote "$ID") >/dev/null 2>&1"
   RULES_BLOCK="-c \"\$($sq_rules emit $(shell_quote "$RULES_STATE") $(shell_quote "$ID"))\" "
 fi
 LAUNCH=${LAUNCH//__RULESNOTIFY__/"$RULES_NOTIFY"}

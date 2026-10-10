@@ -83,7 +83,7 @@ While a stage is open on Claude, the only shell command allowed is one simple co
 
 ## The always-on block
 
-Every rule entry that applies to the tool and is not `native` for it goes into one block, in full and in list order, followed by the skill catalog and a 64-row receipt table.
+Every rule entry that applies to the tool and is not `native` for it goes into one block, in full and in list order, followed by the skill catalog, the list of required skills with the moment each is due and the command that loads it, and a 64-row receipt table.
 Claude receives the block appended to its system prompt, after the worker statement.
 Codex receives it as a `developer_instructions` override, and keeps its hook layer off.
 Both channels are resent by the tool itself after a compaction, so the block needs no refresh.
@@ -128,6 +128,7 @@ While a stage is open, Claude's `PreToolUse` hook refuses every tool except the 
 
 Codex has no hooks, so nothing can refuse a tool call.
 A compaction is detected from the `compacted` record in the session log, at each turn end and on the watcher's cadence.
+Each newly detected compaction is steered to the worker once through its inbox, telling it to run `next`.
 Calls made in the same turn as a compaction inside that turn are counted and reported.
 A project call in a later turn, before the stage is answered, is reported as a violation.
 
@@ -161,7 +162,7 @@ The two compaction signals are the hook and the transcript's `compact_boundary` 
 
 ## Readiness
 
-`bin/fm-pr-check.sh` and `bin/fm-merge-local.sh` refuse while the task's current generation has an open stage, or a required skill whose trigger fired or whose paths the work touched is not read.
+`bin/fm-pr-check.sh` and `bin/fm-merge-local.sh` refuse while the task has an open stage, a command that ran without its required skill and has not been followed by reading it, or changed files under a required skill's paths with that skill never read.
 
 ## Qualification (`config/project-rules-qualified`)
 

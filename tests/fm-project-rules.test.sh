@@ -132,6 +132,7 @@ test_block_receipt_and_chained_reads() {
   assert_not_contains "$block" "Never rename the widget." "a rule for the other tool must not be inlined"
   assert_contains "$block" "- flow (manual; required at start): Workflow to load at start." "the catalog must list a manual required skill with its limit"
   assert_contains "$block" "- tests (auto; required before certain commands): How to run product tests." "the catalog must list every declared skill"
+  assert_contains "$block" '- tests: before you run any command matching `(^|[;&| ])bun run test( |$)`. Load it with: ' "the block must say when a required skill is due and how to load it"
   assert_equals 64 "$(printf '%s\n' "$block" | grep -c '^row[0-9][0-9]=[A-Z2-9]\{6\}$')" "the block must end with a 64-row receipt table"
   out=$("$PR" next "$STATE" t1)
   assert_contains "$out" "stage start) is OPEN" "next must report the open start stage"
@@ -209,8 +210,7 @@ test_compaction_reopens_and_ages_answers() {
   close_stage
   rc=0; hook pretool '{"tool_name":"Bash","tool_input":{"command":"bun run test"}}' >/dev/null 2>&1 || rc=$?
   expect_code 2 "$rc" "a triggered command after a compaction, before the skill is read again"
-  "$PR" ready "$STATE" t1 2>/dev/null && fail "a skill whose trigger fired must be current before readiness"
-  read_all tests >/dev/null; "$PR" ready "$STATE" t1 || fail "readiness must pass once every owed read is current"
+  "$PR" ready "$STATE" t1 || fail "a skill read before its earlier use is not owed again until its next use"
   pass "a compaction opens a new stage with a fresh row and makes earlier skill reads stale"
 }
 
@@ -292,8 +292,12 @@ test_codex_scan_start_and_mid_turn_compaction() {
   codex_log '[call("ls")]'
   assert_equals "" "$("$PR" scan "$STATE" t1)" "a Codex session with the block, the native file, and work only after admission must not alarm"
   codex_log '[compacted([{type:"message",role:"developer",content:[{text:block}]},{type:"message",role:"user",content:[{text:"# AGENTS.md instructions for x\n\n# Agents core\n\nNever rename the widget.\n"}]}]),event(),call("ls"),call("ls")]'
-  "$PR" detect "$STATE" t1
+  printf '#!/bin/sh\nprintf "%%s|%%s\\n" "$1" "$2" >> "%s"\n' "$TMP/xscan.sent" > "$TMP/xscan.send"; chmod +x "$TMP/xscan.send"
+  FM_PROJECT_RULES_SEND="$TMP/xscan.send" "$PR" detect "$STATE" t1
   assert_equals c1 "$(field stage.name)" "a compaction record must open a stage"
+  assert_grep "t1|Your context was compacted (stage c1). Before any other action run: " "$TMP/xscan.sent" "a newly detected Codex compaction must be steered to the worker once"
+  FM_PROJECT_RULES_SEND="$TMP/xscan.send" "$PR" detect "$STATE" t1
+  assert_equals 1 "$(wc -l < "$TMP/xscan.sent" | tr -d ' ')" "a compaction already seen must not be steered again"
   assert_equals true "$(field 'log.evidence[1]')" "a mid-turn compaction record that carries the block is delivery evidence"
   assert_equals 2 "$(field same_turn_calls)" "calls in the same turn as a mid-turn compaction are counted"
   assert_equals 0 "$(field violations.length)" "same-turn calls are counted, not treated as a violation"

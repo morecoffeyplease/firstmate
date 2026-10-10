@@ -38,6 +38,7 @@ fm_live_gate opt-in FM_PROJECT_RULES_LIVE_E2E herdr jq node treehouse git
 
 note() { printf '# %s\n' "$1"; }
 PR="$ROOT/bin/fm-project-rules.sh"
+export FM_PROJECT_RULES_SEND=true  # this guard's own log reads must not steer the worker under test
 TOOLS=${FM_PROJECT_RULES_LIVE_TOOLS:-claude codex}
 RUNS=${FM_PROJECT_RULES_LIVE_RUNS:-2}
 TMP=$(fm_test_tmproot fm-project-rules-live)
@@ -206,7 +207,14 @@ spawn_worker() {  # <tool> <run>
 # check_stage <letter> <generation>: the worker's report and the tool's own log must agree.
 check_stage() {
   local stage=$1 gen=$2 section child token kind alarms
+  local waited=0
   wait_status "working: $stage written" 600
+  # A Codex compaction is steered at the turn end, so give the refresh time to land.
+  while [ "$waited" -lt 300 ]; do
+    "$PR" detect "$STATE" "$ID" >/dev/null 2>&1 || true
+    [ "$(field stage.closed)" = null ] || break
+    sleep 5; waited=$((waited + 5))
+  done
   section=$(awk -v h="## $stage" '$0==h{p=1;next} /^## /{p=0} p' "$REPORT")
   child=$(awk -v h="## CHILD $stage" '$0==h{p=1;next} /^## /{p=0} p' "$REPORT")
   assert_equals "$gen" "$(field compactions)" "$TOOL $VERSION stage $stage: compactions recorded"
@@ -220,7 +228,7 @@ check_stage() {
   done < "$CANARIES"
   assert_contains "$section" "$BRIEF_TOKEN" "$TOOL $VERSION stage $stage: the worker must hold its launch brief"
   if [ -n "$TRIGGER" ]; then
-    assert_equals true "$(field 'Object.keys(hits).length > 0 && Object.keys(hits).every((n) => answers[n] && answers[n].gen === compactions)')" "$TOOL $VERSION stage $stage: the skill for the triggered command must be read in this generation"
+    assert_equals true "$(field 'skills.some((s) => s.required && s.required.before_commands && answers[s.name])')" "$TOOL $VERSION stage $stage: the skill for the triggered command must have been read"
   fi
   [ "$TOOL" != claude ] || assert_contains "$(grep '^EXPLORE:' "$REPORT" | tail -1)" "refused" "$TOOL $VERSION stage $stage: an Explore child must be refused"
   "$PR" ready "$STATE" "$ID" || fail "$TOOL $VERSION stage $stage: readiness must pass once the stage is answered"
@@ -228,6 +236,49 @@ check_stage() {
   assert_equals "" "$alarms" "$TOOL $VERSION stage $stage: the scan of the tool's own log must raise no alarm"
   assert_equals true "$(field "log.evidence[$gen]")" "$TOOL $VERSION stage $stage: the tool's own log must hold the whole block for generation $gen"
   pass "$TOOL $VERSION stage $stage: report and log agree (block $(field block_bytes) bytes, generation $gen)"
+}
+
+# ---- automatic compaction, on a replay of the captured launch -------------
+
+# An untouched spawn cannot lower a tool's compaction limit. This leg takes the
+# exact launch fm-spawn builds, captured through a fake pane after a real
+# admission, adds only that limit, and runs it in the lab. The worker reads
+# filler files until the tool compacts by itself.
+FILLER="$TMP/filler"; mkdir -p "$FILLER"
+for n in 01 02 03 04 05 06 07 08 09 10 11 12 13 14 15 16; do
+  for i in $(seq 1 110); do printf 'Filler %s line %s: nothing here matters to the audit, keep reading.\n' "$n" "$i"; done > "$FILLER/$n.txt"
+done
+replay_worker() {  # <tool>
+  local fakebin log launch wt script args_var extra=()
+  TOOL=$1; ID="auto-$1"
+  HOME_DIR="$TMP/replay-$1"; fm_test_spawn_home "$HOME_DIR" "$1"
+  STATE=$(cd "$HOME_DIR/state" && pwd -P); REPORT="$HOME_DIR/data/$ID/report.md"
+  FM_HOME="$HOME_DIR" FM_ROOT_OVERRIDE="$ROOT" "$ROOT/bin/fm-brief.sh" "$ID" project --scout >/dev/null || fail "could not scaffold the replay brief"
+  node -e 'const fs=require("fs");const [f,task,spec]=process.argv.slice(1);fs.writeFileSync(f,fs.readFileSync(f,"utf8").replace("{TASK}",task).replace("{FIRSTMATE_SPEC}",spec))' \
+    "$HOME_DIR/data/$ID/brief.md" "Read-only context audit of this repository copy; change nothing in it. Audit marker: $BRIEF_TOKEN" \
+    "Before stage C, read every file in $FILLER completely, one file at a time, each with its own command, in name order. $(stage_task C) Later stages arrive as messages typed into this session."
+  wt="$TMP/auto-$1.wt"; git -C "$PROJECT" worktree add --quiet -b "auto-$1" "$wt"
+  fakebin=$(fm_test_make_spawn_fakebin "$TMP/auto-$1.fake")
+  log="$TMP/auto-$1.launch"; : > "$log"
+  args_var="FM_PROJECT_RULES_LIVE_$(printf '%s' "$1" | tr '[:lower:]' '[:upper:]')_ARGS"
+  # shellcheck disable=SC2206 # Word splitting of the caller's extra arguments is intended.
+  [ -z "${!args_var:-}" ] || extra=(${!args_var})
+  FM_ROOT_OVERRIDE='' FM_HOME="$HOME_DIR" FM_SPAWN_NO_GUARD=1 FM_PROJECT_RULES_QUALIFYING=1 \
+    FM_FAKE_PANE_PATH="$wt" FM_FAKE_LAUNCH_LOG="$log" TMUX="fake,1,0" PATH="$fakebin:$PATH" \
+    "$ROOT/bin/fm-spawn.sh" "$ID" "$PROJECT" --scout --harness "$1" ${extra[@]+"${extra[@]}"} > "$TMP/$ID.spawn" 2>&1 \
+    || fail "$1: fm-spawn refused the replay capture: $(tail -5 "$TMP/$ID.spawn" | tr '\n' ' ')"
+  launch=$(grep -E "(^| )$1 " "$log" | tail -1)
+  [ -n "$launch" ] || fail "$1: no launch command was captured"
+  if [ "$1" = codex ]; then
+    launch=${launch/codex /codex -c model_auto_compact_token_limit=${FM_PROJECT_RULES_LIVE_CODEX_AUTO_LIMIT:-30000} }
+  else
+    launch="CLAUDE_CODE_AUTO_COMPACT_WINDOW=${FM_PROJECT_RULES_LIVE_CLAUDE_AUTO_WINDOW:-100000} $launch"
+  fi
+  script="$TMP/$ID.launch.sh"
+  printf '#!/usr/bin/env bash\ncd %q && export FM_TASK_ID=%q && %s\n' "$wt" "$ID" "$launch" > "$script"; chmod +x "$script"
+  PANE=$(lab workspace create --label "auto-$1" --cwd "$wt" --no-focus | jq -r '.result.root_pane.pane_id')
+  lab pane run "$PANE" "$script" >/dev/null || fail "$1: could not start the replayed launch"
+  VERSION=$(field version)
 }
 
 RESULT="$TMP/result.tsv"; : > "$RESULT"
@@ -244,10 +295,21 @@ for TOOL_NAME in $TOOLS; do
     run=$((run + 1))
   done
   printf '%s\t%s\tforced\tpass\n' "$TOOL" "$VERSION" >> "$RESULT"
-  # The automatic leg needs the tool's own compaction limit lowered on the
-  # launch, which an untouched spawn cannot do; until that replay is measured
-  # for this tool and version it is reported as unknown.
-  printf '%s\t%s\tautomatic\tunknown\n' "$TOOL" "$VERSION" >> "$RESULT"
+  replay_worker "$TOOL_NAME"
+  wait_status "working: C written" 900
+  "$PR" detect "$STATE" "$ID" >/dev/null 2>&1 || true
+  auto_gen=$(field compactions)
+  if [ "$auto_gen" -ge 1 ] 2>/dev/null; then
+    check_stage C "$auto_gen"
+    say "/compact"; sleep 45
+    say "$(stage_task D)"
+    check_stage D "$((auto_gen + 1))"
+    printf '%s\t%s\tautomatic\tpass\n' "$TOOL" "$VERSION" >> "$RESULT"
+  else
+    note "$TOOL $VERSION: the lowered limit produced no automatic compaction"
+    printf '%s\t%s\tautomatic\tunknown\n' "$TOOL" "$VERSION" >> "$RESULT"
+  fi
+  say "$([ "$TOOL" = claude ] && printf /exit || printf /quit)"
 done
 
 note "results:"; sed 's/^/#   /' "$RESULT"
