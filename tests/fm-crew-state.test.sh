@@ -41,6 +41,58 @@ run_state() {  # <case-dir> <id>
   PATH="$1/fakebin:$PATH" FM_STATE_OVERRIDE="$1/state" FM_TEST_TASK_ID="$2" "$CREW_STATE" "$2"
 }
 
+new_codex_case() {  # <name> <id>
+  local dir session=fm-lab-fake
+  dir=$(new_case "$1" "$2")
+  fm_write_meta "$dir/state/$2.meta" \
+    "window=$session:w1:p1" \
+    "worktree=$dir/worktree" \
+    "kind=ship" \
+    "harness=codex" \
+    "backend=herdr" \
+    "herdr_session=$session" \
+    "herdr_workspace_id=w1" \
+    "herdr_tab_id=w1:t1" \
+    "herdr_pane_id=w1:p1" \
+    "endpoint_task_id=$2"
+  mkdir -p "$dir/codex/sessions/2026/10/09"
+  cat > "$dir/state/$2.codex-session" <<EOF
+sessions_root=$dir/codex/sessions
+workspace_root=$dir/worktree
+binding_id=test-binding
+EOF
+  cat > "$dir/fakebin/herdr" <<'SH'
+#!/usr/bin/env bash
+set -u
+case "${1:-} ${2:-}" in
+  'status --json') printf '{"server":{"running":true}}\n' ;;
+  'pane get') printf '{"result":{"pane":{"pane_id":"w1:p1"}}}\n' ;;
+  'pane read') printf '%s\n' "${FM_TEST_CODEX_CAPTURE:-› Ask Codex to do anything}" ;;
+  'pane process-info')
+    printf '{"result":{"type":"pane_process_info","process_info":{"pane_id":"w1:p1","shell_pid":100,"foreground_processes":[{"pid":101,"name":"codex","argv0":"codex","argv":["/usr/bin/codex"]}]}}}\n'
+    ;;
+  *) printf '{"error":{"code":"unexpected_test_command"}}\n' ;;
+esac
+SH
+  chmod +x "$dir/fakebin/herdr"
+  printf '%s\n' "$dir"
+}
+
+run_codex_state() {  # <case-dir> <id> [pane-capture]
+  PATH="$1/fakebin:$PATH" \
+    FM_STATE_OVERRIDE="$1/state" \
+    CODEX_HOME="$1/codex" \
+    FM_TEST_CODEX_CAPTURE="${3:-}" \
+    "$CREW_STATE" "$2"
+}
+
+write_codex_rollout() {  # <case-dir> <id> <jsonl-records>
+  local dir=$1 id=$2 records=$3
+  printf '%s\n' "{\"type\":\"session_meta\",\"payload\":{\"cwd\":\"$dir/worktree\"}}" \
+    > "$dir/codex/sessions/2026/10/09/rollout-test.jsonl"
+  printf '%b\n' "$records" >> "$dir/codex/sessions/2026/10/09/rollout-test.jsonl"
+}
+
 write_idle_record() {  # <case-dir> <id>
   local dir=$1 id=$2 generation
   generation=$("$ROOT/bin/fm-busy-event.sh" arm "$dir/state" "$id") || fail "could not arm busy record"
@@ -134,6 +186,76 @@ test_missing_endpoint_does_not_trust_status_log() {
   pass 'missing endpoint cannot reuse a stale state event'
 }
 
+test_codex_herdr_busy_never_reads_idle_during_background_command() {
+  local dir out
+  dir=$(new_codex_case codex-working codex-working)
+  write_codex_rollout "$dir" codex-working \
+    '{"type":"event_msg","payload":{"type":"task_started","turn_id":"turn-1"}}'
+  out=$(run_codex_state "$dir" codex-working)
+  assert_contains "$out" 'state: working' 'a live Codex turn waiting on a command remains working'
+  assert_contains "$out" 'harness busy (codex-rollout)' 'working state identifies Codex rollout events'
+  pass 'a busy Codex worker with an empty-looking composer never reads idle'
+}
+
+test_codex_herdr_long_tool_call_never_reads_idle() {
+  local dir out
+  dir=$(new_codex_case codex-command codex-command)
+  write_codex_rollout "$dir" codex-command \
+    '{"type":"event_msg","payload":{"type":"task_started","turn_id":"turn-1"}}\n{"type":"response_item","payload":{"type":"function_call","call_id":"call-1","name":"exec_command"}}'
+  out=$(run_codex_state "$dir" codex-command)
+  assert_contains "$out" 'state: working' 'an open Codex tool call means the worker is working'
+  assert_not_contains "$out" 'state: idle' 'a tool call waiting for output cannot be idle'
+  pass 'Codex remains working while a long tool call has no matching output'
+}
+
+test_codex_herdr_idle_at_prompt() {
+  local dir out
+  dir=$(new_codex_case codex-idle codex-idle)
+  write_codex_rollout "$dir" codex-idle \
+    '{"type":"event_msg","payload":{"type":"task_started","turn_id":"turn-1"}}\n{"type":"event_msg","payload":{"type":"task_complete","turn_id":"turn-1"}}'
+  printf 'working: old prompt submission\n' > "$dir/state/codex-idle.status"
+  out=$(run_codex_state "$dir" codex-idle)
+  assert_contains "$out" 'state: idle' 'the settled Codex rollout supersedes an old status event'
+  assert_contains "$out" 'harness idle at prompt (codex-rollout)' 'idle identifies the Codex event source'
+  pass 'Codex Herdr reports the settled idle prompt'
+}
+
+test_codex_herdr_needs_input_prompt_is_blocked() {
+  local dir out
+  dir=$(new_codex_case codex-input codex-input)
+  write_codex_rollout "$dir" codex-input \
+    '{"type":"event_msg","payload":{"type":"task_started","turn_id":"turn-1"}}\n{"type":"event_msg","payload":{"type":"task_complete","turn_id":"turn-1"}}'
+  out=$(run_codex_state "$dir" codex-input 'Waiting for your input')
+  assert_contains "$out" 'state: blocked' 'a visible Codex input prompt is needs-input state'
+  assert_contains "$out" 'harness needs input (codex-pane-input)' 'blocked state identifies its pane source'
+  pass 'Codex pane capture reports a needs-input prompt as blocked'
+}
+
+test_codex_herdr_ignores_previous_rollout() {
+  local dir out
+  dir=$(new_codex_case codex-prior codex-prior)
+  printf '%s\n%s\n' \
+    "{\"type\":\"session_meta\",\"payload\":{\"cwd\":\"$dir/worktree\"}}" \
+    '{"type":"event_msg","payload":{"type":"task_started","turn_id":"old-turn"}}' \
+    > "$dir/codex/sessions/2026/10/09/rollout-prior.jsonl"
+  printf 'prior_rollout=%s/codex/sessions/2026/10/09/rollout-prior.jsonl\n' "$dir" \
+    >> "$dir/state/codex-prior.codex-session"
+  write_codex_rollout "$dir" codex-prior \
+    '{"type":"event_msg","payload":{"type":"task_started","turn_id":"turn-1"}}\n{"type":"event_msg","payload":{"type":"task_complete","turn_id":"turn-1"}}'
+  out=$(run_codex_state "$dir" codex-prior)
+  assert_contains "$out" 'state: idle' 'a prior active rollout must not bind to a replacement worker'
+  pass 'Codex rollout binding excludes the previous worker incarnation'
+}
+
+test_codex_herdr_unknown_without_rollout_stays_unknown() {
+  local dir out
+  dir=$(new_codex_case codex-unknown codex-unknown)
+  out=$(run_codex_state "$dir" codex-unknown)
+  assert_contains "$out" 'state: unknown' 'a missing rollout does not prove an idle prompt'
+  assert_contains "$out" 'codex-rollout-unavailable' 'missing evidence is identified'
+  pass 'Codex Herdr stays unknown when no task-bound rollout is available'
+}
+
 test_usage_error_is_distinct() {
   local out rc
   out=$("$CREW_STATE" 2>&1); rc=$?
@@ -149,6 +271,12 @@ test_terminal_status_supersedes_stale_decision
 test_unrecognized_status_event_is_not_current_state
 test_missing_busy_record_does_not_infer_from_stale_log
 test_missing_endpoint_does_not_trust_status_log
+test_codex_herdr_busy_never_reads_idle_during_background_command
+test_codex_herdr_long_tool_call_never_reads_idle
+test_codex_herdr_idle_at_prompt
+test_codex_herdr_needs_input_prompt_is_blocked
+test_codex_herdr_ignores_previous_rollout
+test_codex_herdr_unknown_without_rollout_stays_unknown
 test_usage_error_is_distinct
 
 echo 'all fm-crew-state tests passed'

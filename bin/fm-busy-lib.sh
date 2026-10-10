@@ -34,8 +34,8 @@
 #   claude-hook      Claude lifecycle hooks (UserPromptSubmit/Stop/StopFailure/SessionEnd)
 #   gemini-hook      Gemini agent hooks (BeforeAgent opens; AfterAgent and
 #                    SessionEnd close)
-#   codex-hook, codex-appserver  reserved: Codex, gated by
-#                    fm_busy_codex_semantic_source
+#   codex-hook, codex-appserver  reserved for Codex-native turn lifecycle,
+#                    gated by fm_busy_codex_semantic_source
 #   kimi-wire, kimi-hook  reserved: standalone Kimi, gated by fm_busy_kimi_verified
 # Firstmate-owned sources accepted for every converted adapter:
 #   fm-spawn         the launch-brief turn seeded at spawn
@@ -44,9 +44,10 @@
 # Classifier-only sources (never written into a record):
 #   endpoint-gone, herdr-native, grok-regex, rovo-regex, agy-regex, muse-session-log,
 #   cursor-transcript, missing, malformed, gen-mismatch, source-mismatch,
-#   kimi-unverified, codex-unverified, capture-failed, no-target
+#   kimi-unverified, codex-unverified, codex-rollout, codex-pane-input,
+#   capture-failed, no-target
 #
-# Classification (fm_busy_classify): busy | idle | unknown | dead, always
+# Classification (fm_busy_classify): busy | idle | blocked | unknown | dead, always
 # with the producing source as the second token. Precedence:
 #   1. dead endpoint (fm_busy_classify_live only) -> dead endpoint-gone
 #   2. standalone Kimi before verification       -> unknown kimi-unverified
@@ -82,13 +83,14 @@
 # cleared. See fm_busy_cursor_turn_state for the fold. Cursor's rendered
 # `ctrl+c to stop` footer is deliberately not a state source here.
 #
-# Codex negotiation (fm_busy_codex_appserver_observable,
+# Codex-native negotiation (fm_busy_codex_appserver_observable,
 # fm_busy_codex_hooks_verified): the approved contract prefers Codex's
 # app-server turn lifecycle with capability negotiation, and sanctions its
 # stable lifecycle hooks as the intermediate. Neither is usable on the
 # installed binary, so Codex classifies unknown codex-unverified rather than
 # falling back to idle, and fm-spawn installs no Codex busy wiring.
-# docs/verification/supervision.md owns the evidence for both probes.
+# docs/verification/supervision.md owns the evidence for both probes. Herdr's
+# separate rollout-event path is verified for Codex 0.161.0 below.
 #
 # Sourcing: set -u and set -e safe; no subshell-unfriendly globals.
 
@@ -830,6 +832,159 @@ fm_busy_cursor_turn_state() {  # <transcript>
   '
 }
 
+# Codex's own rollout transcript is append-only JSONL under
+# <CODEX_HOME>/sessions/YYYY/MM/DD/rollout-*.jsonl. fm-spawn records the
+# sessions root, exact worktree, a unique binding id, and all matching prior
+# rollout files so a reused worktree never reads its previous worker's turns.
+fm_busy_codex_binding_path() {  # <state-dir> <id>
+  printf '%s/%s.codex-session' "$1" "$2"
+}
+
+fm_busy_codex_binding_field() {  # <state-dir> <id> <key>
+  local path line key=$3
+  path=$(fm_busy_codex_binding_path "$1" "$2")
+  [ -f "$path" ] || return 1
+  while IFS= read -r line || [ -n "$line" ]; do
+    case "$line" in
+      "$key="*)
+        line=${line#"$key="}
+        [ -n "$line" ] || return 1
+        printf '%s' "$line"
+        return 0
+        ;;
+    esac
+  done < "$path"
+  return 1
+}
+
+fm_busy_codex_binding_has_prior() {  # <state-dir> <id> <rollout>
+  local path line
+  path=$(fm_busy_codex_binding_path "$1" "$2")
+  [ -f "$path" ] || return 1
+  while IFS= read -r line || [ -n "$line" ]; do
+    [ "$line" = "prior_rollout=$3" ] && return 0
+  done < "$path"
+  return 1
+}
+
+# fm_busy_codex_matching_rollouts: main rollout files whose session_meta cwd is
+# exactly this task's worktree. A depth-bounded walk excludes any future nested
+# helper logs and reads only the first JSONL record in each file.
+fm_busy_codex_matching_rollouts() {  # <sessions-root> <workspace-root>
+  local root=$1 workspace=$2
+  [ -d "$root" ] || return 1
+  command -v node >/dev/null 2>&1 || return 1
+  node - "$root" "$workspace" <<'NODE'
+const fs = require("fs");
+const path = require("path");
+const [root, workspace] = process.argv.slice(2);
+
+function directories(parent) {
+  try {
+    return fs.readdirSync(parent, { withFileTypes: true })
+      .filter((entry) => entry.isDirectory())
+      .map((entry) => path.join(parent, entry.name));
+  } catch {
+    return [];
+  }
+}
+
+function matchingWorkspace(file) {
+  let descriptor;
+  try {
+    descriptor = fs.openSync(file, "r");
+    const buffer = Buffer.alloc(65536);
+    const length = fs.readSync(descriptor, buffer, 0, buffer.length, 0);
+    const newline = buffer.indexOf(10, 0);
+    if (newline < 0 || newline >= length) return false;
+    const record = JSON.parse(buffer.subarray(0, newline).toString("utf8"));
+    return record?.type === "session_meta" && record?.payload?.cwd === workspace;
+  } catch {
+    return false;
+  } finally {
+    if (descriptor !== undefined) fs.closeSync(descriptor);
+  }
+}
+
+for (const year of directories(root)) {
+  for (const month of directories(year)) {
+    for (const day of directories(month)) {
+      let entries;
+      try {
+        entries = fs.readdirSync(day, { withFileTypes: true });
+      } catch {
+        continue;
+      }
+      for (const entry of entries) {
+        if (!entry.isFile() || !entry.name.startsWith("rollout-") || !entry.name.endsWith(".jsonl")) continue;
+        const file = path.join(day, entry.name);
+        if (matchingWorkspace(file)) process.stdout.write(`${file}\n`);
+      }
+    }
+  }
+}
+NODE
+}
+
+# fm_busy_codex_rollout_log: the one new rollout for this task's exact
+# worktree, or failure if there is no candidate, more than one candidate, or
+# the binding is absent. Ambiguity remains unknown instead of guessing.
+fm_busy_codex_rollout_log() {  # <state-dir> <id>
+  local root workspace candidate selected=''
+  root=$(fm_busy_codex_binding_field "$1" "$2" sessions_root) || return 1
+  workspace=$(fm_busy_codex_binding_field "$1" "$2" workspace_root) || return 1
+  [ -n "$(fm_busy_codex_binding_field "$1" "$2" binding_id 2>/dev/null || true)" ] || return 1
+  while IFS= read -r candidate; do
+    [ -n "$candidate" ] || continue
+    fm_busy_codex_binding_has_prior "$1" "$2" "$candidate" && continue
+    [ -z "$selected" ] || return 1
+    selected=$candidate
+  done <<EOF
+$(fm_busy_codex_matching_rollouts "$root" "$workspace")
+EOF
+  [ -n "$selected" ] && [ -f "$selected" ] && [ ! -L "$selected" ] || return 1
+  case "$selected" in "$root"/*) ;; *) return 1 ;; esac
+  printf '%s' "$selected"
+}
+
+# Fold Codex's event_msg task lifecycle and response_item tool-call lifecycle.
+# Any active turn or tool call is positive proof of work, including a long
+# foreground command while the rendered composer looks empty. Settled requires
+# at least one complete lifecycle record; absent or malformed data is unknown.
+fm_busy_codex_rollout_state() {  # <rollout-jsonl>
+  local events
+  [ -f "$1" ] && [ ! -L "$1" ] || { printf 'unknown'; return 0; }
+  command -v jq >/dev/null 2>&1 || { printf 'unknown'; return 0; }
+  events=$(jq -Rr '
+    def valid_id: type == "string" and test("^[A-Za-z0-9._-]+$");
+    fromjson as $row
+    | if $row.type == "event_msg" and $row.payload.type == "task_started" then
+        if ($row.payload.turn_id | valid_id) then ["turn-start", $row.payload.turn_id] | @tsv else "invalid" end
+      elif $row.type == "event_msg" and ($row.payload.type == "task_complete" or $row.payload.type == "turn_aborted") then
+        if ($row.payload.turn_id | valid_id) then ["turn-end", $row.payload.turn_id] | @tsv else "invalid" end
+      elif $row.type == "response_item" and ($row.payload.type == "function_call" or $row.payload.type == "custom_tool_call") then
+        if ($row.payload.call_id | valid_id) then ["call-start", $row.payload.call_id] | @tsv else "invalid" end
+      elif $row.type == "response_item" and ($row.payload.type == "function_call_output" or $row.payload.type == "custom_tool_call_output") then
+        if ($row.payload.call_id | valid_id) then ["call-end", $row.payload.call_id] | @tsv else "invalid" end
+      else empty end
+  ' "$1" 2>/dev/null) || { printf 'unknown'; return 0; }
+  printf '%s\n' "$events" | awk -F '\t' '
+    $1 == "turn-start" { turns[$2] = 1; seen = 1; next }
+    $1 == "turn-end" { delete turns[$2]; seen = 1; next }
+    $1 == "call-start" { calls[$2] = 1; seen = 1; next }
+    $1 == "call-end" { delete calls[$2]; seen = 1; next }
+    $1 == "invalid" { invalid = 1 }
+    END {
+      for (id in turns) active = 1
+      for (id in calls) active = 1
+      if (invalid) print "unknown"
+      else if (active) print "busy"
+      else if (seen) print "idle"
+      else print "unknown"
+    }
+  '
+}
+
 # fm_busy_grok_tail_busy: the Grok-only temporary rendered-tail fallback.
 # Consumes the tail on stdin; 0 when Grok's verified busy signature matches.
 # FM_BUSY_REGEX still globally overrides the signature, mirroring the
@@ -869,13 +1024,19 @@ fm_busy_agy_tail_busy() {
 
 # fm_busy_classify: semantic classification for a task whose endpoint the
 # caller has already established as present. Prints "<verdict> <source>":
-# busy|idle|unknown plus the producing source (see header). Never probes
-# process state. <tail40> is optional pre-captured plain output used only by
+# busy|idle|blocked|unknown plus the producing source (see header). Only the
+# Codex-on-Herdr path validates process state. <tail40> is optional pre-captured plain output used only by
 # the grok, rovo, and agy arms; when absent each captures through
 # fm_backend_capture if available, else reports unknown capture-failed.
 fm_busy_classify() {  # <backend> <target> <harness> <id> <state-dir> [tail40]
   local backend=$1 target=$2 harness=$3 id=$4 state=$5 tail40=${6-}
   local out rc r_state r_source native log
+  case "$harness:$backend" in
+    codex*:herdr)
+      fm_busy_codex_herdr_classify "$target" "$id" "$state"
+      return 0
+      ;;
+  esac
   case "$harness" in
     kimi*)
       if ! fm_busy_kimi_verified; then
@@ -1018,6 +1179,51 @@ fm_busy_classify() {  # <backend> <target> <harness> <id> <state-dir> [tail40]
       ;;
   esac
   printf 'unknown missing'
+}
+
+# Codex's TUI uses its own append-only rollout transcript rather than Herdr's
+# agent registry. Live verified on 2026-10-09 with codex-cli 0.161.0; see
+# docs/verification/runtime-backends.md under "Codex worker state on Herdr".
+# Pane capture is consulted only for a visible Codex prompt that needs input.
+fm_busy_codex_needs_input_prompt() {  # <pane-capture>
+  printf '%s\n' "$1" | tail -24 | grep -Eiq \
+    '(^|[^[:alpha:]])(approval required|needs your approval|waiting for your input|do you want to run this command|press enter to confirm|press enter to continue)([^[:alpha:]]|$)'
+}
+
+fm_busy_codex_herdr_classify() {  # <target> <id> <state-dir>
+  local target=$1 id=$2 state=$3 rollout lifecycle capture process_state
+  if ! command -v fm_backend_capture >/dev/null 2>&1 \
+    || ! command -v fm_backend_herdr_parse_target >/dev/null 2>&1 \
+    || ! command -v fm_backend_herdr_pane_process_state >/dev/null 2>&1; then
+    printf 'unknown codex-rollout-unavailable'
+    return 0
+  fi
+  fm_backend_herdr_parse_target "$target" || {
+    printf 'unknown codex-process-unverified'
+    return 0
+  }
+  process_state=$(fm_backend_herdr_pane_process_state \
+    "$FM_BACKEND_HERDR_SESSION" "$FM_BACKEND_HERDR_PANE")
+  if [ "$process_state" != agent ]; then
+    printf 'unknown codex-process-unverified'
+    return 0
+  fi
+  rollout=$(fm_busy_codex_rollout_log "$state" "$id") || {
+    printf 'unknown codex-rollout-unavailable'
+    return 0
+  }
+  lifecycle=$(fm_busy_codex_rollout_state "$rollout")
+  case "$lifecycle" in
+    busy) printf 'busy codex-rollout'; return 0 ;;
+  esac
+  capture=$(fm_backend_capture herdr "$target" 40 2>/dev/null) || capture=
+  if fm_busy_codex_needs_input_prompt "$capture"; then
+    printf 'blocked codex-pane-input'
+  elif [ "$lifecycle" = idle ]; then
+    printf 'idle codex-rollout'
+  else
+    printf 'unknown codex-rollout'
+  fi
 }
 
 # fm_busy_classify_live: fm_busy_classify behind the one process-level

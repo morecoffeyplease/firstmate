@@ -1044,14 +1044,15 @@ secondmate_home_summary_json() {  # <backlog-json-file> <tasks-json-file> <produ
     | ([ $owned_in_flight[] as $work
          | select($work.current_role != "program")
          | $tasks[]
-         | select(.id == $work.id and .current_state.state == "working")
+         | select(.id == $work.id)
          | {id,kind,state:.current_state.state,
             repo:(($work.repo // .project // null) | if . == null then null else trunc(120) end),
             name:(($work.title // null) | if . == null then null else trunc(70) end),
             issue:(.issue // null),pr_url:(.pr.url // null),
             decision_keys:(.decision_keys // []),
             source:.current_state.source,
-            doing:((.current_state.detail // "") | trunc(120))} ]) as $active_all
+            doing:((.current_state.detail // "") | trunc(120))} ]) as $child_lanes_all
+    | ($child_lanes_all | map(select(.state == "working"))) as $active_all
     | ($captain_holds_all
        + ([ $tasks[] as $t | ($t.hints.open_decisions // [])[]
             | {id:$t.id,key,verb,summary:(.summary | trunc(160)),reason:null,source:"status",target_task_id:$t.id} ])) as $decisions_all
@@ -1103,6 +1104,7 @@ secondmate_home_summary_json() {  # <backlog-json-file> <tasks-json-file> <produ
         invalidity:$invalidity,
         state:$state,
         active_children:$active_all[:$child_n],
+        child_lanes:$child_lanes_all[:$child_n],
         decisions_open:$decisions_all[:$decisions_n],
         product_decisions:$product_decisions.open,
         product_decision_count:$product_decisions.total,
@@ -1135,6 +1137,7 @@ secondmate_home_summary_json() {  # <backlog-json-file> <tasks-json-file> <produ
           endpoint:(.endpoint + {target:((.endpoint.target // null) | if . == null then null else trunc(240) end)})}][:$child_n]),
         counts:{
           active_children:($active_all | length),
+          child_lanes:($child_lanes_all | length),
           decisions_open:($decisions_all | length),
           holds:($holds_all | length),
           queued:($queued_all | length),
@@ -1143,6 +1146,7 @@ secondmate_home_summary_json() {  # <backlog-json-file> <tasks-json-file> <produ
         },
         omitted:[
           (if ($active_all | length) > $child_n then {surface:"active_children",count:(($active_all | length) - $child_n)} else empty end),
+          (if ($child_lanes_all | length) > $child_n then {surface:"child_lanes",count:(($child_lanes_all | length) - $child_n)} else empty end),
           (if ($decisions_all | length) > $decisions_n then {surface:"decisions_open",count:(($decisions_all | length) - $decisions_n)} else empty end),
           (if ($queued_all | length) > $queued_n then {surface:"queued",count:(($queued_all | length) - $queued_n)} else empty end),
           (if ($tasks | length) > $child_n then {surface:"endpoints",count:(($tasks | length) - $child_n)} else empty end),
@@ -1890,7 +1894,7 @@ secondmate_current_json() {  # <parent-tasks-json-file> <output-file>
          provenance:{selected:"structured-home",structured_home:$home,summary_source:$summary_source,summary_valid:$summary_valid,
            trust:(if $summary_valid then "complete" else "partial-structured" end),parent_event_role:"historical-only"},
          freshness:{status:$summary_freshness,observed_at:$observed,age_seconds:$summary_age},
-         active_children:$summary.active_children,
+         active_children:$summary.active_children,child_lanes:($summary.child_lanes // $summary.active_children),
          decisions_open:$summary.decisions_open,
          product_decisions:($summary.product_decisions // []),
          product_decision_count:($summary.product_decision_count // 0),
@@ -1928,7 +1932,7 @@ secondmate_current_json() {  # <parent-tasks-json-file> <output-file>
          reconcile_inventory:(if $summary_sampled then $summary.invalidity else null end),
          provenance:{selected:$provenance,structured_home:($home | if . == "" then null else . end),parent_event_role:"fallback-only-not-current"},
          freshness:{status:$freshness,observed_at:$observed,age_seconds:$event_age},
-         active_children:[],decisions_open:[],holds:[],queued:[],landed:[],endpoints:[],counts:{active_children:0,decisions_open:0,holds:0,queued:0,landed:0,endpoints:0},omitted:[],
+         active_children:[],child_lanes:[],decisions_open:[],holds:[],queued:[],landed:[],endpoints:[],counts:{active_children:0,child_lanes:0,decisions_open:0,holds:0,queued:0,landed:0,endpoints:0},omitted:[],
          parent_event:{raw:$event_raw,note:$event_note,age_seconds:$event_age,open_activities:$activities,open_decisions:$decisions,activity_scan:$activity_scan},
          terminal_evidence:$terminal,contradiction:false}' >> "$records_file" || return 1
     fi

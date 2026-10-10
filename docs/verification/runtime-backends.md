@@ -2063,3 +2063,16 @@ A throwaway scout was spawned through `bin/fm-spawn.sh --scout --harness omp --m
 6. `bin/fm-control.sh <id> exit` stopped the agent and `bin/fm-teardown.sh` returned the worktree and closed the item.
 
 `FM_OMP_LIVE_E2E=1 tests/fm-omp-primary-live-e2e.test.sh` refreshes the primary evidence; the worker path above is refreshed by repeating the scout dispatch after any omp upgrade.
+
+## Codex worker state on Herdr
+
+Verified on 2026-10-09 with codex-cli 0.161.0 and Herdr 0.9.3 (client and server, protocol 22) in the isolated task lab session.
+The verified adapter path is `fm_busy_codex_herdr_classify` in `bin/fm-busy-lib.sh`, which folds Codex's task-bound rollout JSONL and verifies the live Codex process through Herdr pane process information.
+The same real Codex worker first reproduced the issue as `state: unknown · source: pane · harness state unavailable (unknown codex-unverified)` while idle at its prompt and while waiting on a background command.
+`fm-spawn` records the Codex sessions root, exact worktree, and pre-existing matching rollout files in `state/<id>.codex-session`, so the adapter accepts only one new rollout for that task's worktree.
+Codex `task_started` and open tool-call records classify as working until matching completion records arrive, including while a long shell command runs and the visible composer looks empty.
+The verified live guard reported the settled prompt as `state: idle · source: pane · harness idle at prompt (codex-rollout)` and a normal started turn as `state: working · source: pane · harness busy (codex-rollout)`.
+When a turn ends with a prompt asking for input, pane capture maps the visible prompt to `blocked codex-pane-input`; otherwise settled rollout lifecycle data classifies as idle.
+The live guard command is `FM_CREW_STATE_CODEX_HERDR_LIVE_E2E=1 tests/fm-crew-state-codex-herdr-live-e2e.test.sh`.
+Portable behavioral cases, including a busy worker whose rendered pane looks like an empty Codex prompt, are in `tests/fm-crew-state.test.sh`.
+The shared Claude path remains covered by the same suite.
