@@ -340,12 +340,12 @@ test_codex_scan_between_turn_compaction_and_triggers() {
   assert_equals "" "$("$PR" scan "$STATE" t1)" "the block re-sent at the next turn start is delivery evidence"
   codex_log '[call("ls "+bin+"/fm-project-rules.sh && bun run test")]'
   "$PR" detect "$STATE" t1
-  read_all tests >/dev/null
-  out=$("$PR" ready "$STATE" t1 2>&1) && fail "a violation the supervisor has not been told about must block readiness, even after the skill is read"
+  out=$("$PR" ready "$STATE" t1 2>&1) && fail "a violation the supervisor has not been told about must block readiness"
   assert_contains "$out" "has not reached the supervisor yet" "the readiness refusal must say the violation is unreported"
   out=$("$PR" scan "$STATE" t1)
   assert_contains "$out" "trigger-skipped tests c1" "a triggered command without its skill must alarm on Codex, even when it mentions the helper"
-  "$PR" ready "$STATE" t1 || fail "readiness must pass once the violation is reported and the skill was read after it"
+  "$PR" ready "$STATE" t1 2>/dev/null && fail "a reported violation must still block readiness while its skill is unread"
+  read_all tests >/dev/null; "$PR" ready "$STATE" t1 || fail "readiness must pass once the violation is reported and the skill is read after it"
   pass "the Codex scan accepts next-turn evidence and catches a triggered command run without its skill"
 }
 
@@ -358,14 +358,15 @@ test_codex_scan_reads_every_command_shape() {
     '[{type:"response_item",payload:{type:"custom_tool_call",name:"exec",input:"await tools.exec_command({cmd:`bun run test`});"}}]' \
     '[{type:"response_item",payload:{type:"custom_tool_call",name:"exec",input:"await tools.exec_command({cmd:'"'"'bun run test'"'"'});"}}]' \
     '[{type:"response_item",payload:{type:"custom_tool_call",name:"exec",input:"const c = \"bun run test\"; await tools.exec_command({cmd:c});"}}]' \
-    '[{type:"response_item",payload:{type:"local_shell_call",action:{command:["sh","-c","bun run test"]}}}]'; do
+    '[{type:"response_item",payload:{type:"local_shell_call",action:{command:["sh","-c","bun run test"]}}}]' \
+    '[{type:"response_item",payload:{type:"custom_tool_call",name:"exec",input:"const c = \"bun run test\"; await tools.exec_command({cmd:"+JSON.stringify(q(bin+"/fm-project-rules.sh")+" next")+"}); await tools.exec_command({cmd:c});"}}]'; do
     n=$((n + 1))
     admit "xshape$n" codex >/dev/null; codex_fixture "xshape$n"
     codex_log '[started(),dev(block),agents()]'; close_stage
     codex_log "$shape"
     assert_contains "$("$PR" scan "$STATE" t1)" "trigger-skipped tests c0" "Codex command shape $n must be recognized"
   done
-  pass "the Codex scan finds a triggering command in every call shape: JSON arguments, batches, each quote style, a variable, and a shell action"
+  pass "the Codex scan finds a triggering command in every call shape: JSON arguments, batches, each quote style, a variable, a variable beside a helper call, and a shell action"
 }
 
 test_codex_read_then_run_in_one_call_is_in_order() {
@@ -385,6 +386,23 @@ test_codex_read_then_run_in_one_call_is_in_order() {
   codex_log "[{type:'response_item',timestamp:new Date().toISOString(),payload:{type:'custom_tool_call',call_id:'c2',name:'exec',input:$run_cmd+$read_cmd}}]"
   assert_contains "$("$PR" scan "$STATE" t1)" "trigger-skipped tests c0" "a call that runs the command before reading the skill is a violation"
   pass "one Codex call that finishes the skill and then runs its command is accepted, and the reverse order is not"
+}
+
+test_codex_following_the_doorbell_is_not_a_violation() {
+  local inbox
+  admit xbell codex >/dev/null; codex_fixture xbell
+  inbox="$STATE/t1.inbox"
+  codex_log '[started(),dev(block),agents()]'; close_stage
+  codex_log '[compacted([]),event()]'
+  FM_PROJECT_RULES_SEND=true "$PR" ready "$STATE" t1 >/dev/null 2>&1 || true
+  assert_equals c1 "$(field stage.name)" "a compaction first seen by a readiness check must open its stage"
+  codex_log "[started(),dev(block),agents(),call(\"ls '$inbox'/*.msg\"),call(\"cat '$inbox/001.msg' && mv '$inbox/001.msg' '$inbox/handled/'\"),{type:'response_item',timestamp:new Date().toISOString(),payload:{type:'function_call',name:'wait',arguments:'{\"timeout_ms\":10000}'}},call(bin+'/fm-project-rules.sh next')]"
+  close_stage
+  assert_equals "" "$("$PR" scan "$STATE" t1)" "listing, reading and moving the task's own inbox, and a wait, must not count as work before the refresh"
+  codex_log '[compacted([]),event()]'; "$PR" detect "$STATE" t1
+  codex_log "[started(),call(\"cat '$inbox/002.msg'; touch elsewhere.txt\")]"
+  assert_contains "$("$PR" scan "$STATE" t1)" "worked-before-refresh stage c2" "an inbox read chained to other work still counts"
+  pass "a Codex worker that follows the compaction doorbell is not charged for it, and other work before the refresh still is"
 }
 
 test_codex_scan_is_idempotent_and_cursor_safe() {
@@ -457,7 +475,15 @@ test_failures_inside_the_hook_and_scan_are_never_silent() {
   out=$("$PR" scan "$STATE")
   assert_contains "$out" "project-rules: t1 scan-failed" "a scan that cannot read a record must raise an alarm"
   assert_equals "" "$("$PR" scan "$STATE")" "the same scan failure is reported once"
-  pass "a failure inside the tool hook refuses the call, and a failed scan raises one alarm"
+  "$PR" ready "$STATE" t1 2>/dev/null && fail "readiness must refuse when the record cannot be read"
+  out=$(PATH="$nonode" /bin/bash "$PR" scan "$STATE") && fail "a scan with node missing must not report success"
+  assert_contains "$out" "project-rules: t1 scan-failed node is required" "a scan with node missing must still raise an alarm"
+  assert_equals "" "$(PATH="$nonode" /bin/bash "$PR" scan "$STATE" || true)" "the missing-node alarm is raised once"
+  admit infra2 claude >/dev/null; claude_evidence; close_stage
+  "$PR" ready "$STATE" t1 || fail "a verified task must be ready before its evidence is removed"
+  mv "$STATE/t1.project-rules.d/block.txt" "$STATE/t1.project-rules.d/block.gone"
+  "$PR" ready "$STATE" t1 2>/dev/null && fail "readiness must refuse when the log can no longer be checked against the block"
+  pass "a failure inside the tool hook refuses the call, a failed scan raises one alarm, and a failed read refuses readiness"
 }
 
 test_no_node_is_needed_without_declared_rules() {
@@ -495,6 +521,8 @@ test_relaunch_admits_a_copy_with_uncommitted_work() {
   printf 'work in progress\n' > "$COPY/unsaved.txt"; printf 'more\n' >> "$COPY/README.md"
   "$PR" admit "$STATE" t1 "$COPY" claude --backend herdr >/dev/null || fail "a second admission must accept the worker's own uncommitted work"
   assert_equals start "$(field stage.name)" "a relaunch starts a fresh start stage"
+  edit_list "$COPY" 'L.prepare={argv:["sh","-c","echo more >> README.md"],timeout_s:5}'
+  "$PR" admit "$STATE" t1 "$COPY" claude --backend herdr >/dev/null 2>&1 && fail "a prepare step that changes a file the worker had already modified must be refused"
   pass "admission refuses only what the project's own commands change, so a relaunch of a dirty copy is admitted"
 }
 
@@ -504,7 +532,10 @@ test_readiness_on_touched_paths() {
   mkdir -p "$COPY/apps/api/src/server"; printf 'x\n' > "$COPY/apps/api/src/server/q.ts"
   "$PR" ready "$STATE" t1 2>/dev/null && fail "a diff that touches a triggered path must block readiness until its skill is read"
   read_all audit >/dev/null; "$PR" ready "$STATE" t1 || fail "readiness must pass once the path skill is read"
-  pass "readiness requires the skill for any triggered path the work touched"
+  hook session-start '{"source":"compact"}' >/dev/null; close_stage; claude_evidence boundary
+  "$PR" ready "$STATE" t1 2>/dev/null && fail "a path skill read before the last compaction must not satisfy readiness"
+  read_all audit >/dev/null; "$PR" ready "$STATE" t1 || fail "readiness must pass once the path skill is read in the current generation"
+  pass "readiness requires the skill for any triggered path the work touched, read in the current generation"
 }
 
 test_merge_settings_preserves_existing_content() {
@@ -600,6 +631,7 @@ test_codex_scan_start_and_mid_turn_compaction
 test_codex_scan_between_turn_compaction_and_triggers
 test_codex_scan_reads_every_command_shape
 test_codex_read_then_run_in_one_call_is_in_order
+test_codex_following_the_doorbell_is_not_a_violation
 test_codex_scan_is_idempotent_and_cursor_safe
 test_codex_missing_evidence_and_witness
 test_a_slow_pattern_counts_as_a_match

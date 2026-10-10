@@ -3460,7 +3460,7 @@ done
 for stuck_signal in push progress review ready; do
   rm -f -- "$STATE/.stuck-$ID-$stuck_signal-since"
 done
-rm -rf -- "$STATE/$ID.project-rules.d" "$STATE/$ID.project-rules.lock" "$STATE/$ID.project-rules.scan-failed"
+rm -rf -- "$STATE/$ID.project-rules.d" "$STATE/$ID.project-rules.lock" "$STATE/$ID.project-rules.scan-failed" "$STATE/$ID.project-rules.detect-failed"
 rm -f "$STATE/$ID.turn-ended" "$STATE/$ID.progress" "$STATE/$ID.project-rules" \
   "$STATE/$ID.heartbeat" "$STATE/$ID.started" \
   "$STATE/$ID.pi-ext.ts" "$STATE/$ID.omp-ext.ts" "$STATE/$ID.grok-turnend-token" \

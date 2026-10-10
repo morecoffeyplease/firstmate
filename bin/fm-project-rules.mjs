@@ -379,7 +379,13 @@ function admit(args) {
   const versionQualified = qualifying || rows.some((row) => row[0] === "tool" && row[1] === tool && row[2] === version && row[3] === backend);
   // A relaunch admits a copy that holds the worker's own uncommitted work, so
   // only a change these commands themselves make is refused.
-  const porcelain = () => spawnSync("git", ["-C", copy, "status", "--porcelain", "--untracked-files=all"], { encoding: "utf8" }).stdout.split("\n").filter(Boolean);
+  // Each changed or untracked path is compared by status and by content, so a
+  // further change to a file the worker had already modified is still seen.
+  const porcelain = () => spawnSync("git", ["-C", copy, "status", "--porcelain", "--untracked-files=all"], { encoding: "utf8" }).stdout.split("\n").filter(Boolean).map((line) => {
+    const file = path.join(copy, line.slice(3).replace(/^.* -> /, ""));
+    const stat = fs.statSync(file, { throwIfNoEntry: false });
+    return `${line} ${stat?.isFile() ? sha(fs.readFileSync(file)) : "absent"}`;
+  });
   const before = new Set(porcelain());
   if (L.prepare) {
     const result = runIn(copy, L.prepare.argv, L.prepare.timeout_s);
@@ -389,7 +395,7 @@ function admit(args) {
   }
   const resolved = resolveList(copy, L, tool);
   const dirty = porcelain().filter((line) => !before.has(line));
-  if (dirty.length) die(`the project's prepare or resolve commands left the copy with uncommitted changes:\n${dirty.slice(0, 10).join("\n")}`);
+  if (dirty.length) die(`the project's prepare or resolve commands left the copy with uncommitted changes:\n${dirty.slice(0, 10).map((line) => line.replace(/ \S+$/, "")).join("\n")}`);
   const R = { v: 1, task: id, state, copy, tool, version, backend, version_qualified: versionQualified };
   if (tool === "codex") refuseCodexConfig(copy);
   let prior = null;
@@ -705,10 +711,24 @@ function codexCommands(payload) {
       add(match[1]);
     }
   }
-  // A command built from a variable has no literal to read, so the whole call
-  // text is inspected as well unless every literal was one of Firstmate's own.
-  if (!found.length || !found.every(helperCall)) add(strings([payload.input, payload.arguments, payload.action]).join(" "));
+  // A command passed as a variable or built by an expression has no literal
+  // to read, so whenever a call holds more command sites than literals the
+  // whole call text is inspected as well.
+  const input = String(payload.input ?? "");
+  const sites = Math.max((input.match(/\b(?:cmd|command)\s*:/g) ?? []).length, (input.match(/\bexec_command\s*\(/g) ?? []).length);
+  // A call that carries no command at all, such as a wait, is not work. One
+  // that edits files without a shell command still is.
+  const edits = /patch|edit|write/i.test(String(payload.name ?? ""));
+  if (sites > found.length || (!found.length && edits)) add(strings([payload.input, payload.arguments, payload.action]).join(" "));
   return found;
+}
+
+// Following Firstmate's own doorbell means listing, reading and moving files
+// in the task's inbox, which a worker must be able to do before it has
+// answered the stage that doorbell announces.
+function inboxOnly(R, command) {
+  const inbox = `${path.join(R.state, R.task)}.inbox`;
+  return String(command).split(/&&|\|\||[;|\n]/).every((part) => /^\s*(?:ls|cat|mv|find|head|tail|sed|mkdir|test|\[)\s/.test(part) && part.includes(inbox));
 }
 
 function scanCodex(R, block, file) {
@@ -734,7 +754,7 @@ function scanCodex(R, block, file) {
       const at = Date.parse(entry.timestamp ?? "") || Date.now();
       const closed = Date.parse(R.closed?.[gen] ?? "") || Infinity;
       const all = codexCommands(payload);
-      const commands = all.filter((command) => !helperCall(command));
+      const commands = all.filter((command) => !helperCall(command) && !inboxOnly(R, command));
       if (!commands.length) continue;
       if (at < closed) {
         if (gen > 0 && R.log.turn === 0) R.same_turn_calls += 1;
@@ -879,7 +899,7 @@ function ready([state, id]) {
       const touched = skill.required.on_paths?.some((glob) => changed.some((file) => pathPattern(glob).test(file)));
       // A command that ran without its skill stays owed until the skill is read afterwards.
       const skipped = R.violations.some((entry) => entry.kind === "trigger-skipped" && entry.detail.startsWith(`${skill.name} `) && !(answer && Date.parse(answer.at) >= Date.parse(entry.at)));
-      if ((touched && !answer) || skipped) open.push(`required skill ${skill.name} was due and is not loaded: ${helperCommand(R, "serve", q(skill.name))}`);
+      if ((touched && !answered(R, skill.name)) || skipped) open.push(`required skill ${skill.name} was due and is not loaded: ${helperCommand(R, "serve", q(skill.name))}`);
     }
     return open;
   });

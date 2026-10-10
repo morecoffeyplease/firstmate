@@ -25,7 +25,8 @@
 #     project's before_commands patterns
 #   FM_PROJECT_RULES_LIVE_TOOLS="claude codex"   FM_PROJECT_RULES_LIVE_RUNS=2
 #   FM_PROJECT_RULES_LIVE_LEGS=forced|automatic   run one leg while iterating; a
-#     run with a leg left out reports it as unknown and qualifies nothing
+#     run with a leg left out reports it as unknown and qualifies nothing, and
+#     so does a run with fewer than 2 sessions per leg
 #   FM_PROJECT_RULES_LIVE_CLAUDE_ARGS / FM_PROJECT_RULES_LIVE_CODEX_ARGS   extra
 #     fm-spawn arguments, for example "--model gpt-6.1-sol --effort medium"
 #   FM_PROJECT_RULES_ACCEPT_PLUGIN_RULE_DIRS / FM_PROJECT_RULES_ACCEPT_SKILL_DIRS
@@ -138,6 +139,7 @@ if [ -n "${FM_PROJECT_RULES_ACCEPT_REPO:-}" ]; then
   [ "$records" = 0 ] || fail "the throwaway clone already has $records plugin install record(s), so prepare would not be what resolves its rules"
 else
   build_fixture "$PROJECT"
+  export FM_PROJECT_RULES_FIXTURE=1
   TRIGGER='sh tools/product-test.sh'
   FM_PROJECT_RULES_ACCEPT_PLUGIN_RULE_DIRS="$PROJECT/vendor/rules"
   FM_PROJECT_RULES_ACCEPT_SKILL_DIRS="$PROJECT/skills"
@@ -155,9 +157,12 @@ const listed=new Set(L.rules.filter(r=>r.path).map(r=>r.path));
 const missing=tracked.filter(f=>!listed.has(f));
 if(missing.length){console.error("left off the declared list: "+missing.join(", "));process.exit(1)}
 const rows=[];
+// In the built-in fixture the resolved file is ours, so it carries a canary too.
+if(process.env.FM_PROJECT_RULES_FIXTURE){fs.appendFileSync(path.join(repo,"vendor/rules/standin.md"),"\nContext audit line: FMQ-PLUGIN-9001\n");rows.push(["codex","plugin","FMQ-PLUGIN-9001","inline","vendor/rules/standin.md"].join("\t"))}
 L.rules.filter(r=>r.path).forEach((r,i)=>{const token="FMQ-"+r.id.replace(/[^a-z]/g,"").toUpperCase()+"-"+(1000+i*37);fs.appendFileSync(path.join(repo,r.path),"\nContext audit line: "+token+"\n");for(const tool of r.tools||["claude","codex"])rows.push([tool,r.id,token,(r.native||[]).includes(tool)?"native":"inline",r.path].join("\t"))});
 fs.writeFileSync(out,rows.join("\n")+"\n");
 ' "$PROJECT" "$CANARIES" || fail "the declared list does not cover every tracked instruction file"
+unset FM_PROJECT_RULES_FIXTURE
 commit_all "$PROJECT" "context audit canaries (throwaway copy only)"
 fm_git_add_origin "$PROJECT" "$PROJECT.origin.git" 2>/dev/null || true
 AREA_RULE=$(awk -F'\t' '$1=="claude" && $4=="inline" && $5 ~ /\/CLAUDE\.md$/ {print $5; exit}' "$CANARIES")
@@ -281,26 +286,30 @@ check_stage() {
 # exact launch fm-spawn builds, captured through a fake pane after a real
 # admission, adds only that limit, and runs it in the lab. The worker reads
 # filler files until the tool compacts by itself.
-FILLER="$TMP/filler"; mkdir -p "$FILLER"
-# The limits leave room to read the brief and skills again after the
-# compaction; a limit close to the session's starting size makes each refresh
-# trigger the next compaction.
-if [ -n "${FM_PROJECT_RULES_ACCEPT_REPO:-}" ]; then CODEX_AUTO_LIMIT=100000; else CODEX_AUTO_LIMIT=70000; fi
+# Claude reads whole files, so a few large ones fill its window. Codex cuts
+# long command output short, so it gets many small ones. The limits leave room
+# to read the brief and skills again after the compaction; a limit close to the
+# session's starting size makes each refresh trigger the next compaction.
+FILLER="$TMP/filler"; mkdir -p "$FILLER/claude" "$FILLER/codex"
+if [ -n "${FM_PROJECT_RULES_ACCEPT_REPO:-}" ]; then CODEX_AUTO_LIMIT=100000; CODEX_FILES=200; else CODEX_AUTO_LIMIT=45000; CODEX_FILES=100; fi
 for n in $(seq -w 1 40); do
-  for i in $(seq 1 110); do printf 'Filler %s line %s: nothing here matters to the audit, keep reading.\n' "$n" "$i"; done > "$FILLER/$n.txt"
+  for i in $(seq 1 110); do printf 'Filler %s line %s: nothing here matters to the audit, keep reading.\n' "$n" "$i"; done > "$FILLER/claude/$n.txt"
 done
-replay_worker() {  # <tool>
+for n in $(seq -w 1 "$CODEX_FILES"); do
+  for i in $(seq 1 20); do printf 'Filler %s line %s: nothing here matters to the audit, keep reading.\n' "$n" "$i"; done > "$FILLER/codex/$n.txt"
+done
+replay_worker() {  # <tool> <run>
   local fakebin log launch wt script args_var extra=()
-  TOOL=$1; ID="auto-$1"
-  HOME_DIR="$TMP/replay-$1"; fm_test_spawn_home "$HOME_DIR" "$1"
+  TOOL=$1; ID="auto-$1-$2"
+  HOME_DIR="$TMP/replay-$1-$2"; fm_test_spawn_home "$HOME_DIR" "$1"
   STATE=$(cd "$HOME_DIR/state" && pwd -P); REPORT="$HOME_DIR/data/$ID/report.md"
   FM_HOME="$HOME_DIR" FM_ROOT_OVERRIDE="$ROOT" "$ROOT/bin/fm-brief.sh" "$ID" project --scout >/dev/null || fail "could not scaffold the replay brief"
   node -e 'const fs=require("fs");const [f,task,spec]=process.argv.slice(1);fs.writeFileSync(f,fs.readFileSync(f,"utf8").replace("{TASK}",task).replace("{FIRSTMATE_SPEC}",spec))' \
     "$HOME_DIR/data/$ID/brief.md" "Read-only context audit of this repository copy; change nothing in it. Audit marker: $BRIEF_TOKEN" \
-    "Before stage C, read every file in $FILLER completely, one file at a time, each with its own command, in name order. $(stage_task C) Later stages arrive as messages typed into this session."
-  wt="$TMP/auto-$1.wt"; git -C "$PROJECT" worktree add --quiet -b "auto-$1" "$wt"
-  fakebin=$(fm_test_make_spawn_fakebin "$TMP/auto-$1.fake")
-  log="$TMP/auto-$1.launch"; : > "$log"
+    "Before stage C, print every file in $FILLER/$1 with its own separate command, one file per command, in name order. The files only fill your context: if an output is cut short, move on to the next file. $(stage_task C) Later stages arrive as messages typed into this session."
+  wt="$TMP/auto-$1-$2.wt"; git -C "$PROJECT" worktree add --quiet -b "auto-$1-$2" "$wt"
+  fakebin=$(fm_test_make_spawn_fakebin "$TMP/auto-$1-$2.fake")
+  log="$TMP/auto-$1-$2.launch"; : > "$log"
   args_var="FM_PROJECT_RULES_LIVE_$(printf '%s' "$1" | tr '[:lower:]' '[:upper:]')_ARGS"
   # shellcheck disable=SC2206 # Word splitting of the caller's extra arguments is intended.
   [ -z "${!args_var:-}" ] || extra=(${!args_var})
@@ -317,7 +326,7 @@ replay_worker() {  # <tool>
   fi
   script="$TMP/$ID.launch.sh"
   printf '#!/usr/bin/env bash\ncd %q && export FM_TASK_ID=%q && %s\n' "$wt" "$ID" "$launch" > "$script"; chmod +x "$script"
-  PANE=$(lab workspace create --label "auto-$1" --cwd "$wt" --no-focus | jq -r '.result.root_pane.pane_id')
+  PANE=$(lab workspace create --label "auto-$1-$2" --cwd "$wt" --no-focus | jq -r '.result.root_pane.pane_id')
   lab pane run "$PANE" "$script" >/dev/null || fail "$1: could not start the replayed launch"
   VERSION=$(field version)
 }
@@ -332,7 +341,7 @@ const [record,ruleDirs,skillDirs]=process.argv.slice(1);
 const R=JSON.parse(record);const sha=(f)=>crypto.createHash("sha256").update(fs.readFileSync(f)).digest("hex");
 const have=new Set(R.rules.map(r=>r.sha));const names=new Set(R.skills.map(s=>s.name.split(":").pop()));const missing=[];
 // A pinned rule is covered by the same bytes, or by a declared file that holds every line of it in order (a generated native copy).
-const lines=(f)=>{let fm=false;return fs.readFileSync(f,"utf8").split("\n").map(l=>l.trim()).filter((l,i)=>{if(i===0&&l==="---"){fm=true;return false}if(fm){fm=l!=="---";return false}return l&&!l.startsWith("<!--")})};
+const lines=(f)=>{let fm=false;return fs.readFileSync(f,"utf8").split("\n").map(l=>l.trim()).filter((l,i)=>{if(i===0&&l==="---"){fm=true;return false}if(fm){fm=l!=="---";return false}return l&&!l.startsWith("<!--")&&!l.startsWith("Context audit line:")})};
 const held=(f)=>R.rules.some(r=>{const t=fs.readFileSync(r.file,"utf8");let at=0;return lines(f).every(l=>{const i=t.indexOf(l,at);if(i<0)return false;at=i+l.length;return true})});
 for(const dir of ruleDirs.split(":").filter(Boolean))for(const f of fs.readdirSync(dir).filter(f=>f.endsWith(".md")))if(!have.has(sha(path.join(dir,f)))&&!held(path.join(dir,f)))missing.push("rule "+f);
 for(const dir of skillDirs.split(":").filter(Boolean))for(const d of fs.readdirSync(dir)){const f=path.join(dir,d,"SKILL.md");if(!fs.existsSync(f))continue;const t=fs.readFileSync(f,"utf8");if(/^disable-model-invocation:\s*true/m.test(t))continue;const n=(t.match(/^name:\s*["\x27]?([^"\x27\n]+)/m)||[,d])[1].trim();if(!names.has(n)&&!names.has(d))missing.push("skill "+n)}
@@ -381,48 +390,75 @@ check_refused_launch() {
   pass "$1: a copy whose prepare step fails launches nothing"
 }
 
+# The deterministic refusals are the same code on any machine, so they are run
+# here once per tool as a leg of their own.
+check_negatives() {
+  check_refused_launch "$1"
+  bash "$ROOT/tests/fm-project-rules.test.sh" > "$TMP/portable-$1.log" 2>&1 || fail "$1: the deterministic refusal suite failed: $(grep '^not ok' "$TMP/portable-$1.log" | head -3 | tr '\n' ' ')"
+  pass "$1: wrong and reused rows, skipped parts, skipped triggers, double compactions, a missed hook and an oversized block are all refused"
+}
+
 RESULT="$TMP/result.tsv"; : > "$RESULT"
+LEGS=" ${FM_PROJECT_RULES_LIVE_LEGS:-forced automatic} "
+record() { printf '%s\t%s\t%s\t%s\n' "$TOOL_NAME" "${VERSION:-unknown}" "$1" "$2" >> "$RESULT"; }
+quit_worker() { say "$([ "$TOOL" = claude ] && printf /exit || printf /quit)"; }
 for TOOL_NAME in $TOOLS; do
   command -v "$TOOL_NAME" >/dev/null 2>&1 || fail "$TOOL_NAME is not installed, so it cannot be qualified"
-  run=1
-  [ "${FM_PROJECT_RULES_LIVE_LEGS:-forced automatic}" != automatic ] || run=$((RUNS + 1))
-  while [ "$run" -le "$RUNS" ]; do
-    spawn_worker "$TOOL_NAME" "$run"
-    check_stage A 0
-    if [ "$run" -eq 1 ]; then check_independent_coverage; check_prepare; check_sizes; check_refused_launch "$TOOL_NAME"; fi
-    say "/compact"; wait_compactions 1
-    send_stage B
-    check_stage B 1
-    say "$([ "$TOOL" = claude ] && printf /exit || printf /quit)"
-    run=$((run + 1))
-  done
-  [ "$run" -gt "$((RUNS + 1))" ] || [ "${FM_PROJECT_RULES_LIVE_LEGS:-forced automatic}" = automatic ] || printf '%s\t%s\tforced\tpass\n' "$TOOL" "$VERSION" >> "$RESULT"
-  if [ "${FM_PROJECT_RULES_LIVE_LEGS:-forced automatic}" = forced ]; then
-    printf '%s\t%s\tautomatic\tunknown\n' "$TOOL" "$VERSION" >> "$RESULT"
-    continue
-  fi
-  replay_worker "$TOOL_NAME"
-  wait_status "working: C written" 900
-  "$PR" detect "$STATE" "$ID" >/dev/null 2>&1 || true
-  auto_gen=$(field compactions)
-  if [ "$auto_gen" -ge 1 ] 2>/dev/null; then
-    check_stage C "$auto_gen"
-    say "/compact"; wait_compactions "$((auto_gen + 1))"
-    send_stage D
-    check_stage D "$((auto_gen + 1))"
-    printf '%s\t%s\tautomatic\tpass\n' "$TOOL" "$VERSION" >> "$RESULT"
+  VERSION=
+  if [ "${LEGS#* forced }" != "$LEGS" ]; then
+    run=1
+    while [ "$run" -le "$RUNS" ]; do
+      spawn_worker "$TOOL_NAME" "$run"
+      check_stage A 0
+      if [ "$run" -eq 1 ]; then
+        check_independent_coverage; record coverage pass
+        check_prepare; check_sizes; record prepare pass
+        check_negatives "$TOOL_NAME"; record negatives pass
+      fi
+      say "/compact"; wait_compactions 1
+      send_stage B
+      check_stage B 1
+      quit_worker
+      run=$((run + 1))
+    done
+    record forced pass
   else
-    note "$TOOL $VERSION: the lowered limit produced no automatic compaction"
-    printf '%s\t%s\tautomatic\tunknown\n' "$TOOL" "$VERSION" >> "$RESULT"
+    for leg in coverage prepare negatives forced; do record "$leg" unknown; done
   fi
-  say "$([ "$TOOL" = claude ] && printf /exit || printf /quit)"
+  if [ "${LEGS#* automatic }" != "$LEGS" ]; then
+    run=1; automatic=pass
+    while [ "$run" -le "$RUNS" ]; do
+      replay_worker "$TOOL_NAME" "$run"
+      wait_status "working: C written" 900
+      "$PR" detect "$STATE" "$ID" >/dev/null 2>&1 || true
+      auto_gen=$(field compactions)
+      if [ "$auto_gen" -ge 1 ] 2>/dev/null; then
+        check_stage C "$auto_gen"
+        say "/compact"; wait_compactions "$((auto_gen + 1))"
+        send_stage D
+        check_stage D "$((auto_gen + 1))"
+      else
+        note "$TOOL $VERSION: the lowered limit produced no automatic compaction"
+        automatic=unknown
+      fi
+      quit_worker
+      run=$((run + 1))
+    done
+    record automatic "$automatic"
+  else
+    record automatic unknown
+  fi
 done
 
 note "results:"; sed 's/^/#   /' "$RESULT"
-if grep -q "$(printf '\tunknown$')" "$RESULT"; then
-  fail "at least one leg is unknown, so this run qualifies nothing"
+# Only a complete set qualifies: every leg passed for the tool, twice where a
+# leg is a live session. Anything left out or unmeasured qualifies nothing.
+if grep -qv "$(printf '\tpass$')" "$RESULT"; then
+  fail "at least one leg is unknown or was left out, so this run qualifies nothing"
 fi
-if [ -n "${FM_PROJECT_RULES_QUALIFY_CONFIG:-}" ]; then
+if [ "$RUNS" -lt 2 ]; then
+  note "every leg passed, but one session per leg qualifies nothing; run with FM_PROJECT_RULES_LIVE_RUNS=2"
+elif [ -n "${FM_PROJECT_RULES_QUALIFY_CONFIG:-}" ]; then
   QUALIFIED="$FM_PROJECT_RULES_QUALIFY_CONFIG/project-rules-qualified"
   {
     cat "$QUALIFIED" 2>/dev/null || true

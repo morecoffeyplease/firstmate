@@ -37,6 +37,14 @@ if ! command -v node >/dev/null 2>&1; then
   echo "fm-project-rules: node is required and was not found on PATH" >&2
   # Claude treats only exit 2 from a tool hook as a refusal.
   [ "$1" = hook ] && [ "${4:-}" != session-start ] && exit 2
+  # A scan that cannot run still has to reach the supervisor, once per record.
+  if [ "$1" = scan ]; then
+    for record in "${2:-${FM_STATE_OVERRIDE:-${FM_HOME:-$SCRIPT_DIR/..}/state}}"/${3:-*}.project-rules; do
+      [ -f "$record" ] || continue
+      [ "$(cat "$record.scan-failed" 2>/dev/null)" = "node is required" ] || printf 'project-rules: %s scan-failed node is required and was not found on PATH\n' "$(basename "$record" .project-rules)"
+      echo "node is required" > "$record.scan-failed"
+    done
+  fi
   exit 1
 fi
 export FM_PROJECT_RULES_HELPER="$SCRIPT_DIR/fm-project-rules.sh"
@@ -57,7 +65,9 @@ rollout_for() {  # <state> <id>
 read_log() {  # <scan|detect> <state> <id>
   local line out rc=0 failed="$2/$3.project-rules.scan-failed" reason
   out=$(engine "$1" "$2" "$3" "$(rollout_for "$2" "$3")" 2>"$failed.new") || rc=$?
+  rm -f -- "$2/$3.project-rules.detect-failed"
   if [ "$rc" -ne 0 ]; then
+    : > "$2/$3.project-rules.detect-failed"
     reason=$(head -1 "$failed.new" | cut -c1-200)
     [ "$1" != scan ] || [ "$(cat "$failed" 2>/dev/null)" = "$reason" ] || printf 'project-rules: %s scan-failed %s\n' "$3" "${reason:-exit $rc}"
     [ "$1" != scan ] || printf '%s\n' "$reason" > "$failed"
@@ -92,10 +102,21 @@ case "$verb" in
       done
     fi
     ;;
-  next | ready)
+  next)
     # The worker is already asking, so a compaction found here needs no steer.
-    [ ! -f "$1/$2.project-rules" ] || engine detect "$1" "$2" "$(rollout_for "$1" "$2")" >/dev/null || true
-    engine "$verb" "$@"
+    engine detect "$1" "$2" "$(rollout_for "$1" "$2")" >/dev/null || true
+    engine next "$@"
+    ;;
+  ready)
+    # A compaction first seen here is steered like any other. Readiness judged
+    # on a log that could not be read would rest on stale evidence, so a failed
+    # read refuses it.
+    read_log detect "$1" "$2" >/dev/null
+    if [ -e "$1/$2.project-rules.detect-failed" ]; then
+      echo "fm-project-rules: $2 is not ready: the tool's own log or the task's record could not be read" >&2
+      exit 1
+    fi
+    engine ready "$@"
     ;;
   *) engine "$verb" "$@" ;;
 esac
