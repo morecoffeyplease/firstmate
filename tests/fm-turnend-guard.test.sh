@@ -443,32 +443,24 @@ test_hook_blocks_when_unhealthy_in_primary() {
 }
 
 test_hook_allows_when_another_session_holds_fleet_lock() {
-  local dir owner fakebin out status mode
+  local dir owner out status mode
   dir=$(make_primary_dir "$TMP_ROOT/hook-read-only-lock")
   : > "$dir/state/task1.meta"
-  sleep 60 &
+  ln -s /bin/bash "$dir/claude"
+  ln -s /bin/bash "$dir/codex"
+  "$dir/codex" -c 'while :; do sleep 60; done' &
   owner=$!
   printf '%s\n' "$owner" > "$dir/state/.lock"
-  ln -s /bin/bash "$dir/claude"
-  fakebin=$(fm_fakebin "$TMP_ROOT/read-only-lock-bin")
-  cat > "$fakebin/ps" <<EOF
-#!/usr/bin/env bash
-case " \$* " in
-  *" -p $owner "*) printf 'codex\\n' ;;
-  *) exec /bin/ps "\$@" ;;
-esac
-EOF
-  chmod +x "$fakebin/ps"
   for mode in default claude; do
     if [ "$mode" = claude ]; then
       out=$(printf '{"stop_hook_active":false,"session_id":"sess-readonly-mode"}' \
-        | PATH="$fakebin:$BLIND_BIN:$PATH" CLAUDECODE=1 FM_HOME="$dir" \
-          "$dir/claude" -c "\"\$FM_HOME/bin/fm-turnend-guard.sh\" --claude" 2>&1); status=$?
+        | CLAUDECODE=1 FM_HOME="$dir" \
+          "$dir/claude" -c "exec -a claude bash \"\$FM_HOME/bin/fm-turnend-guard.sh\" --claude" 2>&1); status=$?
       assert_contains "$out" "SUPERVISION IS OWNED BY ANOTHER LIVE SESSION" \
         "Claude lock-refused stop must explain the verified ownership boundary"
     else
       out=$(printf '{"stop_hook_active":false,"session_id":"sess-readonly-mode"}' \
-        | PATH="$fakebin:$BLIND_BIN:$PATH" CLAUDECODE=1 FM_HOME="$dir" \
+        | CLAUDECODE=1 FM_HOME="$dir" \
           bash "$dir/bin/fm-turnend-guard.sh" 2>&1); status=$?
       [ -z "$out" ] || fail "$mode read-only lock-refused stop should be silent, got: $out"
     fi
