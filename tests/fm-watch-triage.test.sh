@@ -3601,6 +3601,8 @@ test_busy_pane_stable_hash_escalates_past_turn_age_bound() {
   record_pi_busy "$state" busy-stable
   printf 'working: setup complete\n' > "$state/busy-stable.status"
   sig=$(seen_sig "$state/busy-stable.status"); printf '%s' "$sig" > "$state/.seen-busy-stable_status"
+  printf '%s\tlaunched\n' "$(date +%s)" > "$state/busy-stable.heartbeat"
+  date +%s > "$state/busy-stable.started"
   key=$(printf '%s' "$window" | tr ':/.' '___')
   pane_hash=$(hash_text "Working...")
   printf '%s' "$pane_hash" > "$state/.hash-$key"
@@ -3646,6 +3648,8 @@ test_busy_pane_changing_hash_escalates_past_turn_age_bound() {
   record_pi_busy "$state" busy-ticking
   printf 'working: setup complete\n' > "$state/busy-ticking.status"
   sig=$(seen_sig "$state/busy-ticking.status"); printf '%s' "$sig" > "$state/.seen-busy-ticking_status"
+  printf '%s\ttest worker\n' "$(date +%s)" > "$state/busy-ticking.heartbeat"
+  date +%s > "$state/busy-ticking.started"
   key=$(printf '%s' "$window" | tr ':/.' '___')
   touch -t 200001010000 "$state/busy-ticking.meta"
   # No pre-seeded .hash-<key>: with a real ticking elapsed footer, every poll
@@ -3679,6 +3683,242 @@ test_busy_pane_changing_hash_escalates_past_turn_age_bound() {
   pass "a busy worker whose pane hash changes every poll still escalates once its completed-turn age reaches the bound"
 }
 
+test_ticking_live_worker_with_missing_heartbeat_wakes_stuck_board() {
+  local dir state fakebin out ticks window id statusf sig gen pid queue output before hb_ts hb_note
+  dir=$(make_case stuck-board-ticking-no-heartbeat); state="$dir/state"; fakebin="$dir/fakebin"
+  out="$dir/watch.out"; ticks="$dir/ticks"; id=stuck-ticking; window="test:fm-$id"
+  statusf="$state/$id.status"
+  printf 'window=%s\nkind=ship\nharness=claude\nworktree=%s/worktree\n' "$window" "$dir" \
+    > "$state/$id.meta"
+  mkdir -p "$dir/worktree"
+  printf 'working: running the local test suite\n' > "$statusf"
+  sig=$(seen_sig "$statusf"); printf '%s' "$sig" > "$state/.seen-${id}_status"
+  echo $(( $(date +%s) - 5 )) > "$state/$id.started"
+  gen=$("$ROOT/bin/fm-busy-event.sh" arm "$state" "$id")
+  "$ROOT/bin/fm-busy-event.sh" apply "$state" "$id" busy --gen "$gen" \
+    --source claude-hook --event turn-start
+  touch "$state/.last-stuck-board"
+
+  PATH="$fakebin:$PATH" FM_FAKE_TMUX_WINDOW="$window" FM_FAKE_TMUX_TICKS="$ticks" \
+    FM_STATE_OVERRIDE="$state" FM_CHECK_INTERVAL=5 FM_STUCK_HEARTBEAT_SECS=1 \
+    FM_STUCK_PROGRESS_SECS=9999 FM_STUCK_DRAFT_PR_SECS=99999 FM_STUCK_REVIEW_SECS=99999 \
+    FM_STUCK_READY_PR_SECS=99999 FM_CHECK_TIMEOUT=20 FM_POLL=0.2 FM_SIGNAL_GRACE=1 \
+    FM_HEARTBEAT=999999 FM_CREW_STATE_BIN="$fakebin/fm-crew-state.sh" "$WATCH" > "$out" &
+  pid=$!
+  wait_for_exit "$pid" 100 || {
+    reap "$pid"
+    fail "the ticking worker with no heartbeat did not wake the stuck board (watcher=$(cat "$out" 2>/dev/null); state=$(find "$state" -maxdepth 1 -type f -print 2>/dev/null | tr '\n' ' '); triage=$(cat "$state/.watch-triage.log" 2>/dev/null))"
+  }
+  grep -F "stuck: $id heartbeat" "$out" >/dev/null \
+    || fail "the missing worker heartbeat breach was not named: $(cat "$out")"
+  [ "$(cat "$ticks" 2>/dev/null || echo 0)" -gt 0 ] \
+    || fail "the fake terminal did not change while the worker was busy"
+  queue=$(cat "$state/.wake-queue" 2>/dev/null || true)
+  printf '%s\n' "$queue" | grep -F "stuck: $id heartbeat" >/dev/null \
+    || fail "the heartbeat breach was not durably queued: $queue"
+  reap "$pid"
+
+  before=$(cat "$statusf")
+  "$ROOT/bin/fm-task-heartbeat.sh" "$id" "$state" "reviewing the test failure"
+  [ "$(cat "$statusf")" = "$before" ] || fail "a worker heartbeat appended a status-log event"
+  IFS=$'\t' read -r hb_ts hb_note < "$state/$id.heartbeat"
+  case "$hb_ts" in ''|*[!0-9]*) fail "the heartbeat record has no numeric timestamp" ;; esac
+  [ "$hb_note" = "reviewing the test failure" ] || fail "the heartbeat record lost its one-line note"
+  output=$(FM_STATE_OVERRIDE="$state" FM_STUCK_HEARTBEAT_SECS=1 \
+    FM_STUCK_PROGRESS_SECS=9999 FM_STUCK_DRAFT_PR_SECS=99999 FM_STUCK_REVIEW_SECS=99999 \
+    FM_STUCK_READY_PR_SECS=99999 "$ROOT/bin/fm-stuck-board.sh" scan)
+  [ -z "$output" ] || fail "an active breach episode was reported more than once: $output"
+  pass "a changing terminal does not hide a missing heartbeat, and its breach is durably queued once"
+}
+
+stuck_scan() {  # <state> <fakebin> <env assignments...>
+  local state=$1 fakebin=$2
+  shift 2
+  PATH="$fakebin:$PATH" FM_STATE_OVERRIDE="$state" "$@" "$ROOT/bin/fm-stuck-board.sh" scan
+}
+
+test_stuck_board_ignores_terminal_lanes_and_old_base_commits() {
+  local dir state fakebin id now output repo terminal
+  dir=$(make_case stuck-board-negative-attribution); state="$dir/state"; fakebin="$dir/fakebin"
+  now=$(date +%s)
+  id=stuck-stopped
+  printf 'kind=scout\nharness=claude\n' > "$state/$id.meta"
+  printf '%s\n' "$((now - 7200))" > "$state/$id.started"
+  for terminal in 'done' failed needs-decision blocked paused; do
+    printf '%s: terminal lane\n' "$terminal" > "$state/$id.status"
+    touch -t 202001010000 "$state/$id.status"
+    output=$(FM_STUCK_HEARTBEAT_SECS=1 FM_STUCK_PROGRESS_SECS=3600 \
+      FM_STUCK_DRAFT_PR_SECS=99999 FM_STUCK_REVIEW_SECS=99999 FM_STUCK_READY_PR_SECS=99999 \
+      stuck_scan "$state" "$fakebin")
+    [ -z "$output" ] || fail "a $terminal lane triggered active-worker rules: $output"
+  done
+
+  id=stuck-fresh-lane
+  repo="$dir/old-base"
+  mkdir -p "$repo"
+  git -C "$repo" init -q
+  GIT_AUTHOR_DATE='2020-01-01T00:00:00Z' GIT_COMMITTER_DATE='2020-01-01T00:00:00Z' \
+    git -C "$repo" -c user.name=Test -c user.email=test@example.invalid \
+      -c commit.gpgsign=false commit --allow-empty -q -m base
+  printf 'kind=scout\nharness=codex\nworktree=%s\n' "$repo" > "$state/$id.meta"
+  printf '%s\tfresh heartbeat\n' "$now" > "$state/$id.heartbeat"
+  printf '%s\n' "$now" > "$state/$id.started"
+  output=$(FM_STUCK_HEARTBEAT_SECS=9999 FM_STUCK_PROGRESS_SECS=3600 \
+    FM_STUCK_DRAFT_PR_SECS=99999 FM_STUCK_REVIEW_SECS=99999 FM_STUCK_READY_PR_SECS=99999 \
+    stuck_scan "$state" "$fakebin")
+  [ -z "$output" ] || fail "a fresh lane inherited no-progress from its old base commit: $output"
+  printf '%s\tfreshness expired\n' "$((now - 7200))" > "$state/$id.heartbeat"
+  printf '%s\n' "$((now - 7200))" > "$state/$id.started"
+  output=$(FM_STUCK_HEARTBEAT_SECS=99999 FM_STUCK_PROGRESS_SECS=3600 \
+    FM_STUCK_DRAFT_PR_SECS=99999 FM_STUCK_REVIEW_SECS=99999 FM_STUCK_READY_PR_SECS=99999 \
+    stuck_scan "$state" "$fakebin")
+  printf '%s\n' "$output" | grep -F "stuck: $id no-progress" >/dev/null \
+    || fail "an aged lane with an old base commit and heartbeat did not breach no-progress: $output"
+  pass "all terminal lanes stay quiet, while no-progress ignores old base commits on fresh lanes"
+}
+
+test_stuck_board_handles_pr_boolean_empty_review_and_failed_reads() {
+  local dir state fakebin id now output review_marker ready_marker original_review original_ready original_progress
+  dir=$(make_case stuck-board-pr-snapshot); state="$dir/state"; fakebin="$dir/fakebin"
+  id=stuck-pr; now=$(date +%s)
+  printf 'kind=ship\nharness=codex\npr=https://github.com/example/project/pull/12\n' \
+    > "$state/$id.meta"
+  printf '%s\tbusy\n' "$now" > "$state/$id.heartbeat"
+  printf '%s\n' "$now" > "$state/$id.started"
+  printf 'working: awaiting review\n' > "$state/$id.status"
+  review_marker="$state/.stuck-$id-review-since"
+  ready_marker="$state/.stuck-$id-ready-since"
+  printf 'abc123\t%s\n' "$((now - 20))" > "$review_marker"
+  printf 'abc123\t%s\n' "$((now - 20))" > "$ready_marker"
+  cat > "$fakebin/gh" <<'SH'
+#!/usr/bin/env bash
+[ "${FM_FAKE_GH_FAIL:-0}" = 1 ] && exit 1
+cat "$FM_FAKE_GH_JSON"
+SH
+  chmod +x "$fakebin/gh"
+  printf '{"state":"OPEN","isDraft":false,"reviewDecision":"","headRefOid":"abc123","reviews":[]}\n' \
+    > "$dir/pr.json"
+  output=$(FM_FAKE_GH_JSON="$dir/pr.json" FM_STUCK_REVIEW_SECS=1 FM_STUCK_READY_PR_SECS=1 \
+    FM_STUCK_HEARTBEAT_SECS=9999 FM_STUCK_PROGRESS_SECS=9999 \
+    FM_STUCK_DRAFT_PR_SECS=99999 stuck_scan "$state" "$fakebin")
+  [ "$output" = "$(printf 'stuck: %s review-wait\nstuck: %s ready-pr-wait' "$id" "$id")" ] \
+    || fail "isDraft=false with an empty decision did not trigger the aged PR rules: $output"
+
+  original_review=$(cat "$review_marker"); original_ready=$(cat "$ready_marker")
+  printf 'abc123\t%s\n' "$now" > "$review_marker"
+  printf 'abc123\t%s\n' "$now" > "$ready_marker"
+  output=$(FM_FAKE_GH_JSON="$dir/pr.json" FM_STUCK_REVIEW_SECS=3600 FM_STUCK_READY_PR_SECS=3600 \
+    FM_STUCK_HEARTBEAT_SECS=9999 FM_STUCK_PROGRESS_SECS=9999 \
+    FM_STUCK_DRAFT_PR_SECS=99999 stuck_scan "$state" "$fakebin")
+  [ -z "$output" ] || fail "PR rules breached before their head timers elapsed: $output"
+
+  printf '%s\n' "$original_review" > "$review_marker"
+  printf '%s\n' "$original_ready" > "$ready_marker"
+  output=$(FM_FAKE_GH_FAIL=1 FM_FAKE_GH_JSON="$dir/pr.json" FM_STUCK_REVIEW_SECS=1 \
+    FM_STUCK_READY_PR_SECS=1 FM_STUCK_HEARTBEAT_SECS=9999 FM_STUCK_PROGRESS_SECS=9999 \
+    FM_STUCK_DRAFT_PR_SECS=99999 stuck_scan "$state" "$fakebin")
+  [ -z "$output" ] || fail "a failed GitHub read produced a false PR breach: $output"
+  [ "$(cat "$review_marker")" = "$original_review" ] && [ "$(cat "$ready_marker")" = "$original_ready" ] \
+    || fail "a failed GitHub read discarded previously observed PR timer state"
+
+  printf '%s\n' "$((now - 7200))" > "$state/$id.started"
+  printf '%s\tactive\n' "$now" > "$state/$id.heartbeat"
+  touch -t 202001010000 "$state/$id.status"
+  printf 'abc123\t%s\n' "$((now - 7200))" > "$state/.stuck-$id-progress-since"
+  original_progress=$(cat "$state/.stuck-$id-progress-since")
+  output=$(FM_FAKE_GH_FAIL=1 FM_FAKE_GH_JSON="$dir/pr.json" FM_STUCK_REVIEW_SECS=99999 \
+    FM_STUCK_READY_PR_SECS=99999 FM_STUCK_HEARTBEAT_SECS=9999 FM_STUCK_PROGRESS_SECS=3600 \
+    FM_STUCK_DRAFT_PR_SECS=99999 stuck_scan "$state" "$fakebin")
+  [ "$output" = "stuck: $id no-progress" ] \
+    || fail "a failed forge read did not evaluate local progress against last-good evidence: $output"
+  [ "$(cat "$state/.stuck-$id-progress-since")" = "$original_progress" ] \
+    || fail "a failed forge read changed the last successfully observed PR head timestamp"
+  pass "PR rules preserve empty decisions and failed-read timers, and no-progress keeps last-good remote evidence"
+}
+
+test_slow_forge_reads_do_not_starve_local_no_progress_breaches() {
+  local dir state fakebin out slow late sig pid queue now
+  dir=$(make_case stuck-board-slow-forge); state="$dir/state"; fakebin="$dir/fakebin"
+  out="$dir/watch.out"; slow=stuck-a-slow-forge; late=stuck-z-local-breach
+  now=$(date +%s)
+  printf 'kind=scout\nharness=codex\npr=https://github.com/example/project/pull/13\n' \
+    > "$state/$slow.meta"
+  printf '%s\tactive\n' "$now" > "$state/$slow.heartbeat"
+  printf '%s\n' "$((now - 7200))" > "$state/$slow.started"
+  printf 'working: polling review\n' > "$state/$slow.status"
+  touch -t 202001010000 "$state/$slow.status"
+  sig=$(seen_sig "$state/$slow.status"); printf '%s' "$sig" > "$state/.seen-${slow}_status"
+  printf 'kind=scout\nharness=codex\n' > "$state/$late.meta"
+  printf '%s\tactive\n' "$now" > "$state/$late.heartbeat"
+  printf '%s\n' "$((now - 7200))" > "$state/$late.started"
+  printf 'working: still active\n' > "$state/$late.status"
+  touch -t 202001010000 "$state/$late.status"
+  sig=$(seen_sig "$state/$late.status"); printf '%s' "$sig" > "$state/.seen-${late}_status"
+  cat > "$fakebin/gh" <<'SH'
+#!/usr/bin/env bash
+sleep 30
+SH
+  chmod +x "$fakebin/gh"
+  touch -t 202001010000 "$state/.last-stuck-board"
+
+  PATH="$fakebin:$PATH" FM_FAKE_TMUX_WINDOW='' FM_STATE_OVERRIDE="$state" \
+    FM_STUCK_HEARTBEAT_SECS=9999 FM_STUCK_PROGRESS_SECS=1 \
+    FM_STUCK_DRAFT_PR_SECS=99999 FM_STUCK_REVIEW_SECS=99999 FM_STUCK_READY_PR_SECS=99999 \
+    FM_CHECK_INTERVAL=1 FM_CHECK_TIMEOUT=1 FM_POLL=0.2 FM_SIGNAL_GRACE=1 FM_HEARTBEAT=999999 \
+    FM_CREW_STATE_BIN="$fakebin/fm-crew-state.sh" "$WATCH" > "$out" &
+  pid=$!
+  wait_for_exit "$pid" 100 || { reap "$pid"; fail "the timeout-bounded stuck check did not surface its local breach"; }
+  grep -F "stuck: $slow no-progress" "$out" >/dev/null \
+    || fail "a same-lane forge read blocked its local no-progress breach: $(cat "$out")"
+  grep -F "stuck: $late no-progress" "$out" >/dev/null \
+    || fail "an earlier hanging forge read starved a later lane's local no-progress breach: $(cat "$out")"
+  grep -F "check: stuck-board:" "$out" >/dev/null \
+    || fail "the timed-out network pass was not reported with the local breach: $(cat "$out")"
+  queue=$(cat "$state/.wake-queue" 2>/dev/null || true)
+  printf '%s\n' "$queue" | grep -F "stuck: $slow no-progress" >/dev/null \
+    || fail "the same-lane local breach was not durably queued before the forge timeout: $queue"
+  printf '%s\n' "$queue" | grep -F "stuck: $late no-progress" >/dev/null \
+    || fail "the later-lane local breach was not durably queued before the forge timeout: $queue"
+  reap "$pid"
+  pass "same-lane and earlier-lane forge timeouts preserve all local no-progress breaches"
+}
+
+test_repeated_identical_failure_breaches_once_per_episode() {
+  local dir state config id output
+  dir=$(make_case stuck-board-repeated-failure); state="$dir/state"; config="$dir/config"; id=stuck-failure
+  mkdir -p "$config"
+  printf 'kind=scout\nharness=codex\n' > "$state/$id.meta"
+  printf '%s\tlaunched\n' "$(date +%s)" > "$state/$id.heartbeat"
+  date +%s > "$state/$id.started"
+  printf 'failed: test command timed out\nworking: retrying\nfailed: test command timed out\n' \
+    > "$state/$id.status"
+  output=$(FM_STATE_OVERRIDE="$state" FM_CONFIG_OVERRIDE="$config" \
+    FM_STUCK_HEARTBEAT_SECS=9999 FM_STUCK_PROGRESS_SECS=9999 \
+    FM_STUCK_DRAFT_PR_SECS=99999 FM_STUCK_REVIEW_SECS=99999 FM_STUCK_READY_PR_SECS=99999 \
+    "$ROOT/bin/fm-stuck-board.sh" scan)
+  [ "$output" = "stuck: $id repeated-failure" ] \
+    || fail "two identical failures separated by progress did not breach: $output"
+  output=$(FM_STATE_OVERRIDE="$state" FM_CONFIG_OVERRIDE="$config" \
+    FM_STUCK_HEARTBEAT_SECS=9999 FM_STUCK_PROGRESS_SECS=9999 \
+    FM_STUCK_DRAFT_PR_SECS=99999 FM_STUCK_REVIEW_SECS=99999 FM_STUCK_READY_PR_SECS=99999 \
+    "$ROOT/bin/fm-stuck-board.sh" scan)
+  [ -z "$output" ] || fail "a repeated failure episode was reported again: $output"
+  printf 'working: retry underway\n' >> "$state/$id.status"
+  output=$(FM_STATE_OVERRIDE="$state" FM_CONFIG_OVERRIDE="$config" \
+    FM_STUCK_HEARTBEAT_SECS=9999 FM_STUCK_PROGRESS_SECS=9999 \
+    FM_STUCK_DRAFT_PR_SECS=99999 FM_STUCK_REVIEW_SECS=99999 FM_STUCK_READY_PR_SECS=99999 \
+    "$ROOT/bin/fm-stuck-board.sh" scan)
+  [ -z "$output" ] || fail "clearing the failure episode emitted an unexpected breach: $output"
+  printf 'failed: test command timed out\n' >> "$state/$id.status"
+  output=$(FM_STATE_OVERRIDE="$state" FM_CONFIG_OVERRIDE="$config" \
+    FM_STUCK_HEARTBEAT_SECS=9999 FM_STUCK_PROGRESS_SECS=9999 \
+    FM_STUCK_DRAFT_PR_SECS=99999 FM_STUCK_REVIEW_SECS=99999 FM_STUCK_READY_PR_SECS=99999 \
+    "$ROOT/bin/fm-stuck-board.sh" scan)
+  [ "$output" = "stuck: $id repeated-failure" ] \
+    || fail "a re-formed repeated failure episode did not breach once: $output"
+  pass "the same failure across intervening progress breaches once per episode"
+}
+
 test_busy_pane_turn_end_touch_resets_age() {
   local dir state fakebin out capture_file window key pane_hash sig pid
   dir=$(make_case busy-turn-end-resets-age); state="$dir/state"; fakebin="$dir/fakebin"
@@ -3688,6 +3928,8 @@ test_busy_pane_turn_end_touch_resets_age() {
   record_pi_busy "$state" busy-reset
   printf 'working: setup complete\n' > "$state/busy-reset.status"
   sig=$(seen_sig "$state/busy-reset.status"); printf '%s' "$sig" > "$state/.seen-busy-reset_status"
+  printf '%s\tlaunched\n' "$(date +%s)" > "$state/busy-reset.heartbeat"
+  date +%s > "$state/busy-reset.started"
   key=$(printf '%s' "$window" | tr ':/.' '___')
   pane_hash=$(hash_text "Working...")
   printf '%s' "$pane_hash" > "$state/.hash-$key"
@@ -3722,6 +3964,8 @@ test_busy_pane_native_progress_resets_age() {
   record_pi_busy "$state" busy-reset
   printf 'working: setup complete\n' > "$state/busy-reset.status"
   sig=$(seen_sig "$state/busy-reset.status"); printf '%s' "$sig" > "$state/.seen-busy-reset_status"
+  printf '%s\tlaunched\n' "$(date +%s)" > "$state/busy-reset.heartbeat"
+  date +%s > "$state/busy-reset.started"
   key=$(printf '%s' "$window" | tr ':/.' '___')
   pane_hash=$(hash_text "Working...")
   printf '%s' "$pane_hash" > "$state/.hash-$key"
@@ -3818,6 +4062,8 @@ test_busy_declared_pause_is_rechecked_not_wedge_escalated() {
   record_pi_busy "$state" review-scout
   printf 'paused: hosting the Lavish review, awaiting captain feedback\n' > "$statusf"
   sig=$(seen_sig "$statusf"); printf '%s' "$sig" > "$state/.seen-review-scout_status"
+  printf '%s\tlaunched\n' "$(date +%s)" > "$state/review-scout.heartbeat"
+  date +%s > "$state/review-scout.started"
   key=$(printf '%s' "$window" | tr ':/.' '___')
   # No completed turn for hours (the single blocking poll call): age the spawn
   # record itself, exactly as the never-completed-a-turn fixtures above do.
@@ -3925,6 +4171,8 @@ test_afk_busy_declared_pause_hands_off_plain_stale() {
   record_pi_busy "$state" afk-review-scout
   printf 'paused: hosting the Lavish review, awaiting captain feedback\n' > "$statusf"
   sig=$(seen_sig "$statusf"); printf '%s' "$sig" > "$state/.seen-afk-review-scout_status"
+  printf '%s\tlaunched\n' "$(date +%s)" > "$state/afk-review-scout.heartbeat"
+  date +%s > "$state/afk-review-scout.started"
   key=$(printf '%s' "$window" | tr ':/.' '___')
   touch -t 200001010000 "$state/afk-review-scout.meta"
   date '+%s' > "$state/.afk"
@@ -4030,6 +4278,8 @@ SH
   record_pi_busy "$state" afk-ticking-scout
   printf 'paused: hosting the Lavish review, awaiting captain feedback\n' > "$statusf"
   sig=$(seen_sig "$statusf"); printf '%s' "$sig" > "$state/.seen-afk-ticking-scout_status"
+  printf '%s\tlaunched\n' "$(date +%s)" > "$state/afk-ticking-scout.heartbeat"
+  date +%s > "$state/afk-ticking-scout.started"
   key=$(printf '%s' "$window" | tr ':/.' '___')
   touch -t 200001010000 "$state/afk-ticking-scout.meta"
   date '+%s' > "$state/.afk"
@@ -4335,6 +4585,8 @@ test_secondmate_home_supervision_churn_is_not_write_evidence() {
   # it into the wedge timer.
   printf 'working: implementing\n' > "$state/mate.status"
   sig=$(seen_sig "$state/mate.status"); printf '%s' "$sig" > "$state/.seen-mate_status"
+  printf '%s\tlaunched\n' "$(date +%s)" > "$state/mate.heartbeat"
+  date +%s > "$state/mate.started"
   key=$(printf '%s' "$window" | tr ':/.' '___')
   set_mtime "$(( $(date +%s) - 4000 ))" "$state/mate.meta"
   back=$(( $(date +%s) - 500 ))
@@ -5336,6 +5588,13 @@ test_paused_until_that_passed_is_rechecked_before_the_cadence() {
   pass "a declared wait whose until time has passed is rechecked at once, then held to the cadence"
 }
 
+# The full suite is intentionally long because it drives many bounded watcher
+# recovery cycles; FM_TEST_ONLY keeps a new regression case independently runnable.
+if [ -n "${FM_TEST_ONLY:-}" ]; then
+  case "$FM_TEST_ONLY" in test_*) "$FM_TEST_ONLY" ;; *) fail "invalid FM_TEST_ONLY function: $FM_TEST_ONLY" ;; esac
+  exit 0
+fi
+
 test_status_span_actionable_classifier
 test_status_span_is_all_receipts_classifier
 test_status_span_survives_a_later_routine_append
@@ -5405,6 +5664,11 @@ test_wedge_escalation_resets_when_pane_becomes_active
 test_busy_pane_below_turn_age_bound_is_absorbed
 test_busy_pane_stable_hash_escalates_past_turn_age_bound
 test_busy_pane_changing_hash_escalates_past_turn_age_bound
+test_ticking_live_worker_with_missing_heartbeat_wakes_stuck_board
+test_stuck_board_ignores_terminal_lanes_and_old_base_commits
+test_stuck_board_handles_pr_boolean_empty_review_and_failed_reads
+test_slow_forge_reads_do_not_starve_local_no_progress_breaches
+test_repeated_identical_failure_breaches_once_per_episode
 test_busy_pane_turn_end_touch_resets_age
 test_busy_pane_native_progress_resets_age
 test_busy_pane_repeated_escalation_reaches_demand_deep_inspection

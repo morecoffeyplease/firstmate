@@ -15,6 +15,38 @@ The tracked code root contains the shared instruction, skill, documentation, wor
 `config/` holds local gitignored operating choices, including explicit extension bindings under `config/extensions.d/`, and `projects/` holds the local project clones that Firstmate reads but changes only through the narrow guarded and concrete captain-approved exceptions in `AGENTS.md`.
 Untracked files and directories whose names begin with `scratchpad` are also gitignored, so temporary scratch does not make porcelain-based secondmate sync guards treat a home as dirty.
 
+## Worker stuck board (config/stuck-board)
+
+The watcher checks ship and scout lanes for deterministic stuck signals and wakes the home that owns each lane.
+Each breach is surfaced once while that condition remains true, and the marker clears when the condition clears.
+Ship and scout briefs include the exact `bin/fm-task-heartbeat.sh` command and require workers to record a one-line activity note at least every 15 minutes.
+The heartbeat is a separate state record and does not append a status-log wake.
+The watcher also checks for no observed progress, a missing draft pull request, a review wait, repeated identical failures, and a ready pull request that has waited too long.
+The check runs on the existing watcher slow-check cadence and makes no model calls.
+
+Each home can override the defaults in its gitignored `config/stuck-board` file.
+Use one positive whole-number `key=value` entry per line; omitted keys keep their defaults.
+
+```text
+heartbeat_seconds=900
+progress_seconds=3600
+draft_pr_seconds=14400
+review_seconds=7200
+failure_repeats=2
+ready_pr_seconds=86400
+```
+
+`progress_seconds` measures time since the latest locally observed status-log update or local commit, or last successfully observed pushed head or pull-request head update, with the lane start as its earliest baseline.
+The rule means no progress has been observed; when a forge read fails, its last good remote observation remains in use and is not refreshed.
+Done, failed, needs-decision, blocked, and paused lanes do not trigger heartbeat or no-progress rules.
+The separate 45-minute command rule is tracked in [issue #60](https://github.com/morecoffeyplease/firstmate/issues/60) and is not inferred from process trees here.
+Pull-request rules remain active for terminal lanes and read the URL recorded in task metadata.
+An empty review decision is treated as waiting when the open pull request has no approved review, and every open non-draft pull request is subject to the ready-pull-request timer.
+GitHub pull-request rules require the GitHub CLI to be authenticated.
+When a forge read fails, the check keeps the existing pull-request timer observations and retries on a later watcher poll.
+The network portion rotates its starting lane between polls so a slow forge call cannot indefinitely starve later lanes.
+`bin/fm-stuck-board.sh` owns the signal rules, config parsing, and breach episodes, while the helper headers own exact commands and output.
+
 `bin/fm-spawn.sh` owns the base task-metadata fields it emits, while the runtime-backend section below owns backend-specific fields and selector interpretation.
 For issue-linked direct-PR ship tasks, `config/github-operator-login` names the GitHub login assigned during pickup; pass the canonical issue URL with `fm-spawn.sh --issue`, which records it in task metadata for the PR-ready closing-reference check.
 Every direct-PR ship needs `--issue` or the explicit `--no-issue` opt-out, while scouts and local-only tasks are exempt.

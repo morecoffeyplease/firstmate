@@ -665,10 +665,12 @@ test_local_only_fork_remote_allows() {
 }
 
 test_teardown_closes_the_backlog_item_itself() {
-  local case_dir out
+  local case_dir out sibling_marker
   case_dir=$(make_case tasks-axi-close)
   write_meta "$case_dir" direct-PR ship
   printf '%s\n' 'pr=https://github.com/example/repo/pull/7' >> "$case_dir/state/task-x1.meta"
+  sibling_marker="$case_dir/state/.stuck-task-x1-child-heartbeat"
+  printf 'sibling episode\n' > "$sibling_marker"
   seed_backlog_in_flight "$case_dir"
 
   out=$(run_teardown "$case_dir") || fail "teardown failed with a real backlog"
@@ -678,6 +680,7 @@ test_teardown_closes_the_backlog_item_itself() {
     "closed backlog item did not record the task's PR"
   assert_absent "$case_dir/state/task-x1.backlog-close" \
     "a landed close left its pending-close record behind"
+  assert_present "$sibling_marker" "teardown removed a stuck marker belonging to a longer task id"
   printf '%s\n' "$out" | grep -F 'bin/fm-tasks-axi.sh ready' >/dev/null \
     || fail "teardown dropped the dependency-cleared follow-up: $out"
   printf '%s\n' "$out" | grep -F 'check date gates' >/dev/null \
