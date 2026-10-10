@@ -70,6 +70,10 @@ fm_test_captain_decision() {  # <path> <question>
     recommended_option:"B",recommendation:"Choose B because it addresses the reported user impact."}' > "$1"
 }
 
+fm_test_captain_decision_json() {  # <question>
+  fm_test_captain_decision /dev/stdout "$1" | jq -c .
+}
+
 fail() {
   printf 'not ok - %s\n' "$1" >&2
   exit 1

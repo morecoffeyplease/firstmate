@@ -23,6 +23,11 @@ if [ -z "${FM_TEST_DAEMON_SOURCED:-}" ]; then
 fi
 
 TMP_ROOT=$(fm_test_tmproot fm-daemon-tests)
+decision_json() {  # <question>
+  local path="$TMP_ROOT/captain-decision.json"
+  fm_test_captain_decision "$path" "$1"
+  jq -c . "$path"
+}
 FM_DAEMON_PRIMARY_HARNESS=claude
 export FM_DAEMON_PRIMARY_HARNESS
 
@@ -549,16 +554,17 @@ EOF
 }
 
 test_catchall_scan_surfaces_a_masked_event() {
-  local dir state
+  local dir state decision
   dir=$(make_supercase catchall-masked)
   state="$dir/state"
-  printf 'working: setup\nneeds-decision [key=release]: pick A or B\nfailed: release build broke\nworking: tidying the branch\n' \
+  decision=$(decision_json 'pick A or B')
+  printf 'working: setup\nneeds-decision [key=release]: %s\nfailed: release build broke\nworking: tidying the branch\n' "$decision" \
     > "$state/catch-m1.status"
   rm -f "$state/.subsuper-last-scan"
   FM_STATE_OVERRIDE="$state" housekeeping "$state"
   [ -s "$state/.subsuper-escalations" ] \
     || fail "the catch-all scan missed a decision hidden behind a later working: line"
-  grep -F "needs-decision [key=release]: pick A or B" "$state/.subsuper-escalations" >/dev/null \
+  grep -F "needs-decision [key=release]: $decision" "$state/.subsuper-escalations" >/dev/null \
     || fail "the catch-all scan omitted the decision it found"
   grep -F "failed: release build broke" "$state/.subsuper-escalations" >/dev/null \
     || fail "the catch-all scan committed past a failure it did not report"
@@ -1487,13 +1493,14 @@ test_handle_wake_routes_self_and_escalate() {
 # (queued-row and catch-all alike), and re-escalate when the status log grows.
 # https://github.com/kunchenguid/firstmate/issues/4096
 test_needs_decision_queued_row_escalates_once_as_the_decision() {
-  local dir state fakebin status_file payload out
+  local dir state fakebin status_file payload out decision
   dir=$(make_supercase needs-decision-queued-row)
   state="$dir/state"
   fakebin="$dir/daemon-bin"
   mkdir -p "$fakebin"
   status_file="$state/decision-task.status"
-  printf 'working: setup\nneeds-decision [key=release]: pick A or B\n' > "$status_file"
+  decision=$(decision_json 'pick A or B')
+  printf 'working: setup\nneeds-decision [key=release]: %s\n' "$decision" > "$status_file"
   payload="needs-decision: $status_file"
   cat > "$fakebin/fm-wake-drain.sh" <<EOF
 #!/usr/bin/env bash
@@ -1511,7 +1518,7 @@ EOF
     *"unknown wake:"*) fail "a decision-owned wake was labelled unknown: $out" ;;
   esac
   case "$out" in
-    *"needs-decision [key=release]: pick A or B"*) ;;
+    *"needs-decision [key=release]: $decision"*) ;;
     *) fail "the first decision-owned wake was not presented as the decision: $out" ;;
   esac
   [ "$(wc -l < "$state/.subsuper-escalations" | tr -d ' ')" = 1 ] \
@@ -1529,7 +1536,8 @@ EOF
   [ ! -s "$state/.subsuper-escalations" ] \
     || fail "the catch-all scan re-escalated an already-surfaced open decision: $(cat "$state/.subsuper-escalations")"
 
-  printf 'needs-decision [key=release]: pick A, C, or D\n' >> "$status_file"
+  decision=$(decision_json 'pick A, C, or D')
+  printf 'needs-decision [key=release]: %s\n' "$decision" >> "$status_file"
   : > "$state/.subsuper-escalations"
   FM_DAEMON_DIR="$fakebin" FM_STATE_OVERRIDE="$state" FM_ESCALATE_BATCH_SECS=999 \
     handle_durable_wakes fallback "$state" \
@@ -1539,7 +1547,7 @@ EOF
     *"unknown wake:"*) fail "a changed decision-owned wake was labelled unknown: $out" ;;
   esac
   case "$out" in
-    *"needs-decision [key=release]: pick A, C, or D"*) ;;
+    *"needs-decision [key=release]: $decision"*) ;;
     *) fail "a later status change did not re-escalate the decision: $out" ;;
   esac
 

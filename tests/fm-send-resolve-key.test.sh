@@ -42,6 +42,10 @@ DRAIN="$ROOT/bin/fm-wake-drain.sh"
 
 TMP_ROOT=$(fm_test_tmproot fm-send-resolve-key)
 
+decision_json() {  # <question>
+  fm_test_captain_decision_json "$1"
+}
+
 # Stub tmux: logs literal typed text to FM_SEND_LOG and lets the submit path
 # reach a clean "empty" verdict (numeric cursor_y, empty bordered composer).
 # FM_FAKE_TMUX_SEND_FAIL=1 makes send-keys fail so the delivery-failure leg can
@@ -123,7 +127,7 @@ test_answer_send_closes_open_decision() {
   fb=$(make_stubs "$dir"); log="$dir/send.log"
   home=$(setup_home closes)
   fm_write_meta "$home/state/t1.meta" "window=sess:fm-t1" "kind=ship"
-  printf 'needs-decision [key=api-shape]: pick REST or RPC\n' > "$home/state/t1.status"
+  printf 'needs-decision [key=api-shape]: %s\n' "$(decision_json 'Choose REST or RPC')" > "$home/state/t1.status"
   printf 'working: kept busy on an unrelated stream\n' >> "$home/state/t1.status"
 
   out=$(drain_out "$home")
@@ -151,7 +155,7 @@ test_answer_text_may_begin_with_option_token() {
   fb=$(make_stubs "$dir"); log="$dir/send.log"
   home=$(setup_home option-answer)
   fm_write_meta "$home/state/t-option.meta" "window=sess:fm-option" "kind=ship"
-  printf 'needs-decision [key=answer-format]: choose a response\n' > "$home/state/t-option.status"
+  printf 'needs-decision [key=answer-format]: %s\n' "$(decision_json 'Choose a response')" > "$home/state/t-option.status"
 
   run_send "$fb" "$home" "$log" t-option --resolve-key answer-format -- "--resolve-key is answer text"; rc=$?
   expect_code 0 "$rc" "an answer beginning with an option-looking token should succeed after --"
@@ -172,7 +176,7 @@ test_answer_close_is_self_announced() {
   fb=$(make_stubs "$dir"); log="$dir/send.log"
   home=$(setup_home self-announced)
   fm_write_meta "$home/state/t9.meta" "window=sess:fm-t9" "kind=ship"
-  printf 'needs-decision [key=port-choice]: 8080 or 9090\n' > "$home/state/t9.status"
+  printf 'needs-decision [key=port-choice]: %s\n' "$(decision_json 'Choose port 8080 or 9090')" > "$home/state/t9.status"
   FM_STATE_OVERRIDE="$home/state" bash -c '
     . "$1"
     fm_wake_status_mark_current "$2" "$3"
@@ -208,7 +212,7 @@ test_colon_first_key_position_is_answerable() {
   fb=$(make_stubs "$dir"); log="$dir/send.log"
   home=$(setup_home colon-first)
   fm_write_meta "$home/state/t8.meta" "window=sess:fm-t8" "kind=ship"
-  printf 'needs-decision: [key=seam-max-bound] cap the seam at 4 or 8\n' > "$home/state/t8.status"
+  printf 'needs-decision: [key=seam-max-bound] %s\n' "$(decision_json 'Choose whether to cap the seam at 4 or 8')" > "$home/state/t8.status"
 
   out=$(drain_out "$home")
   printf '%s' "$out" | grep -F '[key=seam-max-bound]' >/dev/null \
@@ -232,7 +236,7 @@ test_answer_starts_work_never_orphans() {
   fb=$(make_stubs "$dir"); log="$dir/send.log"
   home=$(setup_home starts-work)
   fm_write_meta "$home/state/t2.meta" "window=sess:fm-t2" "kind=ship"
-  printf 'needs-decision [key=rollout]: big-bang or phased\n' > "$home/state/t2.status"
+  printf 'needs-decision [key=rollout]: %s\n' "$(decision_json 'Choose a big-bang or phased rollout')" > "$home/state/t2.status"
 
   run_send "$fb" "$home" "$log" t2 --resolve-key rollout "phased, gate each region"; rc=$?
   expect_code 0 "$rc" "the rollout answer send should succeed"
@@ -255,7 +259,7 @@ test_routine_steer_never_closes() {
   fb=$(make_stubs "$dir"); log="$dir/send.log"
   home=$(setup_home routine)
   fm_write_meta "$home/state/t3.meta" "window=sess:fm-t3" "kind=ship"
-  printf 'needs-decision [key=schema]: split or embed\n' > "$home/state/t3.status"
+  printf 'needs-decision [key=schema]: %s\n' "$(decision_json 'Choose whether to split or embed the schema')" > "$home/state/t3.status"
 
   run_send "$fb" "$home" "$log" t3 "unrelated nudge, keep going"; rc=$?
   expect_code 0 "$rc" "a routine steer should still succeed"
@@ -280,7 +284,7 @@ test_not_open_key_refuses_before_send() {
   fb=$(make_stubs "$dir"); log="$dir/send.log"; err="$dir/send.err"
   home=$(setup_home not-open)
   fm_write_meta "$home/state/t4.meta" "window=sess:fm-t4" "kind=ship"
-  printf 'needs-decision [key=real-key]: choose\n' > "$home/state/t4.status"
+  printf 'needs-decision [key=real-key]: %s\n' "$(decision_json 'Choose an option')" > "$home/state/t4.status"
 
   : > "$log"
   env PATH="$fb:$PATH" \
@@ -360,9 +364,9 @@ test_multiple_keys_close_together() {
   home=$(setup_home multi)
   fm_write_meta "$home/state/t6.meta" "window=sess:fm-t6" "kind=ship"
   {
-    printf 'needs-decision [key=k1]: first\n'
+    printf 'needs-decision [key=k1]: %s\n' "$(decision_json 'Choose the first option')"
     printf 'blocked [key=k2]: second\n'
-    printf 'needs-decision [key=k3]: third, unanswered\n'
+    printf 'needs-decision [key=k3]: %s\n' "$(decision_json 'Choose the third option')"
   } > "$home/state/t6.status"
 
   run_send "$fb" "$home" "$log" t6 --resolve-key k1 --resolve-key k2 \
@@ -383,7 +387,7 @@ test_local_secondmate_answer_marked_and_closed() {
   fb=$(make_stubs "$dir"); log="$dir/send.log"
   home=$(setup_home sm)
   fm_write_secondmate_meta "$home/state/domain.meta" "$home" "sess:fm-domain"
-  printf 'needs-decision [key=fleet-split]: shard by team or by repo\n' > "$home/state/domain.status"
+  printf 'needs-decision [key=fleet-split]: %s\n' "$(decision_json 'Choose whether to shard by team or repository')" > "$home/state/domain.status"
 
   run_send "$fb" "$home" "$log" fm-domain --resolve-key fleet-split "shard by team"; rc=$?
   expect_code 0 "$rc" "a secondmate answer send should succeed"
@@ -439,7 +443,7 @@ test_remote_secondmate_answer_closes_locally() {
   dir="$TMP_ROOT/remote-ok"; mkdir -p "$dir"
   fb=$(make_stubs "$dir"); log="$dir/send.log"; ssh_log="$dir/ssh.log"; : > "$ssh_log"
   home=$(setup_remote_home remote-ok)
-  printf 'needs-decision [key=upgrade-window]: tonight or the weekend\n' > "$home/state/rsm.status"
+  printf 'needs-decision [key=upgrade-window]: %s\n' "$(decision_json 'Choose tonight or the weekend for the upgrade')" > "$home/state/rsm.status"
 
   : > "$log"
   env PATH="$fb:$PATH" \
@@ -471,7 +475,8 @@ test_remote_reply_corr_tag_does_not_block_resolve_key() {
   dir="$TMP_ROOT/remote-corr-tag"; mkdir -p "$dir"
   fb=$(make_stubs "$dir"); log="$dir/send.log"; ssh_log="$dir/ssh.log"; : > "$ssh_log"
   home=$(setup_remote_home remote-corr-tag)
-  printf 'needs-decision [corr=d448ea86afa4bf67] [key=loan-installment-cadence-amount]: pick the cadence\n' \
+  printf 'needs-decision [corr=d448ea86afa4bf67] [key=loan-installment-cadence-amount]: %s\n' \
+    "$(decision_json 'Choose the loan installment cadence')" \
     > "$home/state/rsm.status"
 
   out=$(drain_out "$home")
@@ -522,7 +527,7 @@ test_flag_misuse_refuses() {
   fb=$(make_stubs "$dir"); log="$dir/send.log"; err="$dir/send.err"
   home=$(setup_home misuse)
   fm_write_meta "$home/state/t7.meta" "window=sess:fm-t7" "kind=ship"
-  printf 'needs-decision [key=k]: choose\n' > "$home/state/t7.status"
+  printf 'needs-decision [key=k]: %s\n' "$(decision_json 'Choose an option')" > "$home/state/t7.status"
 
   # --resolve-key with --key (both orders) is refused: an answer is text.
   : > "$log"
@@ -663,7 +668,7 @@ test_long_decision_key_refuses_before_send() {
   home=$(setup_home long-key)
   key=$(printf 'k%.0s' {1..230})
   fm_write_meta "$home/state/t1.meta" "window=sess:fm-t1" "kind=ship"
-  printf 'needs-decision [key=%s]: choose safely\n' "$key" > "$home/state/t1.status"
+  printf 'needs-decision [key=%s]: %s\n' "$key" "$(decision_json 'Choose safely')" > "$home/state/t1.status"
 
   : > "$log"
   env PATH="$fb:$PATH" \
@@ -692,7 +697,7 @@ test_failed_close_recovery_command_is_shell_safe() {
   marker="$dir/injected"
   answer="ok'; touch $marker; echo '"
   fm_write_meta "$home/state/t1.meta" "window=sess:fm-t1" "kind=ship"
-  printf 'needs-decision [key=quote-safety]: choose safely\n' > "$home/state/t1.status"
+  printf 'needs-decision [key=quote-safety]: %s\n' "$(decision_json 'Choose safely')" > "$home/state/t1.status"
   chmod 0400 "$home/state/t1.status"
 
   env PATH="$fb:$PATH" \

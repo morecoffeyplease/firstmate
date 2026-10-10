@@ -12,6 +12,12 @@ GRANT="$ROOT/bin/fm-wake-grant.sh"
 OUTCOMES="$ROOT/bin/fm-branch-outcome.sh"
 TMP_ROOT=$(fm_test_tmproot fm-wake-drain-outcome-backstop-tests)
 
+decision_json() {  # <question>
+  local path="$TMP_ROOT/captain-decision.json"
+  fm_test_captain_decision "$path" "$1"
+  jq -c . "$path"
+}
+
 set_mtime() {  # <epoch> <file>
   perl -e 'utime($ARGV[0], $ARGV[0], $ARGV[1]) or exit 1' "$1" "$2"
 }
@@ -38,7 +44,7 @@ test_uncovered_keyless_captain_events_surface_on_the_next_main_drain() {
 
   printf 'done: PR https://example.test/3346 checks green\n' > "$state/done-task.status"
   printf 'blocked: release credential unavailable\n' > "$state/blocked-task.status"
-  printf 'needs-decision: choose REST or RPC\n' > "$state/decision-task.status"
+  printf 'needs-decision: %s\n' "$(decision_json 'Choose REST or RPC')" > "$state/decision-task.status"
   set_mtime "$old" "$state/done-task.status"
   set_mtime "$old" "$state/blocked-task.status"
   set_mtime "$old" "$state/decision-task.status"
@@ -51,7 +57,7 @@ test_uncovered_keyless_captain_events_surface_on_the_next_main_drain() {
   case "$body" in *'done-task done: PR https://example.test/3346 checks green'*) ;; *) fail "keyless done event did not surface in the backstop: $body" ;; esac
   grep -F 'blocked-task blocked: release credential unavailable' "$out" >/dev/null \
     || fail "keyless blocked event did not surface through OPEN DECISIONS: $(cat "$out")"
-  grep -F 'decision-task needs-decision: choose REST or RPC' "$out" >/dev/null \
+  grep -F '"question":"Choose REST or RPC"' "$out" >/dev/null \
     || fail "keyless needs-decision event did not surface through OPEN DECISIONS: $(cat "$out")"
   pass "a newest keyless done, blocked, or needs-decision event with no newer branch outcome surfaces on the next main drain"
 }

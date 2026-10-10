@@ -421,11 +421,12 @@ if command -v tasks-axi >/dev/null 2>&1; then
     --start --file data/backlog.md >/dev/null)
   printf 'window=firstmate:fm-worker\nworktree=%s/projects/worker\nproject=alpha\nharness=codex\nkind=scout\n' \
     "$real_home" > "$real_home/state/worker.meta"
-  printf 'needs-decision [key=route]: choose north or south\n' > "$real_home/state/worker.status"
   printf '# Worker report\n\nTwo routes remain open.\n' > "$real_home/data/worker/report.md"
   cat > "$real_home/decision-input.json" <<'JSON'
 {"schema":"fm-captain-decision.v1","question":"Which route should the guests use?","context":"Guests need a route that works on older phones.","user_impact":"This affects how quickly guests can join.","options":[{"label":"A","title":"Keep the current route","pros":["Existing links keep working."],"cons":["Older phones may load slowly."]},{"label":"B","title":"Use the lighter route","pros":["More guests can join quickly."],"cons":["The update needs a short migration."]}],"recommended_option":"B","recommendation":"Choose B because faster loading helps more guests join."}
 JSON
+  printf 'needs-decision [key=route]: %s\n' "$(cat "$real_home/decision-input.json")" \
+    > "$real_home/state/worker.status"
   if env FM_ROOT_OVERRIDE="$ROOT" FM_HOME="$real_home" \
     FM_STATE_OVERRIDE="$real_home/state" FM_DATA_OVERRIDE="$real_home/data" \
     FM_CONFIG_OVERRIDE="$real_home/config" "$ROOT/bin/fm-captain-hold.sh" hold missing-decision \

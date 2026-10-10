@@ -8,6 +8,12 @@ set -u
 CREW_STATE="$ROOT/bin/fm-crew-state.sh"
 TMP_ROOT=$(fm_test_tmproot fm-crew-state)
 
+decision_json() {  # <question>
+  local path="$TMP_ROOT/captain-decision.json"
+  fm_test_captain_decision "$path" "$1"
+  jq -c . "$path"
+}
+
 new_case() {  # <name> <id> -> echoes the case directory
   local dir="$TMP_ROOT/$1" id=$2
   mkdir -p "$dir/state" "$dir/worktree" "$dir/fakebin"
@@ -70,11 +76,12 @@ test_idle_record_allows_status_log_fallback() {
   local dir out
   dir=$(new_case idle idle)
   write_idle_record "$dir" idle
-  printf 'needs-decision [key=storage]: choose a storage backend\nnote: unrelated progress\n' > "$dir/state/idle.status"
+  printf 'needs-decision [key=storage]: %s\nnote: unrelated progress\n' \
+    "$(decision_json 'Choose a storage backend')" > "$dir/state/idle.status"
   out=$(run_state "$dir" idle)
-  assert_contains "$out" 'state: parked' 'idle endpoint retains the open status-log decision'
+  assert_contains "$out" '"question":"Choose a storage backend"' 'idle endpoint retains the open status-log decision'
   assert_contains "$out" 'source: status-log' 'idle endpoint identifies the status-log source'
-  assert_contains "$out" 'choose a storage backend' 'status detail is preserved'
+  assert_contains "$out" '"question":"Choose a storage backend"' 'status detail is preserved'
   pass 'idle endpoint reconciles the latest status event'
 }
 
@@ -93,7 +100,8 @@ test_terminal_status_supersedes_stale_decision() {
   local dir out
   dir=$(new_case terminal terminal)
   write_idle_record "$dir" terminal
-  printf 'needs-decision [key=choice]: choose one\ndone: shipped the selected option\n' > "$dir/state/terminal.status"
+  printf 'needs-decision [key=choice]: %s\ndone: shipped the selected option\n' \
+    "$(decision_json 'Choose one')" > "$dir/state/terminal.status"
   out=$(run_state "$dir" terminal)
   assert_contains "$out" 'state: done' 'a single-owner terminal event supersedes its stale decision'
   assert_contains "$out" 'shipped the selected option' 'terminal detail is preserved'
@@ -104,7 +112,8 @@ test_unrecognized_status_event_is_not_current_state() {
   local dir out
   dir=$(new_case resolved resolved)
   write_idle_record "$dir" resolved
-  printf 'needs-decision [key=choice]: choose one\nresolved [key=choice]: chose one\n' > "$dir/state/resolved.status"
+  printf 'needs-decision [key=choice]: %s\nresolved [key=choice]: chose one\n' \
+    "$(decision_json 'Choose one')" > "$dir/state/resolved.status"
   out=$(run_state "$dir" resolved)
   assert_contains "$out" 'state: unknown' 'decision-closing event is not a state'
   assert_contains "$out" 'source: none' 'decision-closing event does not become a source'

@@ -247,7 +247,9 @@ window=synthetic:fm-decision-task
 backend=tmux
 kind=ship
 EOF
-  printf 'needs-decision [key=api-shape]: captain must choose the synthetic API shape\n' > "$dir/home/state/decision-task.status"
+  printf 'needs-decision [key=api-shape]: %s\n' \
+    "$(fm_test_captain_decision_json 'Choose the synthetic API shape')" \
+    > "$dir/home/state/decision-task.status"
   date +%s > "$dir/home/state/.afk"
   printf '1784074271\t1\tsignal\tdecision-task.status\tsignal: synthetic decision\n' > "$dir/home/state/.fake-drain"
   out=$(run_return "$dir" begin) || fail "approval decision should not be treated as a firstmate blocker: $out"
