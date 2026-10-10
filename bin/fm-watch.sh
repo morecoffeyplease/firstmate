@@ -2237,6 +2237,18 @@ EOF_STUCK
     else
       rm -f -- "$STATE/.stuck-board-error"
     fi
+    # Project-rules receipts ride the same cadence; bin/fm-project-rules.sh owns
+    # what each alarm line means and prints one line per new episode only.
+    while IFS= read -r rules_line; do
+      case "$rules_line" in
+        project-rules:*)
+          fm_wake_append check "$rules_line" "$rules_line" || exit 1
+          stuck_reason="${stuck_reason}check: ${rules_line}"$'\n'
+          ;;
+      esac
+    done <<EOF_RULES
+$(FM_HOME="$FM_HOME" "$SCRIPT_DIR/fm-project-rules.sh" scan "$STATE" 2>/dev/null || true)
+EOF_RULES
     if [ -n "$stuck_reason" ]; then
       wake "${stuck_reason%$'\n'}"
     fi
