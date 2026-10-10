@@ -63,7 +63,7 @@ Admission runs `prepare`, then each `resolve`, in the copy with stdin closed, a 
 The launch is refused, and no agent starts, when:
 
 - the prepare step fails or times out;
-- the prepare step or any resolve command changes the copy's working tree, compared with how it was before they ran, so a relaunch of a copy holding the worker's own uncommitted work is still admitted;
+- the prepare step or any resolve command changes the copy's working tree, compared by status and by file content with how it was before they ran, so a relaunch of a copy holding the worker's own uncommitted work is still admitted;
 - a declared file is missing or is not a readable regular file;
 - an inlined file contains an `@path` import line, which a verbatim copy cannot expand;
 - the rendered block is larger than 79,000 bytes;
@@ -81,7 +81,8 @@ Register only projects whose default branch you would let a worker run code from
 A declared file may live outside the copy, which is how pinned plugin assets are reached, and its content is given to the worker verbatim.
 
 A project's command patterns are matched under a time limit, and a pattern that runs out of time counts as a match.
-While a stage is open on Claude, the only shell command allowed is one simple command that runs a worker-facing Firstmate script by its exact path, with no shell operators, substitutions or redirections.
+While a stage is open on Claude, the only shell command allowed is one simple command, with no shell operators, substitutions or redirections, that runs one of the worker's own Firstmate commands by exact path: this helper's `next`, `ack` and `serve`, the heartbeat, and a decision event.
+An environment prefix is accepted only when it names Firstmate's own root, home and state for that task, so it cannot point the script at other code.
 
 ## The always-on block
 
@@ -135,6 +136,13 @@ Each newly detected compaction is steered to the worker once through its inbox, 
 Calls made in the same turn as a compaction inside that turn are counted and reported.
 A project call in a later turn, before the stage is answered, is reported as a violation.
 
+Every command in a Codex tool call is read: JSON arguments, each command of a batched script in any quote style, and a shell action.
+When a call holds a command that cannot be read as a literal, such as a variable, the whole call text is inspected as well.
+Following Firstmate's own doorbell is not counted as work: a plain `ls`, `cat`, `head`, `tail`, `mv` or `mkdir` whose every path lies inside the task's inbox.
+Neither is a call that carries no command, such as a wait.
+A helper call written as a template is still a helper call when every other string in that call is a plain word.
+A call that starts with Firstmate's own commands and then works, or that finishes reading a skill and then runs its command, is in order when the stage or the read is complete by the time the call's output is logged.
+
 ## Children
 
 A child agent does not receive the block.
@@ -170,14 +178,15 @@ The two compaction signals are the hook and the transcript's `compact_boundary` 
 
 - a stage is open;
 - the tool's own log does not show the block, or a file declared native, for the current generation;
-- a declared source changed on disk, or the last log read failed;
+- a declared source changed on disk, or the tool's own log or the task's record could not be read;
 - a violation has been recorded but has not yet reached the supervisor as an alarm;
 - a command ran without its required skill and the skill has not been read since;
-- the work changed files under a required skill's paths and that skill was never read.
+- the work changed files under a required skill's paths and that skill is not read in the current generation.
 
 ## Qualification (`config/project-rules-qualified`)
 
-The live guard `tests/fm-project-rules-live-e2e.test.sh` writes this file when it passes.
+The live guard `tests/fm-project-rules-live-e2e.test.sh` merges its rows into this file only when every leg passed for a tool, with 2 sessions per live leg: the start and forced-compaction sessions, the automatic-compaction sessions, the independent coverage check, the prepare rerun, and the refusals.
+A leg that was left out or could not be measured qualifies nothing.
 It is local, gitignored, and inherited by secondmate homes.
 
 ```text

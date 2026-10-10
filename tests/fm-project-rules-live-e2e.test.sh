@@ -293,7 +293,7 @@ check_stage() {
 # limits leave room to read the brief and skills again after the compaction; a
 # limit close to the session's starting size makes each refresh trigger the
 # next compaction.
-FILLER="$TMP/filler"; GROUPS_MAX=12
+FILLER="$TMP/filler"; GROUPS_MAX=16
 if [ -n "${FM_PROJECT_RULES_ACCEPT_REPO:-}" ]; then CODEX_AUTO_LIMIT=100000; else CODEX_AUTO_LIMIT=60000; fi
 for g in $(seq -w 1 "$GROUPS_MAX"); do
   mkdir -p "$FILLER/g$g"
@@ -302,7 +302,10 @@ for g in $(seq -w 1 "$GROUPS_MAX"); do
   done
 done
 fill_task() {  # <group number>
-  printf '%s' "Print every file in $FILLER/g$(printf '%02d' "$1"). The files only fill your context: if an output is cut short, move on. Then append the status line 'working: F$1 done' and end your turn."
+  local how="Print every file in"
+  # Claude's shell output is capped per command, so it reads each file whole.
+  [ "$TOOL" != claude ] || how="Read each file completely with your file-reading tool, one file per call, in"
+  printf '%s' "$how $FILLER/g$(printf '%02d' "$1"). The files only fill your context: if an output is cut short, move on. Then append the status line 'working: F$1 done' and end your turn."
 }
 replay_worker() {  # <tool> <run>
   local fakebin log launch wt script args_var extra=()

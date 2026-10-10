@@ -189,7 +189,10 @@ test_claude_hook_verdicts() {
   denied() { rc=0; out=$(hook pretool "$1" 2>&1) || rc=$?; expect_code 2 "$rc" "$2"; assert_contains "$out" "$3" "$2 must say what to do"; }
   allowed() { hook pretool "$1" >/dev/null 2>&1 || fail "$2"; }
   denied '{"tool_name":"Bash","tool_input":{"command":"ls"}}' "a project command while the start stage is open" "next"
-  allowed "{\"tool_name\":\"Bash\",\"tool_input\":{\"command\":\"FM_HOME='/x' '$ROOT/bin/fm-project-rules.sh' next '$STATE' 't1'\"}}" "the helper itself must stay allowed while a stage is open"
+  allowed "{\"tool_name\":\"Bash\",\"tool_input\":{\"command\":\"FM_HOME='$(dirname "$STATE")' FM_STATE_OVERRIDE='$STATE' '$ROOT/bin/fm-project-rules.sh' next '$STATE' 't1'\"}}" "the helper itself must stay allowed while a stage is open"
+  allowed "{\"tool_name\":\"Bash\",\"tool_input\":{\"command\":\"'$ROOT/bin/fm-task-heartbeat.sh' 't1' '$STATE' \\\"reading the brief\\\"\"}}" "the heartbeat must stay allowed while a stage is open"
+  denied "{\"tool_name\":\"Bash\",\"tool_input\":{\"command\":\"FM_ROOT_OVERRIDE='/tmp/evil' '$ROOT/bin/fm-captain-hold.sh' decision-event t1\"}}" "a helper pointed at another root" "next"
+  denied "{\"tool_name\":\"Bash\",\"tool_input\":{\"command\":\"'$ROOT/bin/fm-project-rules.sh' merge-settings /tmp/x '$STATE' t1\"}}" "a helper verb that is not the worker's" "next"
   allowed '{"tool_name":"Read","tool_input":{"file_path":"/tmp/x"}}' "file reads must stay allowed while a stage is open"
   denied "{\"tool_name\":\"Bash\",\"tool_input\":{\"command\":\"'$ROOT/bin/fm-project-rules.sh' next '$STATE' 't1'; touch /tmp/x\"}}" "a command chained after the helper" "next"
   denied "{\"tool_name\":\"Bash\",\"tool_input\":{\"command\":\"$ROOT/bin/../bin/fm-spawn.sh x\"}}" "another script reached through the helper's folder" "next"
@@ -405,9 +408,27 @@ test_codex_following_the_doorbell_is_not_a_violation() {
   close_stage
   assert_equals "" "$("$PR" scan "$STATE" t1)" "helper calls written as a template loop must not count as work before the refresh"
   codex_log '[compacted([]),event()]'; "$PR" detect "$STATE" t1
-  codex_log "[started(),call(\"cat '$inbox/002.msg'; touch elsewhere.txt\")]"
-  assert_contains "$("$PR" scan "$STATE" t1)" "worked-before-refresh stage c3" "an inbox read chained to other work still counts"
+  codex_log "[started(),call(\"cat '$inbox/002.msg' > /tmp/copied.txt\")]"
+  assert_contains "$("$PR" scan "$STATE" t1)" "worked-before-refresh stage c3" "an inbox read redirected somewhere else still counts as work"
   pass "a Codex worker that follows the compaction doorbell is not charged for it, and other work before the refresh still is"
+}
+
+test_codex_admission_then_work_in_one_call_is_in_order() {
+  local done_cmd work_cmd
+  admit xadmit codex >/dev/null; codex_fixture xadmit
+  done_cmd='"await tools.exec_command({cmd:"+JSON.stringify(q(bin+"/fm-project-rules.sh")+" next "+q(state)+" t1")+"});"'
+  work_cmd='"await tools.exec_command({cmd:\"ls apps\"});"'
+  codex_log "[started(),dev(block),agents(),{type:'response_item',timestamp:new Date().toISOString(),payload:{type:'custom_tool_call',call_id:'a1',name:'exec',input:$done_cmd+$work_cmd}}]"
+  "$PR" detect "$STATE" t1
+  assert_equals 0 "$(field violations.length)" "a call that starts with Firstmate's own commands is not judged before its output"
+  close_stage
+  codex_log "[{type:'response_item',timestamp:new Date(Date.now()+2000).toISOString(),payload:{type:'custom_tool_call_output',call_id:'a1',output:'ok'}}]"
+  assert_equals "" "$("$PR" scan "$STATE" t1)" "work after admission completed inside the same call is in order"
+  admit xadmit2 codex >/dev/null; codex_fixture xadmit2
+  codex_log "[started(),dev(block),agents(),{type:'response_item',timestamp:new Date().toISOString(),payload:{type:'custom_tool_call',call_id:'a2',name:'exec',input:$done_cmd+$work_cmd}},{type:'response_item',timestamp:new Date().toISOString(),payload:{type:'custom_tool_call_output',call_id:'a2',output:'ok'}}]"
+  close_stage
+  assert_contains "$("$PR" scan "$STATE" t1)" "worked-before-admission stage start" "work in a call whose output precedes the end of admission is a violation"
+  pass "one Codex call that completes admission and then works is accepted, and one that works before admission ends is not"
 }
 
 test_codex_scan_is_idempotent_and_cursor_safe() {
@@ -637,6 +658,7 @@ test_codex_scan_between_turn_compaction_and_triggers
 test_codex_scan_reads_every_command_shape
 test_codex_read_then_run_in_one_call_is_in_order
 test_codex_following_the_doorbell_is_not_a_violation
+test_codex_admission_then_work_in_one_call_is_in_order
 test_codex_scan_is_idempotent_and_cursor_safe
 test_codex_missing_evidence_and_witness
 test_a_slow_pattern_counts_as_a_match

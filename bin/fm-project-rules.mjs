@@ -172,26 +172,48 @@ function commandPattern(pattern) {
   return new RegExp(pattern.replace(/\[:(\w+):\]/g, (whole, name) => classes[name] ?? whole));
 }
 
-// True only for one simple command that runs a worker-facing Firstmate script
-// by its exact path: no shell operators, expansions, substitutions or
-// redirections anywhere, and no environment prefix beyond Firstmate's own.
-// A command that merely mentions the path, or chains something after it, is
-// an ordinary project command.
-function helperWords(command) {
+// One simple command split into its words, or null when it holds anything a
+// shell would act on beyond plain words: operators, expansions, substitutions,
+// redirections, or a line break. `extra` names further characters a caller is
+// prepared to see inside a word.
+function simpleWords(command, extra = "") {
+  const word = new RegExp(`^(?:'[^']*'|"[^"$\`\\\\]*"|[A-Za-z0-9_@%+=:,./${extra}-]+)+`);
   const words = [];
   let rest = String(command).trim();
   while (rest) {
-    const word = rest.match(/^(?:'[^']*'|"[^"$`\\]*"|[A-Za-z0-9_@%+=:,./-]+)+/);
-    if (!word) return null;
-    words.push(word[0].replace(/'([^']*)'|"([^"]*)"/g, "$1$2"));
-    rest = rest.slice(word[0].length);
+    const found = rest.match(word);
+    if (!found) return null;
+    words.push(found[0].replace(/'([^']*)'|"([^"]*)"/g, "$1$2"));
+    rest = rest.slice(found[0].length);
     if (rest && !/^[ \t]/.test(rest)) return null;
     rest = rest.replace(/^[ \t]+/, "");
   }
-  while (words.length && HELPER_ENV.includes(words[0].split("=")[0]) && words[0].includes("=")) words.shift();
-  return words.length > 0 && HELPERS.includes(words[0]) ? words : null;
+  return words;
 }
-const helperCall = (command) => helperWords(command) !== null;
+
+// The words of a command only when it is one of the worker-facing Firstmate
+// commands a worker may run while a stage is open: this helper's next, ack and
+// serve, the heartbeat, and a decision event. The script is matched by exact
+// path, and an environment prefix is accepted only when it names Firstmate's
+// own root, home and state for this task, so it cannot point the script at
+// other code.
+function helperWords(command, R) {
+  const words = simpleWords(command);
+  if (!words) return null;
+  const root = path.dirname(path.dirname(HELPER));
+  const allowed = { FM_ROOT_OVERRIDE: [root], FM_HOME: [root, R ? path.dirname(R.state) : root], FM_STATE_OVERRIDE: [R ? R.state : path.join(root, "state")] };
+  while (words.length && /^[A-Z_]+=/.test(words[0])) {
+    const [name, value] = [words[0].split("=")[0], words[0].slice(words[0].indexOf("=") + 1)];
+    if (!allowed[name]?.includes(value)) return null;
+    words.shift();
+  }
+  const script = HELPERS.indexOf(words[0]);
+  if (script < 0) return null;
+  if (script === 0 && !["next", "ack", "serve"].includes(words[1])) return null;
+  if (script === 2 && words[1] !== "decision-event") return null;
+  return words;
+}
+const helperCall = (command, R) => helperWords(command, R) !== null;
 
 // A project's pattern is matched under a time limit, and a pattern that runs
 // out of time counts as a match, so a slow pattern cannot stall the hook or
@@ -591,9 +613,10 @@ function hook([state, id, event]) {
   const tool = payload.tool_name ?? "";
   const input = payload.tool_input ?? {};
   const command = tool === "Bash" ? String(input.command ?? "") : "";
-  const ours = helperCall(command);
+  let ours = false;
   const verdict = withRecord(state, id, (R) => {
     if (!R) return "";
+    ours = helperCall(command, R);
     if (!R.stage.closed && !ours && !["Read", "Glob", "Grep"].includes(tool)) {
       return `Project rules admission (stage ${R.stage.name}) is open, so this tool call is refused. Run: ${helperCommand(R, "next")}`;
     }
@@ -728,10 +751,19 @@ function codexCommands(payload) {
 
 // Following Firstmate's own doorbell means listing, reading and moving files
 // in the task's inbox, which a worker must be able to do before it has
-// answered the stage that doorbell announces.
+// answered the stage that doorbell announces. Each part must be one plain
+// ls, cat, head, tail, mv or mkdir whose every path lies inside that inbox.
 function inboxOnly(R, command) {
   const inbox = `${path.join(R.state, R.task)}.inbox`;
-  return String(command).split(/&&|\|\||[;|\n]/).every((part) => /^\s*(?:ls|cat|mv|find|head|tail|sed|mkdir|test|\[)\s/.test(part) && part.includes(inbox));
+  return String(command).split(/&&|;/).every((part) => {
+    const words = simpleWords(part, "*");
+    if (!words || !["ls", "cat", "head", "tail", "mv", "mkdir"].includes(words[0])) return false;
+    const paths = words.slice(1).filter((word) => !/^-[A-Za-z0-9]+$/.test(word));
+    return paths.length > 0 && paths.every((word) => {
+      const resolved = path.resolve(word.replace(/\*/g, "x"));
+      return resolved === inbox || resolved.startsWith(`${inbox}/`);
+    });
+  });
 }
 
 function scanCodex(R, block, file) {
@@ -759,13 +791,26 @@ function scanCodex(R, block, file) {
       // A helper call written as a template, with its arguments filled from a
       // loop, is still a helper call; anything else unreadable is work.
       const { literals, bare, raw } = codexCommands(payload);
-      const helper = (command) => helperCall(command.replace(/\$\{[^}]*\}/g, "x"));
+      // Its placeholders must be filled from plain words: any other string in
+      // the call that holds a space or a shell character makes it ordinary work.
+      const plain = !/\$\{/.test(raw) || [...raw.replace(/`[^`]*`/g, "").matchAll(/"((?:[^"\\]|\\.)*)"|'((?:[^'\\]|\\.)*)'/g)].every((match) => /^[\w:.-]*$/.test(match[1] ?? match[2] ?? ""));
+      const helper = (command) => (command.includes("${") ? plain && helperCall(command.replace(/\$\{[^}]*\}/g, "x"), R) : helperCall(command, R));
       const all = raw ? [...literals, raw] : literals;
       const isWork = (command, index) => (index < literals.length ? !helper(command) && !inboxOnly(R, command) : bare);
-      if (!all.some(isWork)) continue;
-      if (at < closed) {
+      const firstWork = all.findIndex(isWork);
+      if (firstWork < 0) continue;
+      // One call can finish a stage and then go on to work. That is in order
+      // only when Firstmate's own commands come first in the call, so it is
+      // judged when the call's output is logged.
+      const pending = (R.log.pending ??= {});
+      const defer = (item) => (pending[payload.call_id] ??= []).push(item);
+      const early = () => {
         if (gen > 0 && R.log.turn === 0) R.same_turn_calls += 1;
         else violate(R, gen === 0 ? "worked-before-admission" : "worked-before-refresh", `stage ${gen === 0 ? "start" : `c${gen}`}`);
+      };
+      if (at < closed) {
+        if (payload.call_id && literals.slice(0, firstWork).some((command) => helper(command))) defer({ gen, turn: R.log.turn });
+        else early();
       }
       for (const skill of R.skills.filter((item) => item.required?.before_commands)) {
         const hit = all.findIndex((command, index) => (index >= literals.length || !helper(command)) && commandMatches(skill.required.before_commands, command));
@@ -777,18 +822,24 @@ function scanCodex(R, block, file) {
         // is in order only when the read comes first in the same call, so it
         // is judged when the call's output is logged.
         const readFirst = literals.slice(0, hit).some((command) => {
-          const words = helperWords(command);
+          const words = helperWords(command, R);
           return words !== null && words[1] === "serve" && words[4] === skill.name;
         });
-        if (readFirst && payload.call_id) (R.log.pending ??= {})[payload.call_id] = { skill: skill.name, gen };
+        if (readFirst && payload.call_id) defer({ gen, skill: skill.name });
         else violate(R, "trigger-skipped", `${skill.name} c${gen}`);
       }
     } else if (entry.type === "response_item" && /_call_output$/.test(payload.type ?? "") && R.log.pending?.[payload.call_id]) {
-      const { skill, gen: due } = R.log.pending[payload.call_id];
-      delete R.log.pending[payload.call_id];
-      const answer = R.answers[skill];
       const done = Date.parse(entry.timestamp ?? "") || Date.now();
-      if (!(answer?.gen === due && Date.parse(answer.at) <= done)) violate(R, "trigger-skipped", `${skill} c${due}`);
+      for (const item of R.log.pending[payload.call_id]) {
+        if (item.skill) {
+          const answer = R.answers[item.skill];
+          if (!(answer?.gen === item.gen && Date.parse(answer.at) <= done)) violate(R, "trigger-skipped", `${item.skill} c${item.gen}`);
+        } else if (!(Date.parse(R.closed?.[item.gen] ?? "") <= done)) {
+          if (item.gen > 0 && item.turn === 0) R.same_turn_calls += 1;
+          else violate(R, item.gen === 0 ? "worked-before-admission" : "worked-before-refresh", `stage ${item.gen === 0 ? "start" : `c${item.gen}`}`);
+        }
+      }
+      delete R.log.pending[payload.call_id];
     }
   }
   while (R.compactions < R.log.compactions) openStage(R, "compact");
