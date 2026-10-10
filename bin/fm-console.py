@@ -28,6 +28,7 @@ PR_QUERY = """query($owner: String!, $repo: String!, $number: Int!) {
       number
       url
       state
+      title
       isDraft
       merged
       mergedAt
@@ -149,7 +150,9 @@ def issue_urls(record: dict, project_home: Path | None = None, include_title_ref
 
 def pr_urls(record: dict) -> list[str]:
     backlog = record.get("backlog") or {}
-    values = [backlog.get("pr_url"), record.get("pr_url"), (record.get("pr") or {}).get("url")]
+    metadata = record.get("pr")
+    values = [backlog.get("pr_url"), record.get("pr_url"),
+              metadata.get("url") if isinstance(metadata, dict) else metadata]
     urls = []
     for value in values:
         if isinstance(value, str) and re.fullmatch(r"https://github\.com/[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+/pull/[1-9][0-9]*", value):
@@ -403,7 +406,8 @@ def fetch_pr(root: Path, home: Path, url: str) -> dict:
         checks_label = "none reported"
     else:
         checks_label = "unknown"
-    return {"number": pr["number"], "html_url": pr["url"], "state": str(pr.get("state", "unknown")).lower(),
+    return {"number": pr["number"], "html_url": pr["url"], "title": pr.get("title"),
+            "state": str(pr.get("state", "unknown")).lower(),
             "draft": pr.get("isDraft"), "merged": pr.get("merged") is True or bool(pr.get("mergedAt")),
             "merged_at": pr.get("mergedAt"), "review_decision": review_label, "checks": checks_label}
 
@@ -456,7 +460,8 @@ def secondmate_disclosures(value: dict) -> list[str]:
     return sorted(set(warnings))
 
 
-def status_data(home: Path, root: Path, value: dict) -> dict:
+def status_data(home: Path, root: Path, value: dict, issue_cache: dict | None = None,
+                pr_cache: dict | None = None) -> dict:
     records = task_records(value)
     projects = registered_projects(home)
     repositories = {project: repository_identity(home, project) for project in projects}
@@ -466,8 +471,8 @@ def status_data(home: Path, root: Path, value: dict) -> dict:
     for project, repo in repositories.items():
         if repo is None:
             failures.append(f"{project}: registered GitHub project origin is unavailable or invalid")
-    issue_cache: dict[str, dict] = {}
-    pr_cache: dict[str, dict] = {}
+    issue_cache = issue_cache if issue_cache is not None else {}
+    pr_cache = pr_cache if pr_cache is not None else {}
 
     def add_unlinked(record: dict, project: str) -> None:
         owner = record.get("owner_home_id") or "main"
@@ -503,6 +508,7 @@ def status_data(home: Path, root: Path, value: dict) -> dict:
             except (RuntimeError, ValueError, subprocess.SubprocessError) as exc:
                 failures.append(f"{url}: {exc}")
                 issue = {"number": int(url.rsplit("/", 1)[1]), "title": "", "html_url": url, "state": "unknown"}
+                issue_cache[url] = issue
             prs = []
             for pr_url in pr_urls(record):
                 if url_repository(pr_url) != repositories.get(project):
@@ -514,7 +520,9 @@ def status_data(home: Path, root: Path, value: dict) -> dict:
                     prs.append(pr_cache[pr_url])
                 except (RuntimeError, ValueError, subprocess.SubprocessError) as exc:
                     failures.append(f"{pr_url}: {exc}")
-                    prs.append({"html_url": pr_url, "state": "unknown", "draft": None})
+                    pr = {"html_url": pr_url, "title": None, "state": "unknown", "draft": None}
+                    pr_cache[pr_url] = pr
+                    prs.append(pr)
             key = (project, url)
             row = rows.setdefault(key, {"project": project, "number": issue.get("number"), "title": issue.get("title"),
                                         "url": url, "issue_state": issue.get("state", "unknown"),
@@ -735,8 +743,11 @@ def decision_work_context(item: dict, value: dict, home: Path) -> dict:
             "branch": branch or "Unavailable", "work_links": links}
 
 
-def queue_data(snap: dict, home: Path, root: Path) -> list[dict]:
+def queue_data(snap: dict, home: Path, root: Path, issue_cache: dict | None = None,
+               pr_cache: dict | None = None) -> list[dict]:
     out = []
+    task_metadata = {task.get("id"): task for task in snap.get("tasks", [])
+                     if isinstance(task, dict) and isinstance(task.get("id"), str)}
     dependency_states_by_owner = {"main": {}}
     for row in (snap.get("backlog") or {}).get("records", []):
         if isinstance(row, dict) and isinstance(row.get("id"), str):
@@ -762,8 +773,11 @@ def queue_data(snap: dict, home: Path, root: Path) -> list[dict]:
             if isinstance(row, dict) and isinstance(row.get("id"), str):
                 states[row["id"]] = row.get("state") or "queued"
     for row in (snap.get("backlog") or {}).get("records", []):
-        if isinstance(row, dict) and row.get("state") in ("queued", "in_flight"):
-            item = {key: row.get(key) for key in ("id", "title", "state", "repo", "blocked_by_ids", "unresolved_blocker_ids", "blocked_reason", "captain_actionable", "hold_until", "hold_kind", "links", "body_lines")}
+        if isinstance(row, dict) and row.get("state") in ("queued", "in_flight", "done"):
+            item = {key: row.get(key) for key in ("id", "title", "state", "repo", "kind", "pr", "pr_url", "done", "blocked_by_ids", "unresolved_blocker_ids", "blocked_reason", "captain_actionable", "hold_bucket", "hold_until", "hold_kind", "hold_reason", "links", "body_lines")}
+            metadata = task_metadata.get(row.get("id"), {})
+            for field in ("kind", "pr"):
+                item[field] = item.get(field) or metadata.get(field)
             item["owner"] = "main"
             out.append(item)
     for home_record in secondmate_records:
@@ -772,14 +786,16 @@ def queue_data(snap: dict, home: Path, root: Path) -> list[dict]:
         for child in children:
             if isinstance(child, dict):
                 out.append({"id": f"{owner}/{child.get('id', '')}", "title": child.get("name") or child.get("id"),
-                            "state": child.get("state") or "unknown", "repo": child.get("repo"), "blocked_by_ids": [],
+                            "state": child.get("state") or "unknown", "repo": child.get("repo"), "kind": child.get("kind"),
+                            "pr": child.get("pr"), "done": child.get("done"), "blocked_by_ids": [],
                             "unresolved_blocker_ids": [], "blocked_reason": None, "captain_actionable": False,
                             "hold_until": None, "hold_kind": None, "links": [child.get("issue")] if child.get("issue") else [],
                             "body_lines": child.get("body_lines") or [], "owner": owner})
         for row in home_record.get("queued", []):
             if isinstance(row, dict):
                 out.append({"id": f"{owner}/{row.get('id', '')}", "title": row.get("title"), "state": "queued",
-                            "repo": row.get("repo"), "blocked_by_ids": row.get("blocked_by_ids") or [],
+                            "repo": row.get("repo"), "kind": row.get("kind"), "pr": row.get("pr"), "done": row.get("done"),
+                            "blocked_by_ids": row.get("blocked_by_ids") or [],
                             "unresolved_blocker_ids": row.get("unresolved_blocker_ids") or [],
                             "blocked_reason": row.get("blocked_reason") or row.get("hold_reason"),
                             "captain_actionable": row.get("captain_actionable") is True,
@@ -803,10 +819,21 @@ def queue_data(snap: dict, home: Path, root: Path) -> list[dict]:
         except (ValueError, OSError):
             return None
     issue_urls_all = sorted({url for item in out for url in issue_urls(item, item_project_home(item))})
+    pr_urls_all = sorted({url for item in out for url in pr_urls(item)})
+    issue_cache = issue_cache if issue_cache is not None else {}
+    missing_issue_urls = [url for url in issue_urls_all if url not in issue_cache]
     try:
-        issue_cache = fetch_issues(root, home, issue_urls_all)
+        issue_cache.update(fetch_issues(root, home, missing_issue_urls))
     except (RuntimeError, ValueError, subprocess.SubprocessError):
-        issue_cache = {}
+        pass
+    pr_cache = pr_cache if pr_cache is not None else {}
+    for url in pr_urls_all:
+        if url in pr_cache:
+            continue
+        try:
+            pr_cache[url] = fetch_pr(root, home, url)
+        except (RuntimeError, ValueError, subprocess.SubprocessError):
+            pr_cache[url] = {"html_url": url, "title": None, "state": "unknown"}
     for item in out:
         blockers = item.get("unresolved_blocker_ids") or []
         owner_dependency_states = dependency_states_by_owner.get(item.get("owner"), {})
@@ -873,6 +900,11 @@ def queue_data(snap: dict, home: Path, root: Path) -> list[dict]:
                 item["issues"].append({"html_url": url, "title": "Issue details unavailable", "milestone": None,
                                        "error": str(exc)})
         item["issue_missing"] = not item["issue_urls"]
+        item["board_issues"] = []
+        for issue, url in zip(item["issues"], item["issue_urls"]):
+            if url in explicit_issue_urls:
+                item["board_issues"].append(issue)
+        item["prs"] = [pr_cache[url] for url in pr_urls(item) if url in pr_cache]
         item.pop("body_lines", None)
         item.pop("owner_home_path", None)
         item.pop("owner_remote", None)
@@ -881,15 +913,98 @@ def queue_data(snap: dict, home: Path, root: Path) -> list[dict]:
     return out
 
 
+BOARD_COLUMNS = ("Up next", "In progress", "Waiting on you", "Ready to merge", "Done (last 7 days)")
+WORKER_KINDS = {"scout", "review", "ops", "tooling"}
+
+
+def recent_date(value: object, today: datetime.date) -> bool:
+    if not isinstance(value, str):
+        return False
+    try:
+        parsed = datetime.date.fromisoformat(value[:10])
+    except ValueError:
+        return False
+    return today - datetime.timedelta(days=6) <= parsed <= today
+
+
+def queue_board(items: list[dict]) -> dict:
+    cards_by_key = {}
+    worker_tasks = []
+    today = datetime.date.today()
+    for item in items:
+        issues = item.get("board_issues") or []
+        prs = item.get("prs") or []
+        has_issue = bool(issues)
+        linked = bool(issues or prs or pr_urls(item))
+        kind = str(item.get("kind") or "").lower()
+        task_id = str(item.get("id") or "")
+        worker_only = (kind in WORKER_KINDS or task_id.startswith("rv-")) and not has_issue
+        if worker_only:
+            worker_tasks.append({"title": item.get("title") or "Worker task"})
+            continue
+        if not linked:
+            continue
+        hold_bucket = item.get("hold_bucket")
+        held = (item.get("captain_actionable") is True or hold_bucket == "live"
+                or (hold_bucket is None and item.get("hold_kind") == "captain")
+                or item.get("hold_kind") == "merge")
+        for entity_kind, entities in (("issue", issues), ("pull_request", prs)):
+            for entity in entities:
+                url = entity.get("html_url")
+                if not isinstance(url, str):
+                    continue
+                is_pr = entity_kind == "pull_request"
+                merged_recently = is_pr and entity.get("merged") is True and recent_date(entity.get("merged_at"), today)
+                done_recently = item.get("state") == "done" and recent_date(item.get("done"), today)
+                if item.get("state") == "done" and not done_recently and not merged_recently:
+                    continue
+                if is_pr and entity.get("merged") is True and not merged_recently:
+                    continue
+                if merged_recently or done_recently:
+                    column = "Done (last 7 days)"
+                elif held:
+                    column = "Waiting on you"
+                elif is_pr and entity.get("state") == "open" and not entity.get("draft") \
+                        and entity.get("review_decision") == "approved" and entity.get("checks") == "passed":
+                    column = "Ready to merge"
+                elif item.get("state") in ("in_flight", "working", "parked", "paused", "blocked"):
+                    column = "In progress"
+                else:
+                    column = "Up next"
+                key = (entity_kind, url)
+                ranks = {"Up next": 1, "In progress": 2, "Ready to merge": 3,
+                         "Waiting on you": 4, "Done (last 7 days)": 0}
+                card = cards_by_key.get(key)
+                if card is None:
+                    entity_title = entity.get("title")
+                    if not entity_title or entity_title == "Issue details unavailable":
+                        entity_title = item.get("title") or "Untitled work"
+                    card = {"kind": entity_kind, "url": url,
+                            "title": entity_title,
+                            "backlog_titles": [], "column": column}
+                    cards_by_key[key] = card
+                elif ranks[column] > ranks[card["column"]]:
+                    card["column"] = column
+                title = item.get("title")
+                if (isinstance(title, str) and title and title != card["title"]
+                        and title not in card["backlog_titles"]):
+                    card["backlog_titles"].append(title)
+    columns = {name: [] for name in BOARD_COLUMNS}
+    for card in cards_by_key.values():
+        columns[card.pop("column")].append(card)
+    return {"columns": [{"name": name, "cards": columns[name]} for name in BOARD_COLUMNS],
+            "worker_tasks": worker_tasks}
+
+
 def page(token: str, port: int, sample_data: bool = False) -> bytes:
     token_json = json.dumps(token)
     html_page = r"""<!doctype html><html lang="en"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Firstmate Console</title>
 <style>
 :root{font:16px system-ui,sans-serif;color-scheme:light dark}body{max-width:1200px;margin:2rem auto;padding:0 1rem}header{display:flex;align-items:center;gap:1rem;flex-wrap:wrap}h1{margin-right:auto}nav{display:flex;gap:.5rem;border-bottom:1px solid #888;padding:.5rem 0}button{font:inherit;padding:.55rem .8rem;border:1px solid #888;border-radius:.35rem;background:Canvas;color:CanvasText;cursor:pointer}button[aria-selected=true]{border-bottom:3px solid #3978db}.muted{color:GrayText}.error{color:#b42318}.tab{padding-top:1rem}table{border-collapse:collapse;width:100%;margin-top:1rem}th,td{text-align:left;vertical-align:top;padding:.65rem;border-bottom:1px solid #8885}a{color:LinkText}textarea{display:block;width:min(48rem,100%);min-height:5rem;margin:.5rem 0;font:inherit}#status{white-space:pre-wrap}label{display:block;margin:.4rem 0}.decision-card{border:1px solid #8885;border-radius:.65rem;padding:1.2rem;margin:1rem 0;box-shadow:0 1px 3px #0002}.decision-card h2{margin:.1rem 0 .65rem}.decision-context{max-width:75ch;line-height:1.55}.decision-option{border-top:1px solid #8885;padding:.65rem 0}.decision-option h3{margin:.1rem 0 .4rem}.decision-option ul{margin:.35rem 0}.recommendation{border-left:4px solid #39825a;background:color-mix(in srgb,Canvas 92%,#39825a);padding:.8rem 1rem;margin:.8rem 0}.rewrite{color:#8a4b00;font-weight:650}.issue-link{display:block;margin:.2rem 0}.sample-notice{padding:.8rem 1rem;border:1px solid #996e00;border-radius:.4rem;background:color-mix(in srgb,Canvas 86%,#d9aa32);font-weight:650}.decision-work{display:flex;gap:.6rem 1.2rem;flex-wrap:wrap;margin:0 0 .8rem;padding:.7rem .9rem;border-radius:.4rem;background:color-mix(in srgb,Canvas 94%,#3978db);font-size:.95rem}.decision-work p{margin:0}.decision-work-links{flex-basis:100%}.answer-feedback{padding:.7rem .9rem;border-radius:.4rem;font-weight:650}.answer-feedback.success{color:#216e39;background:color-mix(in srgb,Canvas 88%,#7bc98c)}.answer-feedback.error{color:#9f241b;background:color-mix(in srgb,Canvas 90%,#e79087)}.decision-card pre{white-space:pre-wrap;overflow-wrap:anywhere}
-</style><header><h1>Firstmate Console</h1><button id="refresh">Refresh</button></header><p id="status" class="muted" role="status">Loading…</p><p id="sample-notice" class="sample-notice" role="alert" __SAMPLE_HIDDEN__>Sample data only. Nothing will be sent from this console.</p><nav role="tablist" aria-label="Console sections"><button role="tab" aria-selected="true" aria-controls="status-tab" id="status-button">Status</button><button role="tab" aria-selected="false" aria-controls="decisions-tab" id="decisions-button">Open decisions</button><button role="tab" aria-selected="false" aria-controls="queue-tab" id="queue-button">Queue</button></nav>
-<section class="tab" role="tabpanel" id="status-tab" aria-labelledby="status-button"><label>Project <select id="project"></select></label><div id="status-content"></div></section>
+.sprint-board{display:grid;grid-template-columns:repeat(5,minmax(13rem,1fr));gap:.8rem;align-items:start;overflow-x:auto;padding-bottom:.8rem}.sprint-column{min-width:13rem;background:color-mix(in srgb,Canvas 94%,#3978db);border-radius:.65rem;padding:.65rem}.sprint-column h2{font-size:1rem;margin:.2rem 0 .7rem}.sprint-count{color:GrayText;font-size:.85rem;font-weight:400}.sprint-card{border:1px solid #8885;border-radius:.5rem;background:Canvas;padding:.8rem;margin:.55rem 0;box-shadow:0 1px 2px #0001}.sprint-card h3{font-size:.98rem;line-height:1.35;margin:0 0 .45rem}.sprint-card p{margin:.35rem 0;color:GrayText;font-size:.9rem}.sprint-card a{font-weight:650}.worker-toggle{margin:.8rem 0}.worker-list{padding-left:1.4rem}.worker-list li{margin:.45rem 0}</style><header><h1>Firstmate Console</h1><button id="refresh">Refresh</button></header><p id="status" class="muted" role="status">Loading…</p><p id="sample-notice" class="sample-notice" role="alert" __SAMPLE_HIDDEN__>Sample data only. Nothing will be sent from this console.</p><nav role="tablist" aria-label="Console sections"><button role="tab" aria-selected="false" aria-controls="status-tab" id="status-button">Status</button><button role="tab" aria-selected="false" aria-controls="decisions-tab" id="decisions-button">Open decisions</button><button role="tab" aria-selected="true" aria-controls="queue-tab" id="queue-button">Queue</button></nav>
+<section class="tab" role="tabpanel" id="status-tab" aria-labelledby="status-button" hidden><label>Project <select id="project"></select></label><div id="status-content"></div></section>
 <section class="tab" role="tabpanel" id="decisions-tab" aria-labelledby="decisions-button" hidden><div id="decisions-content"></div></section>
-<section class="tab" role="tabpanel" id="queue-tab" aria-labelledby="queue-button" hidden><div id="queue-content"></div></section>
+<section class="tab" role="tabpanel" id="queue-tab" aria-labelledby="queue-button"><div id="queue-content"></div></section>
 <script>
 const token=__TOKEN__,tabs=[...document.querySelectorAll('[role=tab]')],status=document.getElementById('status');
 const el=id=>document.getElementById(id),node=value=>document.createTextNode(value==null?'':String(value));
@@ -904,7 +1019,8 @@ function answerIdentity(item){return JSON.stringify([item.owner,item.task,item.k
 function workCard(item){const context=document.createElement('section');context.className='decision-work';context.setAttribute('aria-label','Related work');for(const [label,value] of [['Project',item.project||'Home operations'],['Task',item.task_title||'No linked task'],['Feature branch',item.branch||'Unavailable']]){const field=document.createElement('p');field.append(node(`${label}: ${value}`));context.append(field)}const links=document.createElement('p');links.className='decision-work-links';links.append(node('Related GitHub work: '));if(item.work_links?.length){item.work_links.forEach((work,index)=>{if(index)links.append(node(' · '));links.append(link(work.url,work.label))})}else{links.append(node('No linked issue or pull request'))}context.append(links);return context}
 function feedback(card,state){if(!state)return null;const message=document.createElement('p');message.className=`answer-feedback ${state.kind==='success'?'success':'error'}`;message.setAttribute('role','status');message.setAttribute('aria-live','polite');message.textContent=state.message;card.append(message);return message}
 function renderDecision(item){const card=document.createElement('article');card.className='decision-card';card.id=item.card_id;card.append(workCard(item));const title=document.createElement('h2');title.textContent=item.decision?.question||(item.verb==='decision-repair'?'Decision event needs repair':'Decision needs rewrite');card.append(title);if(!item.decision){const rewrite=document.createElement('p');rewrite.className='rewrite';rewrite.textContent=item.verb==='decision-repair'?'Repair required: this incoming event is retained for supervision, but its content does not meet the structured decision format and cannot be answered.':'Needs rewrite: add a plain-language context, user impact, lettered options with pros and cons, and a recommendation before this can be answered.';card.append(rewrite);if(item.verb==='decision-repair'&&item.note){const raw=document.createElement('pre');raw.textContent=item.note;card.append(raw)}return card}const context=document.createElement('p');context.className='decision-context';context.textContent=`${item.decision.context} User impact: ${item.decision.user_impact}`;card.append(context);const options=document.createElement('div');for(const option of item.decision.options){const section=document.createElement('section');section.className='decision-option';const heading=document.createElement('h3');heading.textContent=`${option.label}. ${option.title}`;section.append(heading);for(const [label,values] of [['Pros',option.pros],['Cons',option.cons]]){const strong=document.createElement('strong');strong.textContent=label;const list=document.createElement('ul');values.forEach(value=>{const li=document.createElement('li');li.textContent=value;list.append(li)});section.append(strong,list)}options.append(section)}card.append(options);const recommendation=document.createElement('p');recommendation.className='recommendation';recommendation.textContent=`Recommended: ${item.decision.recommended_option}. ${item.decision.recommendation}`;card.append(recommendation);const identity=answerIdentity(item),saved=answerStates.get(identity);if(saved?.kind==='success'){feedback(card,saved);return card}if(!item.answerable){const notice=document.createElement('p');notice.textContent='Answer unavailable: owning task could not be resolved.';card.append(notice);return card}const responseMessage=feedback(card,saved)||document.createElement('p');if(!saved){responseMessage.className='answer-feedback error';responseMessage.setAttribute('role','status');responseMessage.setAttribute('aria-live','polite');responseMessage.hidden=true;card.append(responseMessage)}const form=document.createElement('form'),label=document.createElement('label'),area=document.createElement('textarea'),send=document.createElement('button');label.textContent='Reply with an option letter or your own answer';area.name='answer';area.maxLength=8192;area.required=true;area.setAttribute('aria-label',`Answer ${item.decision.question}`);area.placeholder=`For example: ${item.decision.recommended_option} or describe another choice`;area.value=drafts.get(identity)||'';area.oninput=()=>drafts.set(identity,area.value);send.textContent='Answer and send';form.append(label,area,send);form.onsubmit=async event=>{event.preventDefault();send.disabled=true;responseMessage.hidden=false;responseMessage.className='answer-feedback error';responseMessage.textContent='Sending answer…';answerStates.set(identity,{kind:'pending',message:'Sending answer…'});try{const response=await fetch('/api/answer',{method:'POST',headers:{'Content-Type':'application/json','X-FM-Token':token},body:JSON.stringify({owner:item.owner,task:item.task,key:item.key,answer:area.value})});const result=await response.json();if(!response.ok||!result.ok)throw Error(result.error||'answer was not delivered');const success={kind:'success',message:'Answer sent successfully.'};answerStates.set(identity,success);sentItems.set(identity,item);drafts.delete(identity);responseMessage.className='answer-feedback success';responseMessage.textContent=success.message;await load(true)}catch(error){const failure={kind:'error',message:`Answer not sent: ${error.message}`};answerStates.set(identity,failure);responseMessage.className='answer-feedback error';responseMessage.textContent=failure.message;send.disabled=false}};card.append(form);return card}
-function render(data){const s=data.status||{},d=data.decisions||[],q=data.queue||[];el('sample-notice').hidden=!data.sample_data;const select=el('project'),prior=select.value;select.replaceChildren(...(s.projects||[]).map(name=>{const o=document.createElement('option');o.value=name;o.textContent=name;return o}));if((s.projects||[]).includes(prior))select.value=prior;const rows=(s.rows||[]).filter(row=>!select.value||row.project===select.value).map(row=>[row.project,row.issue_missing?row.title:link(row.url,`#${row.number} ${row.title||'(title unavailable)'}`),row.issue_state,row.tasks.map(task=>`${task.owner||'main'}/${task.id}: ${task.stage} (${task.state})`).join('\n'),prCell(row.prs)]);if(rows.length)table(el('status-content'),['Project','Issue','Issue state','Lane stage','PR status'],rows);else el('status-content').textContent=select.value?'No admitted issues or unlinked work are recorded for this project.':'No registered projects are available.';updateSnapshotStatus();const visible=new Map(d.map(item=>[answerIdentity(item),item]));for(const [identity,item] of sentItems){if(!visible.has(identity))visible.set(identity,item)}const cards=[...visible.values()].map(renderDecision);el('decisions-content').replaceChildren(...cards);if(!cards.length)el('decisions-content').textContent='No open decisions.';const issueCell=item=>{const root=document.createElement('div');if(item.issue_missing){root.textContent='No linked GitHub issue';return root}for(const issue of item.issues||[]){const a=link(issue.html_url,issue.title||issue.html_url);a.className='issue-link';root.append(a);if(issue.milestone?.title)root.append(node(`Milestone: ${issue.milestone.title}`));else root.append(node(issue.title==='Issue details unavailable'?'Milestone unavailable':'No milestone'));root.append(document.createElement('br'))}return root};const reasonCell=item=>{const root=document.createElement('div');root.append(node(item.start_reason));if(item.decision_card_id){root.append(document.createElement('br'));const a=document.createElement('a');a.href=`#${item.decision_card_id}`;a.textContent='View decision';root.append(a)}return root};if(q.length)table(el('queue-content'),['Task','Project','GitHub issue','State','Why it has not started'],q.map(item=>[`${item.id||''} ${item.title||''}`,item.repo||'Home operations',issueCell(item),item.state,reasonCell(item)]));else el('queue-content').textContent='No queued or in-flight work.'}
+function renderBoard(board){const root=el('queue-content'),columns=board?.columns||[],layout=document.createElement('div');layout.className='sprint-board';for(const column of columns){const section=document.createElement('section');section.className='sprint-column';const heading=document.createElement('h2');heading.append(node(column.name+' '));const count=document.createElement('span');count.className='sprint-count';count.textContent=String(column.cards.length);heading.append(count);section.append(heading);for(const item of column.cards){const card=document.createElement('article');card.className='sprint-card';const title=document.createElement('h3');title.append(link(item.url,item.title));card.append(title);for(const backlogTitle of item.backlog_titles||[]){const detail=document.createElement('p');detail.textContent=backlogTitle;card.append(detail)}section.append(card)}if(!column.cards.length){const empty=document.createElement('p');empty.className='muted';empty.textContent='Nothing here yet';section.append(empty)}layout.append(section)}const workers=board?.worker_tasks||[],details=document.createElement('details');details.className='worker-toggle';const summary=document.createElement('summary');summary.textContent=`Show worker tasks (${workers.length})`;details.append(summary);if(workers.length){const list=document.createElement('ul');list.className='worker-list';for(const item of workers){const line=document.createElement('li');line.textContent=item.title;list.append(line)}details.append(list)}root.replaceChildren(layout,details)}
+function render(data){const s=data.status||{},d=data.decisions||[],q=data.queue||[];el('sample-notice').hidden=!data.sample_data;const select=el('project'),prior=select.value;select.replaceChildren(...(s.projects||[]).map(name=>{const o=document.createElement('option');o.value=name;o.textContent=name;return o}));if((s.projects||[]).includes(prior))select.value=prior;const rows=(s.rows||[]).filter(row=>!select.value||row.project===select.value).map(row=>[row.project,row.issue_missing?row.title:link(row.url,`#${row.number} ${row.title||'(title unavailable)'}`),row.issue_state,row.tasks.map(task=>`${task.owner||'main'}/${task.id}: ${task.stage} (${task.state})`).join('\n'),prCell(row.prs)]);if(rows.length)table(el('status-content'),['Project','Issue','Issue state','Lane stage','PR status'],rows);else el('status-content').textContent=select.value?'No admitted issues or unlinked work are recorded for this project.':'No registered projects are available.';updateSnapshotStatus();const visible=new Map(d.map(item=>[answerIdentity(item),item]));for(const [identity,item] of sentItems){if(!visible.has(identity))visible.set(identity,item)}const cards=[...visible.values()].map(renderDecision);el('decisions-content').replaceChildren(...cards);if(!cards.length)el('decisions-content').textContent='No open decisions.';renderBoard(data.board)}
 async function load(force=false){if(refreshing){refreshAgain=refreshAgain||force;return}refreshing=true;refreshError='';const button=el('refresh');button.disabled=true;button.textContent='Refreshing…';if(latestData)updateSnapshotStatus();else{status.className='muted';status.textContent='Loading snapshot…'}try{const query=force?'?refresh=1':'';const response=await fetch('/api/data'+query),data=await response.json();if(!response.ok||data.unavailable||!data.status)throw Error(data.error||'console data unavailable');latestData=data;render(data)}catch(error){refreshError=error.message;if(latestData)updateSnapshotStatus();else{status.className='error';status.textContent='Could not load a snapshot: '+error.message}}finally{refreshing=false;button.disabled=false;button.textContent='Refresh';if(latestData)updateSnapshotStatus();if(refreshAgain){refreshAgain=false;void load(true)}}}
 el('project').onchange=()=>{if(latestData)render(latestData)};el('refresh').onclick=()=>{void load(true)};void load();setInterval(()=>{if(!document.hidden&&latestData)updateSnapshotStatus()},10000);setInterval(()=>{if(!document.hidden)void load()},30000);
 </script></html>"""
@@ -913,11 +1029,15 @@ el('project').onchange=()=>{if(latestData)render(latestData)};el('refresh').oncl
 
 
 def compose_data(home: Path, root: Path, value: dict, sample_data: bool = False) -> dict:
-    status = status_data(home, root, value)
+    issue_cache: dict[str, dict] = {}
+    pr_cache: dict[str, dict] = {}
+    status = status_data(home, root, value, issue_cache, pr_cache)
     generated = snapshot_epoch(value)
     warnings = list(status.get("warnings") or [])
+    queue = queue_data(value, home, root, issue_cache, pr_cache)
     return {"generated_epoch": generated, "age_seconds": max(0, int(time.time()) - generated),
-            "status": status, "decisions": decisions(home, root, value), "queue": queue_data(value, home, root),
+            "status": status, "decisions": decisions(home, root, value), "queue": queue,
+            "board": queue_board(queue),
             "warnings": warnings, "stale": False, "unavailable": False, "sample_data": sample_data}
 
 

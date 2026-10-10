@@ -1,6 +1,6 @@
 # Local operator console
 
-Run `bin/fm-console.sh` from a Firstmate checkout to open the local Status, Open decisions, and Queue tabs.
+Run `bin/fm-console.sh` from a Firstmate checkout to open the local console, which defaults to Queue and also offers Status and Open decisions tabs.
 The page binds to IPv4 loopback and refreshes from the active home's structured fleet snapshot and GitHub issue and pull request records without starting an agent or using an AI model.
 Use `--sample-data` for a preview home; the console labels the data as sample data and refuses to send answers.
 
@@ -17,6 +17,10 @@ Answering rechecks that the keyed decision is still open.
 When a live worker is recorded, the console sends the answer through `bin/fm-send.sh --resolve-key`.
 When a held call has no live worker target, the console records the answer through the owning home's `bin/fm-captain-hold.sh answers` intake.
 
-Queue shows queued and in-flight work, the linked GitHub issue title and milestone, and a plain-language reason each queued item has not started.
-Dependency reasons include each named dependency's current state, captain-held items link to their decision card, dated holds show their date, and a queued item without a blocker says it is ready to start now.
-Home-level work is labeled "Home operations", and ready items appear before blocked or in-flight items.
+Queue is the default tab and presents planned GitHub issues and pull requests as a five-column sprint board.
+The columns are Up next, In progress, Waiting on you, Ready to merge, and Done (last 7 days).
+Each card uses the GitHub issue or pull request title and adds a user-facing backlog title when available.
+The board places captain decisions and merge holds in Waiting on you, and places non-draft open pull requests in Ready to merge only after review approval and passing checks.
+Done cards appear for seven days after the backlog completion date or pull request merge date.
+Worker-only tasks stay out of the board by default and can be revealed with Show worker tasks.
+An issue-linked scout or review task remains visible because its GitHub issue identifies the planned work.
