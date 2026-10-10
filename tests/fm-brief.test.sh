@@ -729,8 +729,10 @@ test_ship_brief_teaches_review_escalation_and_lane_checks() {
   mkdir -p "$home/data"
   FM_HOME="$home" "$ROOT/bin/fm-brief.sh" brief-review-escalation firstmate --mode direct-PR >/dev/null 2>&1
   brief="$home/data/brief-review-escalation/brief.md"
-  assert_grep "shared review-round rules in the project" "$brief" \
-    "ship brief did not point workers to the shared review-round policy"
+  assert_grep "supervising Firstmate runs the full review-round ladder" "$brief" \
+    "ship brief did not assign the full review-round ladder to supervising Firstmate"
+  assert_grep "Firstmate's" "$brief" \
+    "ship brief did not identify Firstmate's shared guidance"
   assert_grep 'AGENTS.md` under **Review rounds**' "$brief" \
     "ship brief did not name the shared review-round section"
   assert_grep "name competing explanations, test them with the cheapest discriminating observation, and check proportionality" "$brief" \

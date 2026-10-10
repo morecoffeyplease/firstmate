@@ -495,7 +495,7 @@ $ASK_USER_BLOCK
 $INBOX_SECTION
 
 # Review rounds
-Follow the shared review-round rules in the project \`AGENTS.md\` under **Review rounds**.
+The supervising Firstmate runs the full review-round ladder in Firstmate's \`AGENTS.md\` under **Review rounds**.
 After the second failed review round or a repeated failure, before another fix run the inline differential diagnosis with a mid-size model: name competing explanations, test them with the cheapest discriminating observation, and check proportionality; load the /suspicious skill when available.
 Before UI review, compare screenshots against main on the same fixture and rerun the shared test helpers.
 
