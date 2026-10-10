@@ -176,11 +176,16 @@ test_claude_hook_verdicts() {
   denied '{"tool_name":"Bash","tool_input":{"command":"ls"}}' "a project command while the start stage is open" "next"
   allowed "{\"tool_name\":\"Bash\",\"tool_input\":{\"command\":\"FM_HOME='/x' '$ROOT/bin/fm-project-rules.sh' next '$STATE' 't1'\"}}" "the helper itself must stay allowed while a stage is open"
   allowed '{"tool_name":"Read","tool_input":{"file_path":"/tmp/x"}}' "file reads must stay allowed while a stage is open"
+  denied "{\"tool_name\":\"Bash\",\"tool_input\":{\"command\":\"'$ROOT/bin/fm-project-rules.sh' next '$STATE' 't1'; touch /tmp/x\"}}" "a command chained after the helper" "next"
+  denied "{\"tool_name\":\"Bash\",\"tool_input\":{\"command\":\"$ROOT/bin/../bin/fm-spawn.sh x\"}}" "another script reached through the helper's folder" "next"
+  denied "{\"tool_name\":\"Bash\",\"tool_input\":{\"command\":\"PATH=/tmp/evil '$ROOT/bin/fm-project-rules.sh' next '$STATE' 't1'\"}}" "the helper under a foreign environment prefix" "next"
+  denied "{\"tool_name\":\"Bash\",\"tool_input\":{\"command\":\"echo \$('$ROOT/bin/fm-project-rules.sh' next)\"}}" "a command that only mentions the helper" "next"
   close_stage || fail "the start stage must close"
   allowed '{"tool_name":"Bash","tool_input":{"command":"ls"}}' "an ordinary command must be allowed after admission"
   denied '{"tool_name":"Agent","tool_input":{"subagent_type":"Explore"}}' "an unqualified child type" "general-purpose"
   allowed '{"tool_name":"Agent","tool_input":{"subagent_type":"general-purpose"}}' "a qualified child type must be allowed"
   denied '{"tool_name":"Bash","tool_input":{"command":"cd apps && bun run test"}}' "a triggered command before its skill" "serve"
+  denied '{"tool_name":"Bash","tool_input":{"command":"sh -c \"bun run test\""}}' "a triggered command hidden in a quoted wrapper" "serve"
   denied "{\"tool_name\":\"Edit\",\"tool_input\":{\"file_path\":\"$COPY/apps/api/src/server/a/b.ts\"}}" "an edit on a triggered path before its skill" "audit"
   allowed "{\"tool_name\":\"Edit\",\"tool_input\":{\"file_path\":\"$COPY/apps/web/x.ts\"}}" "an edit outside the triggered paths must be allowed"
   read_all tests >/dev/null
@@ -309,9 +314,9 @@ test_codex_scan_between_turn_compaction_and_triggers() {
   assert_equals undefined "$(field 'log.evidence[1]')" "a between-turn compaction record carries no block"
   codex_log '[started(),dev(block),agents()]'; close_stage
   assert_equals "" "$("$PR" scan "$STATE" t1)" "the block re-sent at the next turn start is delivery evidence"
-  codex_log '[call("bun run test")]'
+  codex_log '[call("ls "+bin+"/fm-project-rules.sh && bun run test")]'
   out=$("$PR" scan "$STATE" t1)
-  assert_contains "$out" "trigger-skipped tests c1" "a triggered command without its skill must alarm on Codex"
+  assert_contains "$out" "trigger-skipped tests c1" "a triggered command without its skill must alarm on Codex, even when it mentions the helper"
   "$PR" ready "$STATE" t1 2>/dev/null && fail "a skipped trigger must block readiness until the skill is read"
   read_all tests >/dev/null; "$PR" ready "$STATE" t1 || fail "readiness must pass once the skill is read"
   pass "the Codex scan accepts next-turn evidence and catches a triggered command run without its skill"
@@ -345,6 +350,16 @@ test_codex_missing_evidence_and_witness() {
   assert_contains "$out" "native-missing core generation 0" "a native file absent from the session log must alarm"
   assert_contains "$out" "witness-mismatch" "a compaction record with no matching event must alarm"
   pass "the Codex scan alarms on a missing block, a missing native file, and disagreeing compaction records"
+}
+
+test_a_slow_pattern_counts_as_a_match() {
+  local rc=0
+  admit slow claude >/dev/null
+  node -e 'const fs=require("fs");const f=process.argv[1];const r=JSON.parse(fs.readFileSync(f,"utf8"));r.skills.find(s=>s.name==="tests").required.before_commands=["^(a+)+$"];fs.writeFileSync(f,JSON.stringify(r))' "$STATE/t1.project-rules"
+  close_stage
+  hook pretool '{"tool_name":"Bash","tool_input":{"command":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa!"}}' >/dev/null 2>&1 || rc=$?
+  expect_code 2 "$rc" "a command whose pattern check ran out of time"
+  pass "a project pattern that runs out of time is treated as a match instead of stalling or letting the command through"
 }
 
 test_readiness_on_touched_paths() {
@@ -449,6 +464,7 @@ test_codex_scan_start_and_mid_turn_compaction
 test_codex_scan_between_turn_compaction_and_triggers
 test_codex_scan_is_idempotent_and_cursor_safe
 test_codex_missing_evidence_and_witness
+test_a_slow_pattern_counts_as_a_match
 test_readiness_on_touched_paths
 test_merge_settings_preserves_existing_content
 test_size_and_emit

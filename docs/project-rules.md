@@ -71,6 +71,16 @@ The launch is refused, and no agent starts, when:
 
 A tool version the live guard has not seen still launches, with a notice and a one-time alarm, and its children are denied until it is qualified.
 
+## Trust boundary
+
+The prepare and resolve commands come from the project's own default branch and run under the operator's account, in the launcher's process, before any worker exists.
+That is the same trust a worker in that project already has, since it runs the project's code with the operator's account, but it happens earlier and outside the worker.
+Register only projects whose default branch you would let a worker run code from.
+A declared file may live outside the copy, which is how pinned plugin assets are reached, and its content is given to the worker verbatim.
+
+A project's command patterns are matched under a time limit, and a pattern that runs out of time counts as a match.
+While a stage is open on Claude, the only shell command allowed is one simple command that runs a worker-facing Firstmate script by its exact path, with no shell operators, substitutions or redirections.
+
 ## The always-on block
 
 Every rule entry that applies to the tool and is not `native` for it goes into one block, in full and in list order, followed by the skill catalog and a 64-row receipt table.

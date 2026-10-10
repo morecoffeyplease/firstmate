@@ -6,6 +6,7 @@
 import crypto from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
+import vm from "node:vm";
 import { spawnSync } from "node:child_process";
 
 const CAP = 79000;
@@ -16,7 +17,9 @@ const GRACE_SECS = Number(process.env.FM_PROJECT_RULES_GRACE_SECS ?? 60);
 const TOOLS = ["claude", "codex"];
 const EDIT_TOOLS = ["Edit", "Write", "MultiEdit", "NotebookEdit"];
 const HELPER = process.env.FM_PROJECT_RULES_HELPER || "";
-const BIN = path.dirname(HELPER);
+// The worker-facing Firstmate commands a worker may run while a stage is open.
+const HELPERS = ["fm-project-rules.sh", "fm-task-heartbeat.sh", "fm-captain-hold.sh"].map((name) => path.join(path.dirname(HELPER), name));
+const HELPER_ENV = ["FM_HOME", "FM_ROOT_OVERRIDE", "FM_STATE_OVERRIDE"];
 
 const die = (message, code = 1) => {
   process.stderr.write(`fm-project-rules: ${message}\n`);
@@ -145,6 +148,7 @@ function loadList(copy) {
     if ("before_commands" in skill.required) {
       strings(skill.required.before_commands, `${where}.required.before_commands`);
       for (const pattern of skill.required.before_commands) {
+        if (pattern.length > 300) bad(`${where}.required.before_commands patterns may be at most 300 characters`);
         try {
           commandPattern(pattern);
         } catch (error) {
@@ -163,6 +167,43 @@ function loadList(copy) {
 function commandPattern(pattern) {
   const classes = { space: "\\s", digit: "0-9", alpha: "A-Za-z", alnum: "A-Za-z0-9", upper: "A-Z", lower: "a-z" };
   return new RegExp(pattern.replace(/\[:(\w+):\]/g, (whole, name) => classes[name] ?? whole));
+}
+
+// True only for one simple command that runs a worker-facing Firstmate script
+// by its exact path: no shell operators, expansions, substitutions or
+// redirections anywhere, and no environment prefix beyond Firstmate's own.
+// A command that merely mentions the path, or chains something after it, is
+// an ordinary project command.
+function helperCall(command) {
+  const words = [];
+  let rest = String(command).trim();
+  while (rest) {
+    const word = rest.match(/^(?:'[^']*'|"[^"$`\\]*"|[A-Za-z0-9_@%+=:,./-]+)+/);
+    if (!word) return false;
+    words.push(word[0].replace(/'([^']*)'|"([^"]*)"/g, "$1$2"));
+    rest = rest.slice(word[0].length);
+    if (rest && !/^[ \t]/.test(rest)) return false;
+    rest = rest.replace(/^[ \t]+/, "");
+  }
+  while (words.length && HELPER_ENV.includes(words[0].split("=")[0]) && words[0].includes("=")) words.shift();
+  return words.length > 0 && HELPERS.includes(words[0]);
+}
+
+// A project's pattern is matched under a time limit, and a pattern that runs
+// out of time counts as a match, so a slow pattern cannot stall the hook or
+// the watcher and cannot hide a command either. The command is also tried with
+// its quoting and grouping characters blanked, so a wrapper such as
+// sh -c "..." does not hide it.
+function commandMatches(patterns, command) {
+  const text = String(command).slice(0, 8000);
+  const forms = [text, text.replace(/["'`(){}]/g, " ")];
+  return patterns.some((pattern) => {
+    try {
+      return vm.runInNewContext("forms.some((form) => re.test(form))", { re: commandPattern(pattern), forms }, { timeout: 100 });
+    } catch {
+      return true;
+    }
+  });
 }
 
 function pathPattern(glob) {
@@ -517,7 +558,7 @@ function hook([state, id, event]) {
   const tool = payload.tool_name ?? "";
   const input = payload.tool_input ?? {};
   const command = tool === "Bash" ? String(input.command ?? "") : "";
-  const ours = command.trim().replace(/^(?:[A-Za-z_][A-Za-z0-9_]*=(?:'[^']*'|"[^"]*"|\S*)\s+)*/, "").replace(/^['"]/, "").startsWith(`${BIN}/`);
+  const ours = helperCall(command);
   const verdict = withRecord(state, id, (R) => {
     if (!R) return "";
     if (!R.stage.closed && !ours && !["Read", "Glob", "Grep"].includes(tool)) {
@@ -533,7 +574,7 @@ function hook([state, id, event]) {
     for (const skill of R.skills.filter((entry) => entry.required && !entry.required.at)) {
       const rel = EDIT_TOOLS.includes(tool) ? path.relative(R.copy, path.resolve(R.copy, String(input.file_path ?? input.notebook_path ?? ""))) : "";
       const matched = skill.required.before_commands
-        ? Boolean(command) && !ours && skill.required.before_commands.some((pattern) => commandPattern(pattern).test(command))
+        ? Boolean(command) && !ours && commandMatches(skill.required.before_commands, command)
         : Boolean(rel) && skill.required.on_paths.some((glob) => pathPattern(glob).test(rel));
       if (!matched) continue;
       R.hits[skill.name] = true;
@@ -635,7 +676,7 @@ function scanCodex(R, block, file) {
       } catch {
         command = raw;
       }
-      if (command.includes(`${BIN}/`)) continue;
+      if (helperCall(command)) continue;
       const at = Date.parse(entry.timestamp ?? "") || Date.now();
       const closed = Date.parse(R.closed?.[gen] ?? "") || Infinity;
       if (at < closed) {
@@ -643,7 +684,7 @@ function scanCodex(R, block, file) {
         else violate(R, gen === 0 ? "worked-before-admission" : "worked-before-refresh", `stage ${gen === 0 ? "start" : `c${gen}`}`);
       }
       for (const skill of R.skills.filter((item) => item.required?.before_commands)) {
-        if (!skill.required.before_commands.some((pattern) => commandPattern(pattern).test(command))) continue;
+        if (!commandMatches(skill.required.before_commands, command)) continue;
         R.hits[skill.name] = true;
         const answer = R.answers[skill.name];
         if (!(answer?.gen === gen && Date.parse(answer.at) <= at)) violate(R, "trigger-skipped", `${skill.name} c${gen}`);
