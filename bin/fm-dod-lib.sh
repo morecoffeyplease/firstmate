@@ -42,6 +42,19 @@ Project instructions still govern the work wherever they do not conflict with th
 EOF
 }
 
+# fm_brief_project_rules_gate owns the startup gate appended to a launch brief
+# when the project declares its rules (docs/project-rules.md).
+fm_brief_project_rules_gate() {  # <helper> <state-dir> <task-id>
+  cat <<EOF
+
+# Project rules gate
+This project declares rules that bind your work, and they are already in your instructions as a block titled "Project rules".
+Before your first project command or edit, run \`'$1' next '$2' '$3'\` and do everything it prints, in order.
+Run the same command again right after any context compaction, before any other action.
+Load a required skill only through the command it names, never from memory of an earlier read.
+EOF
+}
+
 fm_ship_rule_one() {  # <direct-PR|local-only> <task-id>
   local mode=$1 id=$2
   case "$mode" in

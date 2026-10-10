@@ -95,6 +95,13 @@ git -C "$PROJ" rev-parse --verify --quiet "refs/heads/$BRANCH" >/dev/null || { e
 
 DEFAULT=$(default_branch) || { echo "error: cannot determine default branch for $PROJ; expected origin/HEAD, main, or master" >&2; exit 1; }
 
+# A task whose project declares rules lands only once nothing is owed for its
+# current generation (docs/project-rules.md).
+"$SCRIPT_DIR/fm-project-rules.sh" ready "$STATE" "$ID" || {
+  echo "error: task $ID still owes a project-rules receipt or a required skill read; refusing to merge" >&2
+  exit 1
+}
+
 # The project's main checkout must be on its default branch and clean, so the
 # fast-forward lands predictably (firstmate never writes here otherwise).
 cur=$(git -C "$PROJ" symbolic-ref --short HEAD 2>/dev/null || echo "")
