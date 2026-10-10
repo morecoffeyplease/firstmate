@@ -64,9 +64,36 @@ The parent's prompt gave no canary to either child; the results below are from t
 | Claude Explore | no | yes | no |
 | Codex sub-agent | root `AGENTS.md` yes | not applicable | yes |
 
+## Live guard
+
+`tests/fm-project-rules-live-e2e.test.sh` ran on 2026-10-10 against its built-in fixture project, with each worker launched by the real `bin/fm-spawn.sh` into an isolated Herdr lab on a fresh pool copy.
+Claude ran as `--model sonnet --effort low` and Codex as its default model at low effort; a project's own dispatch models are exercised when the guard is pointed at that project.
+
+```console
+$ FM_PROJECT_RULES_LIVE_E2E=1 FM_PROJECT_RULES_LIVE_RUNS=2 tests/fm-project-rules-live-e2e.test.sh
+ok - claude 2.1.296 stage A: report and log agree (block 3229 bytes, generation 0)
+ok - claude 2.1.296 stage B: report and log agree (block 3229 bytes, generation 1)
+ok - claude 2.1.296 stage C: report and log agree (block 3269 bytes, generation 1)
+ok - claude 2.1.296 stage D: report and log agree (block 3269 bytes, generation 2)
+ok - codex 0.161.0 stage A: report and log agree (block 3435 bytes, generation 0)
+ok - codex 0.161.0 stage B: report and log agree (block 3435 bytes, generation 1)
+ok - codex 0.161.0 stage C: report and log agree (block 3471 bytes, generation 1)
+ok - codex 0.161.0 stage D: report and log agree (block 3471 bytes, generation 2)
+```
+
+Each of those stages passed in 2 sessions per tool.
+Stage A is admission, B follows a forced compaction, C follows an automatic compaction in a second session, and D follows a forced compaction in that same session.
+At every stage the worker reported each canary it should hold, a child held the native files (and on Claude the area rule after touching that folder), the triggering command had its skill read in that generation, an Explore child was refused on Claude, and the scan of the tool's own log raised no alarm.
+The same run passed the independent coverage check, the prepare rerun, and the refusals for both tools.
+The Claude and Codex results come from two invocations on the same engine code, because the first stopped at a fault in the guard's own stage message after Claude had finished.
+
+Automatic compaction was produced by lowering the tool's own limit on a replay of the launch `fm-spawn` builds: `CLAUDE_CODE_AUTO_COMPACT_WINDOW=160000` for Claude and `-c model_auto_compact_token_limit=60000` for Codex.
+An earlier Claude session under the same setting compacted twice by itself and then once on request, and passed at generation 3.
+
 ## Not yet measured
 
-Claude automatic compaction, more than one compaction in a session, a child's own compaction, and plugin-defined Claude child types.
+A child's own compaction, plugin-defined Claude child types, and block sizes above 79 KB.
+The live guard has not yet run against ButterTrip's own declared list, which is the acceptance run that lifts the pause.
 
 ## Suites
 

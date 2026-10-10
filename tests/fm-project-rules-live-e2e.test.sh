@@ -222,7 +222,9 @@ stage_task() {  # <stage letter>
 send_stage() {  # <letter>
   local file="$HOME_DIR/data/$ID/stage-$1.md"
   stage_task "$1" > "$file"
-  say "Read the file $file now and do exactly what it says."
+  # Reading the stage file is itself work, so the pointer leads with the gate,
+  # the way a steer through the task's inbox would.
+  say "First run your project rules next command and do everything it prints. After that, read the file $file and do exactly what it says."
 }
 
 spawn_worker() {  # <tool> <run>
