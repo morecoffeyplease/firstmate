@@ -439,6 +439,22 @@ test_boolean_view_never_promotes_unknown() {
   pass "the boolean view reports busy only on an exact busy verdict"
 }
 
+test_codex_input_prompt_uses_prompt_widget_not_assistant_prose() {
+  local approval prose
+  approval='Would you like to run the following command?
+› 1. Yes, proceed (y)
+  2. Yes, and do not ask again
+  3. No, and tell Codex what to do differently (esc)
+Press enter to confirm or esc to cancel'
+  prose='The assistant said: Waiting for your input.'
+  fm_busy_codex_needs_input_prompt "$approval" \
+    || fail "Codex approval widget should identify a real needs-input prompt"
+  if fm_busy_codex_needs_input_prompt "$prose"; then
+    fail "ordinary assistant prose must not count as a needs-input prompt"
+  fi
+  pass "Codex needs-input detection requires the approval widget, not matching prose"
+}
+
 test_progress_is_generation_bound_and_not_semantic_state() {
   local state gen replacement before
   state=$(new_state_dir native-progress)
@@ -459,6 +475,7 @@ test_progress_is_generation_bound_and_not_semantic_state() {
 }
 
 test_progress_is_generation_bound_and_not_semantic_state
+test_codex_input_prompt_uses_prompt_widget_not_assistant_prose
 
 test_arm_seeds_busy_spawn
 test_apply_advances_seq_and_source

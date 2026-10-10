@@ -2063,3 +2063,21 @@ A throwaway scout was spawned through `bin/fm-spawn.sh --scout --harness omp --m
 6. `bin/fm-control.sh <id> exit` stopped the agent and `bin/fm-teardown.sh` returned the worktree and closed the item.
 
 `FM_OMP_LIVE_E2E=1 tests/fm-omp-primary-live-e2e.test.sh` refreshes the primary evidence; the worker path above is refreshed by repeating the scout dispatch after any omp upgrade.
+
+## Codex worker state on Herdr
+
+Verified on 2026-10-10 with codex-cli 0.161.0 and Herdr 0.9.3 (client and server, protocol 22) in the isolated task lab session.
+The verified adapter path is `fm_busy_codex_herdr_classify` in `bin/fm-busy-lib.sh`, which folds Codex's task-bound rollout JSONL and verifies the live Codex process through Herdr pane process information.
+The same real Codex worker first reproduced the issue as `state: unknown · source: pane · harness state unavailable (unknown codex-unverified)` while idle at its prompt and while waiting on a background command.
+`fm-spawn` records the Codex sessions root, exact worktree, and pre-existing matching rollout files in `state/<id>.codex-session`.
+For an already-running task, the read-only classifier interprets the local start time in matching rollout filenames, filters to those at or after the task's `spawn_gen`, then selects the most recently written file.
+If no eligible rollout exists, the newest write is tied, or multiple eligible candidates change during inspection, the classifier reports unknown.
+The state read does not create or update a Codex binding sidecar.
+Codex `task_started` and open tool-call records classify as working until matching completion records arrive, including while a long shell command runs and the visible composer looks empty.
+The verified live guard reported the settled prompt as `state: idle · source: pane · harness idle at prompt (codex-rollout)` and a normal started turn as `state: working · source: pane · harness busy (codex-rollout)`.
+During a live approval widget, pane capture maps the numbered `Yes, proceed` and `No, and tell Codex what to do differently` choices plus the confirmation footer to `blocked codex-pane-input`, including while the rollout still records active work.
+Ordinary assistant text containing `Waiting for your input` remains idle when the rollout is settled.
+The live guard command is `FM_CREW_STATE_CODEX_HERDR_LIVE_E2E=1 bash tests/fm-crew-state-codex-herdr-live-e2e.test.sh`.
+The 2026-10-10 rerun on codex-cli 0.161.0 printed `# codex-cli 0.161.0 on Herdr 0.9.3` and passed read-only discovery, working turn, settled prompt, mid-turn, long command, ordinary prose, and approval-widget checks.
+Portable behavioral cases, including a busy worker whose rendered pane looks like an empty Codex prompt, are in `tests/fm-crew-state.test.sh`.
+The shared Claude path remains covered by the same suite.

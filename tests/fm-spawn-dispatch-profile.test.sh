@@ -470,7 +470,7 @@ test_codex_omits_max_effort_for_unsupported_model() {
 # a crewmate runs hook-free, a secondmate keeps the project hooks that carry its
 # own primary-session turn-end guard and session-start digest.
 test_codex_crewmate_launch_disables_the_hook_layer() {
-  local rec id out status launch
+  local rec id out status launch binding
   id=profile-codex-hooks-z4c
   rec=$(make_spawn_case profile-codex-hooks codex "$id")
   read_case_record "$rec"
@@ -489,6 +489,14 @@ test_codex_crewmate_launch_disables_the_hook_layer() {
   # launch rather than any hook.
   assert_contains "$launch" "notify=" \
     "codex crewmate launch lost the turn-end notify program"
+  binding="$HOME_DIR/state/$id.codex-session"
+  assert_present "$binding" "codex crewmate spawn did not bind its rollout transcript"
+  assert_grep "sessions_root=$HOME_DIR/user-home/.codex/sessions" "$binding" \
+    "codex rollout binding did not record the isolated sessions root"
+  assert_grep "workspace_root=$WT_DIR" "$binding" \
+    "codex rollout binding did not record its exact worktree"
+  grep -Eq '^binding_id=.' "$binding" \
+    || fail "codex rollout binding did not record its incarnation id"
   pass "a codex crewmate launches with no hook layer and keeps its turn-end signal"
 }
 

@@ -340,6 +340,11 @@
 # resolver because `cursor` is not the CLI name. A cursor SECONDMATE instead runs
 # the tracked project-scope .cursor/hooks.json in its own home, whose stop-hook
 # park owns that home's supervision (docs/supervision-protocols/cursor.md).
+# Codex on Herdr writes its turn lifecycle to its own rollout JSONL; the spawn
+# records the sessions root, exact worktree, and binding id in
+# state/<id>.codex-session. The reader filters by spawn generation and selects
+# the newest write. Other Codex backends remain unknown until their
+# own live-verified semantic source is wired.
 # claude is the one harness whose pre-launch setup can REFUSE the spawn: before
 # any per-task state exists, and before its worktree .claude/settings.local.json
 # hooks are written, every claude launch pre-registers the directory the pane
@@ -4431,14 +4436,23 @@ export default function (pi: any) {
 EOF
     ;;
   codex*)
-    # Semantic busy-state source negotiation (bin/fm-busy-lib.sh owns the
-    # probes and the evidence). Neither Codex path is usable on the
-    # installed binary: a pane worker's turns are not observable through
-    # the app-server protocol, and its lifecycle hooks did not fire for a
-    # firstmate-launched worker. Codex therefore classifies unknown with
-    # an explicit reason rather than falling back to idle, and no busy
-    # wiring is installed. The turn-end NOTIFICATION marker still rides
-    # the launch command via -c notify=[...] and __TURNEND__.
+    # Codex app-server and lifecycle-hook sources remain unavailable for a
+    # pane worker, so Codex on non-Herdr backends still classifies unknown.
+    # Herdr Codex uses its own task-bound rollout transcript; it has no writer
+    # or hook wiring. The turn-end NOTIFICATION marker still rides the launch
+    # command via -c notify=[...] and __TURNEND__.
+    CODEX_HOME_ROOT=${CODEX_HOME:-$HOME/.codex}
+    if [ -d "$CODEX_HOME_ROOT" ]; then
+      CODEX_SESSIONS_ROOT="$(cd "$CODEX_HOME_ROOT" && pwd -P)/sessions"
+    else
+      CODEX_SESSIONS_ROOT="$CODEX_HOME_ROOT/sessions"
+    fi
+    CODEX_BINDING_ID="$$.$RANDOM.$(date +%s)"
+    {
+      printf 'sessions_root=%s\n' "$CODEX_SESSIONS_ROOT"
+      printf 'workspace_root=%s\n' "$WT"
+      printf 'binding_id=%s\n' "$CODEX_BINDING_ID"
+    } >"$STATE/$ID.codex-session"
     ;;
   grok*)
     # grok fires a Stop hook at every turn boundary (verified, grok 0.2.73), the

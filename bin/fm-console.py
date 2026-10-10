@@ -174,7 +174,8 @@ def task_records(value: dict) -> list[dict]:
                 item["id"] = f"{home_record.get('id', 'secondmate')}/{task.get('id', '')}"
                 item["owner_home_id"] = home_record.get("id")
                 records.append(item)
-        for task in home_record.get("active_children", []):
+        children = home_record.get("child_lanes", home_record.get("active_children", []))
+        for task in children:
             if isinstance(task, dict):
                 item = dict(task)
                 item["id"] = f"{home_record.get('id', 'secondmate')}/{task.get('id', '')}"
@@ -436,8 +437,12 @@ def secondmate_disclosures(value: dict) -> list[str]:
         name = record.get("id") or "secondmate"
         current = record.get("current") or {}
         reason = current.get("reason")
-        if current.get("state") == "unknown" or reason or record.get("registered") is False:
+        lane_degraded = (record.get("reconcile_inventory") or {}).get("kind") == "child_current_unavailable"
+        if ((current.get("state") == "unknown" or reason) and not lane_degraded) or record.get("registered") is False:
             warnings.append(f"{name}: {reason or 'secondmate inventory is unavailable or unregistered'}")
+        for child in record.get("child_lanes", []):
+            if isinstance(child, dict) and child.get("state") == "unknown":
+                warnings.append(f"{name}/{child.get('id', 'child')}: current lane state is unavailable")
         freshness = record.get("freshness") or {}
         if freshness.get("status") == "cached":
             warnings.append(f"{name}: showing cached secondmate data ({freshness.get('age_seconds', 'unknown')} seconds old)")
@@ -593,7 +598,7 @@ def decisions(home: Path, root: Path, value: dict) -> list[dict]:
             task = item.get("target_task_id") or (item.get("id") if item.get("verb") != "captain-hold" else None)
             direct_hold = False
             if item.get("verb") == "captain-hold":
-                children = [child for child in home_record.get("active_children", []) if isinstance(child, dict)]
+                children = [child for child in home_record.get("child_lanes", home_record.get("active_children", [])) if isinstance(child, dict)]
                 if not task and isinstance(key, str):
                     task = next((child.get("id") for child in children if key in (child.get("decision_keys") or [])), None)
                 if not any(child.get("id") == task for child in children):
@@ -763,10 +768,11 @@ def queue_data(snap: dict, home: Path, root: Path) -> list[dict]:
             out.append(item)
     for home_record in secondmate_records:
         owner = home_record.get("id") or "secondmate"
-        for child in home_record.get("active_children", []):
+        children = home_record.get("child_lanes", home_record.get("active_children", []))
+        for child in children:
             if isinstance(child, dict):
                 out.append({"id": f"{owner}/{child.get('id', '')}", "title": child.get("name") or child.get("id"),
-                            "state": child.get("state") or "working", "repo": child.get("repo"), "blocked_by_ids": [],
+                            "state": child.get("state") or "unknown", "repo": child.get("repo"), "blocked_by_ids": [],
                             "unresolved_blocker_ids": [], "blocked_reason": None, "captain_actionable": False,
                             "hold_until": None, "hold_kind": None, "links": [child.get("issue")] if child.get("issue") else [],
                             "body_lines": child.get("body_lines") or [], "owner": owner})

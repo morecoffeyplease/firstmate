@@ -145,6 +145,17 @@ snapshot = {
          "omitted": []},
         {"id": "stale-mate", "registered": True, "current": {"state": "unknown", "reason": "structured home unavailable"},
          "freshness": {"status": "cached", "age_seconds": 100}, "omitted": [{"surface": "queued", "count": 2}]},
+        {"id": "partial-mate", "home": str(home / "projects" / "mate-home"), "registered": True,
+         "current": {"state": "unknown", "reason": "structured home state invalid: child current state unavailable: unreadable"},
+         "reconcile_inventory": {"kind": "child_current_unavailable", "ids": ["unreadable"]},
+         "freshness": {"status": "fresh", "age_seconds": 0},
+         "active_children": [{"id": "healthy-lane", "state": "working", "repo": "alpha", "issue": issue_url}],
+         "child_lanes": [
+             {"id": "healthy-lane", "state": "working", "repo": "alpha", "issue": issue_url},
+             {"id": "unreadable", "state": "unknown", "repo": "alpha", "issue": issue_url, "decision_keys": ["unreadable-call"]},
+         ],
+         "decisions_open": [{"id": "unreadable-call", "key": "unreadable-call", "verb": "needs-decision", "summary": "Resolve unreadable lane", "target_task_id": "unreadable"}],
+         "queued": [], "omitted": []},
     ]},
 }
 snapshot_path = tmp / "snapshot.json"
@@ -269,6 +280,8 @@ try:
     assert any(row["issue_missing"] and row["title"] == "No issue link recorded" and row["tasks"][0]["id"] == "unlinked" for row in rows), rows
     assert any("stale-mate" in warning and "unavailable" in warning for warning in data["warnings"]), data["warnings"]
     assert any("cached secondmate data" in warning for warning in data["warnings"]), data["warnings"]
+    assert any("partial-mate/unreadable" in warning and "current lane state is unavailable" in warning for warning in data["warnings"]), data["warnings"]
+    assert not any(warning.startswith("partial-mate:") for warning in data["warnings"]), data["warnings"]
     decisions = data["decisions"]
     assert {(item["owner"], item["task"], item["key"], item["verb"]) for item in decisions} == {
         ("main", "worker", "decision-a", "needs-decision"),
@@ -280,6 +293,7 @@ try:
         ("mate", "mate-child", "mate-route", "needs-decision"),
         ("mate", "mate-child", "mate-held", "captain-hold"),
         ("mate", None, "mate-orphan-hold", "captain-hold"),
+        ("partial-mate", "unreadable", "unreadable-call", "needs-decision"),
     }, decisions
     assert not any(item["key"] == "captain-hold-mate-child-1" for item in decisions), decisions
     structured = next(item for item in decisions if item["key"] == "decision-a")
@@ -327,6 +341,9 @@ try:
     first_blocked = next(index for index, row in enumerate(queue) if row["start_reason"] != "Ready to start now")
     assert all(row["start_reason"] == "Ready to start now" for row in queue[:first_blocked])
     assert any(row["id"] == "mate/mate-child" for row in queue)
+    assert {row["id"]: row["state"] for row in queue if row["id"].startswith("partial-mate/")} == {
+        "partial-mate/healthy-lane": "working", "partial-mate/unreadable": "unknown"
+    }, queue
     assert any(row["id"] == "mate/mate-next" and row["unresolved_blocker_ids"] == ["mate-child"] for row in queue)
     assert next(row for row in queue if row["id"] == "mate/mate-next")["start_reason"] == "Waiting for dependencies: mate-child (working)"
     assert next(row for row in queue if row["id"] == "mate/mate-stale-dependency")["start_reason"] == "Waiting for dependencies: finished-pruned (state unavailable)"

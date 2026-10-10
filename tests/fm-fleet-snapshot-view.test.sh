@@ -1165,10 +1165,48 @@ EOF
   pass "secondmate summary projects issue bindings and captain-hold answer owners"
 }
 
+test_home_summary_keeps_sibling_lanes_when_one_state_is_unknown() {
+  local home fakebin out
+  home=$(make_home summary-partial-lanes)
+  mkdir -p "$home/projects/working-child" "$home/projects/unknown-child"
+  cat > "$home/data/backlog.md" <<'EOF'
+## In flight
+- [ ] working-child - Working child (repo: alpha) (kind: ship) (since 2026-07-11)
+- [ ] unknown-child - Unknown child (repo: alpha) (kind: ship) (since 2026-07-11)
+
+## Queued
+
+## Done
+EOF
+  fm_write_meta "$home/state/working-child.meta" \
+    "window=firstmate:fm-working-child" "worktree=$home/projects/working-child" \
+    "project=alpha" "harness=claude" "kind=ship"
+  fm_write_meta "$home/state/unknown-child.meta" \
+    "window=firstmate:fm-unknown-child" "worktree=$home/projects/unknown-child" \
+    "project=alpha" "harness=codex" "kind=ship" \
+    "issue=https://github.com/example/alpha/issues/37"
+  fixture_gen=$("$ROOT/bin/fm-busy-event.sh" arm "$home/state" working-child)
+  "$ROOT/bin/fm-busy-event.sh" apply "$home/state" working-child busy --gen "$fixture_gen" \
+    --source claude-hook --event user-prompt-submit
+  fakebin=$(make_fakebin "$home")
+  out=$(PATH="$fakebin:$PATH" FM_HOME="$home" "$SNAPSHOT" --secondmate-home-summary)
+  printf '%s' "$out" | jq -e '
+    .valid == false
+      and .invalidity == {kind:"child_current_unavailable",ids:["unknown-child"]}
+      and ([.child_lanes[] | select(.id == "working-child" and .state == "working")] | length) == 1
+      and ([.child_lanes[] | select(.id == "unknown-child" and .state == "unknown")] | length) == 1
+      and ([.active_children[] | select(.id == "working-child")] | length) == 1
+      and ([.active_children[] | select(.id == "unknown-child")] | length) == 0
+      and ([.endpoints[] | select(.id == "unknown-child")] | length) == 1
+  ' >/dev/null || fail "one unavailable lane must not erase its sibling's current state: $out"
+  pass "home summary preserves healthy and unknown child lanes independently"
+}
+
 test_empty_fleet_json
 test_fixture_snapshot_json
 test_home_summary_excludes_secondmate_from_child_inventory
 test_home_summary_projects_issue_bindings_and_hold_owners
+test_home_summary_keeps_sibling_lanes_when_one_state_is_unknown
 test_undated_captain_hold_phrasing_and_aging
 test_hold_buckets_are_total_and_text_blind
 test_main_inventory_orphan_and_unstructured_disclosure

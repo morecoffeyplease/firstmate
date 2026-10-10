@@ -6,7 +6,7 @@
 #
 # Output is one stable, parseable, token-tight line:
 #
-#   state: <working|parked|done|blocked|paused|failed|unknown> · source: <pane|status-log|remote-endpoint|none> · <detail>
+#   state: <working|idle|parked|done|blocked|paused|failed|unknown> · source: <pane|status-log|remote-endpoint|none> · <detail>
 #
 # Remote secondmates are queried on their own host because local endpoint reads cannot prove their state.
 # A transport failure remains unknown, never a false death verdict.
@@ -168,6 +168,14 @@ crew_busy_verdict() {  # <target>
 # the current state.
 [ -n "$BACKEND_TARGET" ] || emit unknown none "no backend target recorded"
 if ! pane_readable "$BACKEND_TARGET"; then
+  case "$TASK_BACKEND:$HARNESS" in
+    herdr:codex*)
+      if fm_backend_target_exists herdr "$BACKEND_TARGET"; then
+        emit unknown pane "Codex pane capture unavailable"
+      fi
+      emit unknown none "Codex pane unavailable"
+      ;;
+  esac
   # A failed probe is not itself evidence the pane is gone: the herdr CLI can
   # error or stall under load, and tmux can fail to be executed at all (a
   # trimmed PATH) or answer non-definitively, while the pane is alive - a busy
@@ -218,14 +226,19 @@ fi
 
 # Secondmates idle on their own watcher (idle pane = healthy), so the busy
 # state is not meaningful for them; read their state from the status log only.
-# Only an exact busy verdict reports working here, and only an exact idle
-# verdict permits the status-log fallback below. Missing, malformed, stale, or
-# unverified semantic state remains unknown.
+# Codex rollout events report working and idle; a visible Codex input prompt
+# reports blocked. Other exact idle verdicts permit the status-log fallback
+# below. Missing, malformed, stale, or unverified semantic state remains unknown.
 if [ "$KIND" != secondmate ]; then
   BUSY_VERDICT=$(crew_busy_verdict "$BACKEND_TARGET")
   case "${BUSY_VERDICT%% *}" in
     busy) emit working pane "harness busy (${BUSY_VERDICT#* })" ;;
-    idle) ;;
+    blocked) emit blocked pane "harness needs input (${BUSY_VERDICT#* })" ;;
+    idle)
+      if [ "${BUSY_VERDICT#* }" = codex-rollout ]; then
+        emit idle pane "harness idle at prompt (codex-rollout)"
+      fi
+      ;;
     *) emit unknown pane "harness state unavailable ($BUSY_VERDICT)" ;;
   esac
 fi
