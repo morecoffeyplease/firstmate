@@ -867,6 +867,61 @@ fm_busy_codex_binding_has_prior() {  # <state-dir> <id> <rollout>
   return 1
 }
 
+# fm_busy_codex_meta_field: read exactly one nonempty key from task metadata.
+fm_busy_codex_meta_field() {  # <meta-file> <key>
+  local file=$1 key=$2 count value
+  [ -f "$file" ] && [ ! -L "$file" ] || return 1
+  count=$(grep -c "^$key=" "$file" 2>/dev/null || true)
+  [ "$count" -eq 1 ] || return 1
+  value=$(sed -n "s/^$key=//p" "$file")
+  [ -n "$value" ] || return 1
+  printf '%s' "$value"
+}
+
+# Existing Codex tasks predate rollout binding. Bind only when task metadata
+# names one canonical worktree and exactly one existing rollout has that exact
+# cwd. Refuse symlinked records/paths and ambiguous worktrees, matching spawn's
+# exact-identity rule without guessing which old conversation belongs to it.
+fm_busy_codex_bind_existing_rollout() {  # <state-dir> <id>
+  local state=$1 id=$2 meta binding workspace canonical_workspace codex_home sessions_root
+  local candidate selected='' count=0 temp
+  case "$id" in ''|*[!A-Za-z0-9._-]*) return 1 ;; esac
+  meta="$state/$id.meta"
+  binding=$(fm_busy_codex_binding_path "$state" "$id")
+  [ ! -e "$binding" ] && [ ! -L "$binding" ] || return 1
+  workspace=$(fm_busy_codex_meta_field "$meta" worktree) || return 1
+  case "$workspace" in /*) ;; *) return 1 ;; esac
+  [ -d "$workspace" ] && [ ! -L "$workspace" ] || return 1
+  canonical_workspace=$(cd "$workspace" 2>/dev/null && pwd -P) || return 1
+  [ "$canonical_workspace" = "$workspace" ] || return 1
+  codex_home=${CODEX_HOME:-$HOME/.codex}
+  [ -d "$codex_home" ] || return 1
+  sessions_root=$(cd "$codex_home" 2>/dev/null && pwd -P)/sessions
+  [ -d "$sessions_root" ] && [ ! -L "$sessions_root" ] || return 1
+  while IFS= read -r candidate; do
+    [ -n "$candidate" ] || continue
+    count=$((count + 1))
+    selected=$candidate
+  done <<EOF
+$(fm_busy_codex_matching_rollouts "$sessions_root" "$workspace")
+EOF
+  [ "$count" -eq 1 ] || return 1
+  [ -f "$selected" ] && [ ! -L "$selected" ] || return 1
+  case "$selected" in "$sessions_root"/*) ;; *) return 1 ;; esac
+  temp=$(mktemp "$state/.$id.codex-session.XXXXXX") || return 1
+  {
+    printf 'sessions_root=%s\n' "$sessions_root"
+    printf 'workspace_root=%s\n' "$workspace"
+    printf 'binding_id=existing.%s.%s\n' "$$" "$(date +%s)"
+  } > "$temp" || { rm -f -- "$temp"; return 1; }
+  if ! ln "$temp" "$binding" 2>/dev/null; then
+    rm -f -- "$temp"
+    return 1
+  fi
+  rm -f -- "$temp"
+  return 0
+}
+
 # fm_busy_codex_matching_rollouts: main rollout files whose session_meta cwd is
 # exactly this task's worktree. A depth-bounded walk excludes any future nested
 # helper logs and reads only the first JSONL record in each file.
@@ -1182,12 +1237,17 @@ fm_busy_classify() {  # <backend> <target> <harness> <id> <state-dir> [tail40]
 }
 
 # Codex's TUI uses its own append-only rollout transcript rather than Herdr's
-# agent registry. Live verified on 2026-10-09 with codex-cli 0.161.0; see
+# agent registry. Live verified on 2026-10-10 with codex-cli 0.161.0; see
 # docs/verification/runtime-backends.md under "Codex worker state on Herdr".
 # Pane capture is consulted only for a visible Codex prompt that needs input.
 fm_busy_codex_needs_input_prompt() {  # <pane-capture>
-  printf '%s\n' "$1" | tail -24 | grep -Eiq \
-    '(^|[^[:alpha:]])(approval required|needs your approval|waiting for your input|do you want to run this command|press enter to confirm|press enter to continue)([^[:alpha:]]|$)'
+  printf '%s\n' "$1" | tail -16 | awk '
+    /Would you like to run the following command\?/ { approval = 1 }
+    /^[[:space:]]*[›>][[:space:]]*[0-9]+\. Yes, proceed/ { action = 1 }
+    /^[[:space:]]*[0-9]+\. No, and tell Codex what to do differently/ { cancel = 1 }
+    /Press enter to confirm or esc to cancel/ { confirm = 1 }
+    END { exit !(approval && action && cancel && confirm) }
+  '
 }
 
 fm_busy_codex_herdr_classify() {  # <target> <id> <state-dir>
@@ -1208,17 +1268,20 @@ fm_busy_codex_herdr_classify() {  # <target> <id> <state-dir>
     printf 'unknown codex-process-unverified'
     return 0
   fi
+  if [ ! -e "$(fm_busy_codex_binding_path "$state" "$id")" ] \
+    && [ ! -L "$(fm_busy_codex_binding_path "$state" "$id")" ]; then
+    fm_busy_codex_bind_existing_rollout "$state" "$id" >/dev/null 2>&1 || true
+  fi
   rollout=$(fm_busy_codex_rollout_log "$state" "$id") || {
     printf 'unknown codex-rollout-unavailable'
     return 0
   }
   lifecycle=$(fm_busy_codex_rollout_state "$rollout")
-  case "$lifecycle" in
-    busy) printf 'busy codex-rollout'; return 0 ;;
-  esac
   capture=$(fm_backend_capture herdr "$target" 40 2>/dev/null) || capture=
   if fm_busy_codex_needs_input_prompt "$capture"; then
     printf 'blocked codex-pane-input'
+  elif [ "$lifecycle" = busy ]; then
+    printf 'busy codex-rollout'
   elif [ "$lifecycle" = idle ]; then
     printf 'idle codex-rollout'
   else

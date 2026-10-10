@@ -439,6 +439,70 @@ test_boolean_view_never_promotes_unknown() {
   pass "the boolean view reports busy only on an exact busy verdict"
 }
 
+test_codex_existing_rollout_binding_is_exact_and_ambiguous_is_unknown() {
+  local state workspace sessions day rollout
+  state=$(new_state_dir codex-existing-bind)
+  workspace="$TMP_ROOT/codex-existing-bind/workspace"
+  sessions="$TMP_ROOT/codex-existing-bind/codex/sessions"
+  day="$sessions/2026/10/10"
+  mkdir -p "$workspace" "$day"
+  cat > "$state/t1.meta" <<EOF
+worktree=$workspace
+EOF
+  rollout="$day/rollout-one.jsonl"
+  printf '{"type":"session_meta","payload":{"cwd":"%s"}}\n' "$workspace" > "$rollout"
+  CODEX_HOME="$TMP_ROOT/codex-existing-bind/codex" \
+    fm_busy_codex_bind_existing_rollout "$state" t1 \
+    || fail "a unique exact-worktree rollout should bind for an existing task"
+  [ "$(fm_busy_codex_rollout_log "$state" t1)" = "$rollout" ] \
+    || fail "existing task binding did not resolve its exact-worktree rollout"
+  [ "$(grep -c '^binding_id=' "$state/t1.codex-session")" -eq 1 ] \
+    || fail "existing rollout binding should be recorded once"
+
+  cat > "$state/t2.meta" <<EOF
+worktree=$workspace
+EOF
+  printf '{"type":"session_meta","payload":{"cwd":"%s"}}\n' "$workspace" > "$day/rollout-two.jsonl"
+  if CODEX_HOME="$TMP_ROOT/codex-existing-bind/codex" \
+    fm_busy_codex_bind_existing_rollout "$state" t2; then
+    fail "ambiguous existing-worktree rollouts must not be bound"
+  fi
+  [ ! -e "$state/t2.codex-session" ] || fail "ambiguous rollout binding wrote a sidecar"
+
+  ln -s "$workspace" "$TMP_ROOT/codex-existing-bind/workspace-link"
+  cat > "$state/t3.meta" <<EOF
+worktree=$TMP_ROOT/codex-existing-bind/workspace-link
+EOF
+  if CODEX_HOME="$TMP_ROOT/codex-existing-bind/codex" \
+    fm_busy_codex_bind_existing_rollout "$state" t3; then
+    fail "symlinked task worktrees must not be bound"
+  fi
+  [ ! -e "$state/t3.codex-session" ] || fail "symlinked task worktree wrote a sidecar"
+
+  ln -s "$rollout" "$state/t4.codex-session"
+  if CODEX_HOME="$TMP_ROOT/codex-existing-bind/codex" \
+    fm_busy_codex_bind_existing_rollout "$state" t4; then
+    fail "symlinked binding paths must not be replaced or followed"
+  fi
+  pass "existing Codex tasks bind one exact-worktree rollout and refuse symlinked or ambiguous inputs"
+}
+
+test_codex_input_prompt_uses_prompt_widget_not_assistant_prose() {
+  local approval prose
+  approval='Would you like to run the following command?
+› 1. Yes, proceed (y)
+  2. Yes, and do not ask again
+  3. No, and tell Codex what to do differently (esc)
+Press enter to confirm or esc to cancel'
+  prose='The assistant said: Waiting for your input.'
+  fm_busy_codex_needs_input_prompt "$approval" \
+    || fail "Codex approval widget should identify a real needs-input prompt"
+  if fm_busy_codex_needs_input_prompt "$prose"; then
+    fail "ordinary assistant prose must not count as a needs-input prompt"
+  fi
+  pass "Codex needs-input detection requires the approval widget, not matching prose"
+}
+
 test_progress_is_generation_bound_and_not_semantic_state() {
   local state gen replacement before
   state=$(new_state_dir native-progress)
@@ -459,6 +523,8 @@ test_progress_is_generation_bound_and_not_semantic_state() {
 }
 
 test_progress_is_generation_bound_and_not_semantic_state
+test_codex_existing_rollout_binding_is_exact_and_ambiguous_is_unknown
+test_codex_input_prompt_uses_prompt_widget_not_assistant_prose
 
 test_arm_seeds_busy_spawn
 test_apply_advances_seq_and_source

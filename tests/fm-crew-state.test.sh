@@ -225,7 +225,11 @@ test_codex_herdr_needs_input_prompt_is_blocked() {
   dir=$(new_codex_case codex-input codex-input)
   write_codex_rollout "$dir" codex-input \
     '{"type":"event_msg","payload":{"type":"task_started","turn_id":"turn-1"}}\n{"type":"event_msg","payload":{"type":"task_complete","turn_id":"turn-1"}}'
-  out=$(run_codex_state "$dir" codex-input 'Waiting for your input')
+  out=$(run_codex_state "$dir" codex-input 'Would you like to run the following command?
+› 1. Yes, proceed (y)
+  2. Yes, and do not ask again
+  3. No, and tell Codex what to do differently (esc)
+Press enter to confirm or esc to cancel')
   assert_contains "$out" 'state: blocked' 'a visible Codex input prompt is needs-input state'
   assert_contains "$out" 'harness needs input (codex-pane-input)' 'blocked state identifies its pane source'
   pass 'Codex pane capture reports a needs-input prompt as blocked'

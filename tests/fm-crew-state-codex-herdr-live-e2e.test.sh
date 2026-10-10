@@ -2,8 +2,8 @@
 # Prompt-submitting live guard for Codex current-state classification on Herdr.
 #
 # This opt-in test launches the installed Codex in an isolated named Herdr lab
-# session, checks an idle prompt and a normal turn, waits through a long shell
-# command, then checks a final response explicitly asking for input.
+# session, checks on-read binding for an existing worker, normal turns, a long
+# shell command, an actual approval prompt, and ordinary prose that mentions input.
 # It spends model tokens and never targets the default Herdr session.
 set -u
 
@@ -22,7 +22,7 @@ HERDR_LAB_SESSION=$("$HERDR_LAB_HELPER" name fm-52-codex-state-live)
 SCRATCH="$ROOT/.fm-codex-herdr-live-$$"
 SHIM="$SCRATCH/fakebin"
 STATE="$SCRATCH/state"
-mkdir -p "$SHIM" "$STATE"
+mkdir -p "$SHIM" "$STATE" "$SCRATCH/workspace"
 cleanup() {
   local status=$?
   "$HERDR_LAB_HELPER" teardown "$HERDR_LAB_SESSION" || status=1
@@ -38,7 +38,7 @@ CODEX_VERSION=$(codex --version 2>/dev/null | head -1)
 note "$CODEX_VERSION on Herdr $HERDR_VERSION"
 
 WORKSPACE=$("$HERDR_LAB_HELPER" run "$HERDR_LAB_SESSION" workspace create \
-  --label fm-codex-state --cwd "$ROOT") || fail "could not create lab workspace"
+  --label fm-codex-state --cwd "$SCRATCH/workspace") || fail "could not create lab workspace"
 PANE=$(printf '%s' "$WORKSPACE" | jq -r '.result.root_pane.pane_id // empty')
 [ -n "$PANE" ] || fail "workspace create returned no root pane"
 TARGET="$HERDR_LAB_SESSION:$PANE"
@@ -62,7 +62,7 @@ chmod +x "$SHIM/herdr"
 
 cat > "$STATE/codex.meta" <<EOF
 window=$TARGET
-worktree=$ROOT
+worktree=$SCRATCH/workspace
 kind=ship
 harness=codex
 backend=herdr
@@ -72,21 +72,8 @@ EOF
 
 CODEX_HOME_ROOT=${CODEX_HOME:-$HOME/.codex}
 CODEX_HOME_ROOT=$(cd "$CODEX_HOME_ROOT" && pwd -P) || fail "Codex home is not readable"
-CODEX_SESSIONS_ROOT="$CODEX_HOME_ROOT/sessions"
-# shellcheck source=/dev/null
-. "$ROOT/bin/fm-busy-lib.sh"
-{
-  printf 'sessions_root=%s\n' "$CODEX_SESSIONS_ROOT"
-  printf 'workspace_root=%s\n' "$ROOT"
-  printf 'binding_id=live.$$.%s\n' "$(date +%s)"
-  while IFS= read -r prior; do
-    [ -n "$prior" ] && printf 'prior_rollout=%s\n' "$prior"
-  done <<EOF
-$(fm_busy_codex_matching_rollouts "$CODEX_SESSIONS_ROOT" "$ROOT" || true)
-EOF
-} > "$STATE/codex.codex-session"
-
 "$HERDR_LAB_HELPER" run "$HERDR_LAB_SESSION" pane run "$PANE" codex --no-alt-screen \
+  --sandbox read-only --ask-for-approval on-request \
   || fail "could not launch Codex in the lab pane"
 
 pane_capture() {
@@ -102,7 +89,7 @@ wait_for_composer() {
       # Escape selects no update and spends no input on the dialog.
       "$HERDR_LAB_HELPER" run "$HERDR_LAB_SESSION" pane send-keys "$PANE" Escape
       dismissed=1
-      sleep 1
+      sleep 2
     else
       verdict=$(PATH="$SHIM:$PATH" CODEX_HOME="$CODEX_HOME_ROOT" \
         FM_ROOT_OVERRIDE="$ROOT" FM_HOME="$SCRATCH" FM_STATE_OVERRIDE="$STATE" \
@@ -137,13 +124,32 @@ wait_state() {  # <state> <seconds>
   fail "Codex did not reach state $wanted (last: ${got:-none}; foreground: ${process_info:-unknown}; pane: ${pane_text:-unreadable})"
 }
 send_turn() {  # <prompt>
+  local pane_text
   "$HERDR_LAB_HELPER" run "$HERDR_LAB_SESSION" pane send-text "$PANE" "$1"
-  "$HERDR_LAB_HELPER" run "$HERDR_LAB_SESSION" pane send-keys "$PANE" Enter
+  PATH="$SHIM:$PATH" CODEX_HOME="$CODEX_HOME_ROOT" FM_ROOT_OVERRIDE="$ROOT" \
+    FM_HOME="$SCRATCH" FM_STATE_OVERRIDE="$STATE" bash -c '
+      . "$1/bin/fm-tmux-lib.sh"
+      . "$1/bin/fm-backend.sh"
+      . "$1/bin/fm-composer-lib.sh"
+      fm_backend_source herdr
+      fm_backend_submit_exact_pending herdr "$2" "$3" 3 1
+    ' _ "$ROOT" "$TARGET" "$1" \
+    || {
+      pane_text=$(pane_capture 2>/dev/null | tail -16 | tr '\n' ' ')
+      fail "Codex did not submit the exact prompt through its composer (pane: ${pane_text:-unreadable})"
+    }
 }
 
 wait_for_composer
-send_turn 'Reply with exactly READY and make no changes.'
+if [ -e "$STATE/codex.codex-session" ]; then
+  fail "the live guard must start without a prewritten Codex rollout binding"
+fi
+send_turn 'Use the shell to run sleep 8, then reply with exactly READY and make no changes.'
 wait_state working 60
+if [ ! -s "$STATE/codex.codex-session" ]; then
+  fail "reading a pre-existing live Codex worker did not write its rollout binding"
+fi
+pass "real $CODEX_VERSION worker spawned without a binding is discovered on read"
 WORKING=$(state_line)
 case "$WORKING" in
   *"state: working"*"codex-rollout"*) pass "real $CODEX_VERSION reports a started Codex turn as working" ;;
@@ -175,9 +181,17 @@ esac
 wait_state idle 90
 
 send_turn 'Ask me to choose between A and B, then end your final answer with the exact words: Waiting for your input.'
+wait_state idle 90
+PROSE=$(state_line)
+case "$PROSE" in
+  *"state: idle"*"codex-rollout"*) pass "ordinary assistant prose mentioning input remains idle" ;;
+  *) fail "ordinary assistant prose was mistaken for a pending input prompt: $PROSE" ;;
+esac
+
+send_turn 'Use the shell tool to create a file named approval-probe in the current workspace. Wait without choosing an approval option.'
 wait_state blocked 90
 NEEDS_INPUT=$(state_line)
 case "$NEEDS_INPUT" in
-  *"state: blocked"*"codex-pane-input"*) pass "real $CODEX_VERSION pane capture marks a needs-input prompt as blocked" ;;
+  *"state: blocked"*"codex-pane-input"*) pass "real $CODEX_VERSION approval widget marks a needs-input prompt as blocked" ;;
   *) fail "real $CODEX_VERSION needs-input prompt did not classify as blocked: $NEEDS_INPUT" ;;
 esac
