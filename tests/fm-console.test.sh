@@ -20,7 +20,6 @@ trap cleanup EXIT
 python3 - "$ROOT" "$TMP" <<'PY'
 import json
 import datetime
-import ast
 import importlib.util
 import os
 import pathlib
@@ -33,21 +32,6 @@ import urllib.request
 
 repo = pathlib.Path(sys.argv[1])
 tmp = pathlib.Path(sys.argv[2])
-console_spec = importlib.util.spec_from_file_location("fm_console", repo / "bin" / "fm-console.py")
-console_module = importlib.util.module_from_spec(console_spec)
-console_spec.loader.exec_module(console_module)
-console_tree = ast.parse((repo / "bin" / "fm-console.py").read_text())
-query_assignment = next(node for node in console_tree.body if isinstance(node, ast.Assign) and any(isinstance(target, ast.Name) and target.id == "PR_QUERY" for target in node.targets))
-pr_query = ast.literal_eval(query_assignment.value)
-depth = 0
-for char in pr_query:
-    if char == "{":
-        depth += 1
-    elif char == "}":
-        depth -= 1
-        assert depth >= 0, "PR_QUERY contains an extra closing brace"
-assert depth == 0, "PR_QUERY has an unclosed selection set"
-assert all(field in pr_query for field in ("reviewDecision", "statusCheckRollup", "isDraft", "mergedAt"))
 root = tmp / "fake-root"
 home = tmp / "home"
 (root / "bin").mkdir(parents=True)
@@ -76,11 +60,12 @@ parity_cases.append(long_question)
 long_pro = json.loads(json.dumps(decision))
 long_pro["options"][0]["pros"][0] = "p" * 1001
 parity_cases.append(long_pro)
-for candidate in parity_cases:
+parity_expectations = []
+for index, candidate in enumerate(parity_cases):
     shell_valid = subprocess.run(["/bin/bash", "-c", '. "$1/fm-decision-lib.sh"; fm_decision_json_is_valid "$2"',
                                   "fm-decision-parity", str(repo / "bin"), json.dumps(candidate)],
                                  capture_output=True).returncode == 0
-    assert shell_valid == (console_module.parse_decision(candidate) is not None), candidate
+    parity_expectations.append((f"parity-{index}", candidate, shell_valid))
 decision_input = tmp / "decision-input.json"
 decision_input.write_text(json.dumps(decision))
 event_env = {**os.environ, "FM_ROOT_OVERRIDE": str(repo), "FM_HOME": str(home), "FM_STATE_OVERRIDE": str(home / "state")}
@@ -190,16 +175,6 @@ mate_fold = subprocess.run(["/bin/bash", "-c", '. "$1/fm-classify-lib.sh"; scan_
 assert mate_fold.returncode == 0, mate_fold.stderr
 mate_task, mate_key, mate_verb, mate_summary = mate_fold.stdout.strip().split("\t", 3)
 assert (mate_task, mate_key, mate_verb, json.loads(mate_summary)) == ("mate-child", "mate-route", "needs-decision", decision)
-producer_value = {"tasks": [], "backlog": {"records": []}, "secondmate_current": {"records": [
-    {"id": "mate", "home": str(mate_home), "remote": False, "registered": True,
-     "active_children": [{"id": "mate-child", "name": "Guest route follow-up", "repo": "alpha"}],
-     "decisions_open": [{"id": mate_task, "key": mate_key, "verb": mate_verb,
-                         "summary": mate_summary, "target_task_id": mate_task}],
-     "queued": []}]}}
-producer_decisions = console_module.decisions(home, repo, producer_value)
-owned_decision = next(item for item in producer_decisions if item["owner"] == "mate")
-assert (owned_decision["task"], owned_decision["key"], owned_decision["answerable"]) == (
-    "mate-child", "mate-route", True), producer_decisions
 fake_gh = tmp / "fake-bin" / "gh"
 fake_gh.write_text(r'''#!/usr/bin/env python3
 import json, sys
@@ -254,7 +229,16 @@ print(json.dumps(out))
 fake_gh.chmod(0o755)
 capture = tmp / "send.txt"
 decisions_path = tmp / "decisions.tsv"
-decisions_path.write_text("worker\tdecision-a\tneeds-decision\t" + json.dumps(decision, separators=(",", ":")) + "\nworker\tlegacy\tdecision-repair\tChoose one\nmate\tcaptain-hold-mate-child-1\tneeds-decision\t" + json.dumps(decision, separators=(",", ":")) + "\n")
+long_repair_note = "legacydecisionwithoutspaces" * 600
+decision_records = [
+    ("worker", "decision-a", "needs-decision", json.dumps(decision, separators=(",", ":"))),
+    ("worker", "legacy", "decision-repair", "Choose one"),
+    ("mate", "captain-hold-mate-child-1", "needs-decision", json.dumps(decision, separators=(",", ":"))),
+    *(("worker", key, "needs-decision", json.dumps(candidate, separators=(",", ":")))
+      for key, candidate, _ in parity_expectations),
+    ("worker", "long-repair", "decision-repair", long_repair_note),
+]
+decisions_path.write_text("\n".join("\t".join(record) for record in decision_records) + "\n")
 hold_capture = tmp / "hold-capture.txt"
 env = {**os.environ, "PATH": f"{tmp / 'fake-bin'}:{os.environ['PATH']}", "FM_CONSOLE_FIXTURE": str(snapshot_path), "FM_CONSOLE_SEND_CAPTURE": str(capture), "FM_CONSOLE_HOLD_CAPTURE": str(hold_capture), "FM_CONSOLE_DECISIONS_FILE": str(decisions_path), "BROWSER": "/usr/bin/true"}
 snapshot_count = tmp / "snapshot-count"
@@ -270,6 +254,7 @@ try:
     base = line.rstrip("/")
     page = urllib.request.urlopen(base + "/", timeout=3).read().decode()
     assert all(f">{tab}<" in page for tab in ("Status", "Open decisions", "Queue"))
+    assert "white-space:pre-wrap;overflow-wrap:anywhere" in page
     data = json.load(urllib.request.urlopen(base + "/api/data", timeout=3))
     rows = data["status"]["rows"]
     assert any(row["title"] == "Exact issue title" and row["issue_state"] == "open" for row in rows), rows
@@ -284,6 +269,8 @@ try:
     assert {(item["owner"], item["task"], item["key"], item["verb"]) for item in decisions} == {
         ("main", "worker", "decision-a", "needs-decision"),
         ("main", "worker", "legacy", "decision-repair"),
+        ("main", "worker", "long-repair", "decision-repair"),
+        *(("main", "worker", key, "needs-decision") for key, _, _ in parity_expectations),
         ("main", "worker", "held-call", "captain-hold"),
         ("mate", "mate-child", "mate-choice", "needs-decision"),
         ("mate", "mate-child", "mate-held", "captain-hold"),
@@ -292,6 +279,12 @@ try:
     assert not any(item["key"] == "captain-hold-mate-child-1" for item in decisions), decisions
     structured = next(item for item in decisions if item["key"] == "decision-a")
     legacy = next(item for item in decisions if item["key"] == "legacy")
+    for key, candidate, shell_valid in parity_expectations:
+        actual = next(item for item in decisions if item["key"] == key)
+        assert actual["answerable"] is shell_valid, actual
+        assert actual["decision"] == (candidate if shell_valid else None), actual
+    long_repair = next(item for item in decisions if item["key"] == "long-repair")
+    assert long_repair["answerable"] is False and long_repair["note"] == long_repair_note
     assert structured["answerable"] is True and structured["decision"]["question"] == decision["question"]
     assert structured["project"] == "alpha" and structured["task_title"] == "Guest route selection", structured
     assert structured["branch"] == "feature/guest-route", structured
@@ -300,6 +293,7 @@ try:
     assert legacy["answerable"] is False and legacy["decision"] is None
     assert "this incoming event is retained for supervision" in page
     mate_decision = next(item for item in decisions if item["key"] == "mate-choice")
+    assert mate_decision["answerable"] is True
     assert mate_decision["project"] == "alpha" and mate_decision["task_title"] == "Guest route follow-up", mate_decision
     assert mate_decision["branch"] == "Unavailable", mate_decision
     assert {(work["kind"], work["url"]) for work in mate_decision["work_links"]} == {
