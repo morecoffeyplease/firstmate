@@ -729,24 +729,18 @@ test_ship_brief_teaches_review_escalation_and_lane_checks() {
   mkdir -p "$home/data"
   FM_HOME="$home" "$ROOT/bin/fm-brief.sh" brief-review-escalation firstmate --mode direct-PR >/dev/null 2>&1
   brief="$home/data/brief-review-escalation/brief.md"
-  assert_grep "second failed blocking-review round" "$brief" \
-    "ship brief did not trigger diagnosis after the second failed review round"
-  assert_grep "same failure is reported twice" "$brief" \
-    "ship brief did not trigger diagnosis for a repeated failure"
-  assert_grep "cheapest observation that would distinguish them" "$brief" \
-    "ship brief did not require a discriminating observation before another fix"
-  assert_grep "more than 2x the lane size target" "$brief" \
-    "ship brief did not require the proportionate-scope check"
-  assert_grep "recommend parking and shrinking it" "$brief" \
-    "ship brief did not recommend parking and shrinking oversized changes"
-  assert_grep "Do not make another fix before completing this pass" "$brief" \
-    "ship brief did not stop fixes until differential diagnosis is complete"
-  assert_grep "larger-model shape review at round 3" "$brief" \
-    "ship brief did not defer shape review until round 3"
+  assert_grep "shared review-round rules in the project" "$brief" \
+    "ship brief did not point workers to the shared review-round policy"
+  assert_grep 'AGENTS.md` under **Review rounds**' "$brief" \
+    "ship brief did not name the shared review-round section"
+  assert_grep "name competing explanations, test them with the cheapest discriminating observation, and check proportionality" "$brief" \
+    "ship brief did not retain the inline differential-diagnosis method"
   assert_grep "/suspicious skill" "$brief" \
     "ship brief did not point to the suspicious skill"
-  assert_grep "must-not-trigger cases" "$brief" \
-    "ship brief did not require cross-cutting plans to include must-not-trigger cases"
+  assert_no_grep "larger-model shape review at round 3" "$brief" \
+    "ship brief duplicated the shared shape-review escalation rule"
+  assert_no_grep "must-not-trigger cases" "$brief" \
+    "ship brief duplicated the shared cross-cutting plan rule"
   assert_grep "compare screenshots against main on the same fixture" "$brief" \
     "ship brief did not require the UI screenshot self-check"
   assert_grep "rerun the shared test helpers" "$brief" \

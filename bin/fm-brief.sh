@@ -495,13 +495,9 @@ $ASK_USER_BLOCK
 $INBOX_SECTION
 
 # Review rounds
-After this lane's second failed blocking-review round, or when the same failure is reported twice, pause fixes and run a differential-diagnosis pass with a mid-size model: name competing explanations (including a wrong test or spec, reviewer error, environment fault, or a real defect being patched around), then test them with the cheapest observation that would distinguish them.
-The pass must also ask whether the change remains proportionate to the user problem; if it is more than 2x the lane size target, recommend parking and shrinking it instead of another repair round.
-Do not make another fix before completing this pass.
-If its observation resolves the cause, act on that evidence; only if the cause remains unresolved, escalate to a larger-model shape review at round 3 before another fix.
-When available, load the /suspicious skill for its method; this inline procedure is complete without that skill.
-Before coding on a cross-cutting lane, write a short plan with the approach, a case table that includes must-not-trigger cases, and out-of-scope items, then have a mid-size model review it.
-Before sending a UI lane for review, compare screenshots against main on the same fixture and rerun the shared test helpers.
+Follow the shared review-round rules in the project \`AGENTS.md\` under **Review rounds**.
+After the second failed review round or a repeated failure, before another fix run the inline differential diagnosis with a mid-size model: name competing explanations, test them with the cheapest discriminating observation, and check proportionality; load the /suspicious skill when available.
+Before UI review, compare screenshots against main on the same fixture and rerun the shared test helpers.
 
 # Project memory
 If \`AGENTS.md\` or \`CLAUDE.md\` already exists, or if this task produced durable project-intrinsic knowledge, run \`$FM_ROOT/bin/fm-ensure-agents-md.sh .\` in the worktree.
