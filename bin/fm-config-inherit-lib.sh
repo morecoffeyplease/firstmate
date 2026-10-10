@@ -20,6 +20,9 @@
 # Primary config/claude-permission-mode is a captain-wide safety preference
 # (bypass or auto for every claude launch), so it flows down too and a
 # secondmate's own claude crewmates launch on the same permission posture.
+# config/project-rules-qualified records which tool, version and backend pairs
+# passed the project-rules live guard on this machine, so a secondmate's own
+# crews are admitted on the primary's qualification (docs/project-rules.md).
 # config/project-memory points secondmate crews at the primary's same existing
 # project memory folders, without copying or moving those folders.
 # It also pushes

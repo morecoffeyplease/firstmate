@@ -15,6 +15,12 @@ The tracked code root contains the shared instruction, skill, documentation, wor
 `config/` holds local gitignored operating choices, including explicit extension bindings under `config/extensions.d/`, and `projects/` holds the local project clones that Firstmate reads but changes only through the narrow guarded and concrete captain-approved exceptions in `AGENTS.md`.
 Untracked files and directories whose names begin with `scratchpad` are also gitignored, so temporary scratch does not make porcelain-based secondmate sync guards treat a home as dirty.
 
+## Project rules qualification (config/project-rules-qualified)
+
+A project that declares its rules in `.agents/project-rules.json` has them delivered to every Claude and Codex worker and verified.
+[`docs/project-rules.md`](project-rules.md) owns the declared list, the launch refusals, the alarms, and this file's format.
+The live guard writes the file; it is inherited by secondmate homes and is never edited by hand.
+
 ## Worker stuck board (config/stuck-board)
 
 The watcher checks ship and scout lanes for deterministic stuck signals and wakes the home that owns each lane.
