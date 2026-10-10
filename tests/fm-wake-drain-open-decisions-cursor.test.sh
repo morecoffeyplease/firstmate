@@ -297,7 +297,7 @@ test_pre_fix_cursor_refolds_corr_tagged_decision() {
 
   FM_STATE_OVERRIDE="$state" FM_OPEN_DECISIONS_READ_PROBE="$probe" "$DRAIN" > "$out" \
     || fail "drain failed while migrating the pre-fix corr-tag cursor"
-  grep -F 'task7 [key=loan-installment-cadence-amount] needs-decision: pick the cadence' "$out" >/dev/null \
+  grep -F 'task7 [key=loan-installment-cadence-amount] decision-repair: pick the cadence' "$out" >/dev/null \
     || fail "the pre-fix cursor hid the corr-tagged decision after migration: $(cat "$out")"
   probe_bytes=$(last_probe_bytes "$probe" "$status")
   [ "$probe_bytes" = "$status_bytes" ] \
@@ -338,7 +338,7 @@ test_previous_fold_cache_is_refolded_under_current_semantics() {
   appended_bytes=$(printf 'needs-decision [key=current]: choose the current path\n' | tee -a "$status" | LC_ALL=C wc -c | tr -d '[:space:]')
   FM_STATE_OVERRIDE="$state" FM_OPEN_DECISIONS_READ_PROBE="$probe" "$DRAIN" > "$out" \
     || fail "same-version incremental drain failed after cache migration"
-  grep -F 'task6 [key=current] needs-decision: choose the current path' "$out" >/dev/null \
+  grep -F 'task6 [key=current] decision-repair: choose the current path' "$out" >/dev/null \
     || fail "the same-version append did not fold into the migrated open set"
   probe_bytes=$(last_probe_bytes "$probe" "$status")
   [ "$probe_bytes" = "$appended_bytes" ] \
@@ -385,7 +385,7 @@ test_terminal_supersession_reaches_cached_drains() {
       printf 'blocked [key=access]: reopened\nneeds-decision [key=new]: a new decision\nnote: more cleanup\n' >> "$status"
       FM_STATE_OVERRIDE="$state" "$DRAIN" > "$out" 2> "$dir/drain.err" || fail "reopened drain failed"
       assert_contains "$(cat "$out")" 'task [key=access] blocked: reopened' "post-terminal reopening must surface"
-      assert_contains "$(cat "$out")" 'task [key=new] needs-decision: a new decision' "post-terminal new key must surface"
+      assert_contains "$(cat "$out")" 'task [key=new] decision-repair: a new decision' "post-terminal new key must surface as a repair diagnostic"
       printf 'resolved [key=access]: answered\nresolved [key=new]: answered\nnote: final cleanup\n' >> "$status"
       FM_STATE_OVERRIDE="$state" "$DRAIN" > "$out" 2> "$dir/drain.err" || fail "resolved drain failed"
       assert_not_contains "$(cat "$out")" 'OPEN DECISIONS' "matching resolutions must close reopened decisions"

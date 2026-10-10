@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Start the local Firstmate operator console.
 #
-# Usage: fm-console.sh [--home <firstmate-home>] [--port <port>]
+# Usage: fm-console.sh [--home <firstmate-home>] [--port <port>] [--sample-data]
 set -eu
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 FM_ROOT="${FM_ROOT_OVERRIDE:-$(cd "$SCRIPT_DIR/.." && pwd)}"

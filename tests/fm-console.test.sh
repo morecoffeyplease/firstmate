@@ -2,13 +2,25 @@
 # End-to-end tests for the local operator console tabs and answer delivery.
 set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-TMP="$(mktemp -d)"
-trap 'rm -rf -- "$TMP"' EXIT
+if [[ "${FM_CONSOLE_KEEP_TEST_FIXTURE:-}" == "1" ]]; then
+  TMP="$ROOT/.tmp-fm-console-fixture-$$"
+  mkdir -p "$TMP"
+else
+  TMP="$(mktemp -d)"
+fi
+cleanup() {
+  if [[ "${FM_CONSOLE_KEEP_TEST_FIXTURE:-}" == "1" ]]; then
+    printf 'FM_CONSOLE_FIXTURE_DIR=%s\n' "$TMP"
+  else
+    rm -rf -- "$TMP"
+  fi
+}
+trap cleanup EXIT
 
 python3 - "$ROOT" "$TMP" <<'PY'
 import json
 import datetime
-import ast
+import importlib.util
 import os
 import pathlib
 import re
@@ -20,53 +32,116 @@ import urllib.request
 
 repo = pathlib.Path(sys.argv[1])
 tmp = pathlib.Path(sys.argv[2])
-console_tree = ast.parse((repo / "bin" / "fm-console.py").read_text())
-query_assignment = next(node for node in console_tree.body if isinstance(node, ast.Assign) and any(isinstance(target, ast.Name) and target.id == "PR_QUERY" for target in node.targets))
-pr_query = ast.literal_eval(query_assignment.value)
-depth = 0
-for char in pr_query:
-    if char == "{":
-        depth += 1
-    elif char == "}":
-        depth -= 1
-        assert depth >= 0, "PR_QUERY contains an extra closing brace"
-assert depth == 0, "PR_QUERY has an unclosed selection set"
-assert all(field in pr_query for field in ("reviewDecision", "statusCheckRollup", "isDraft", "mergedAt"))
 root = tmp / "fake-root"
 home = tmp / "home"
 (root / "bin").mkdir(parents=True)
 (home / "data").mkdir(parents=True)
 (home / "state").mkdir()
+(home / "bin").mkdir()
+(home / "AGENTS.md").write_text("# Firstmate test home\n")
 (home / "projects" / "alpha").mkdir(parents=True)
 (tmp / "fake-bin").mkdir()
 (home / "data" / "projects.md").write_text("- alpha - Example project\n")
 subprocess.run(["git", "init", "-q", str(home / "projects" / "alpha")], check=True)
 subprocess.run(["git", "-C", str(home / "projects" / "alpha"), "config", "remote.origin.url", "git@github.com:example/alpha.git"], check=True)
+subprocess.run(["git", "-C", str(home / "projects" / "alpha"), "checkout", "-qb", "feature/guest-route"], check=True)
 issue_url = "https://github.com/example/alpha/issues/7"
 pr_url = "https://github.com/example/alpha/pull/8"
+decision = {"schema": "fm-captain-decision.v1", "question": "Which route should guests use?",
+            "context": "Guests need a route that works on older phones.", "user_impact": "This determines whether guests can join without extra setup.",
+            "options": [{"label": "A", "title": "Keep the current route", "pros": ["Works with existing links."], "cons": ["Older phones may load slowly."]},
+                        {"label": "B", "title": "Use the lighter route", "pros": ["Loads faster for guests."], "cons": ["Needs a short migration."]}],
+            "recommended_option": "B", "recommendation": "Choose B because faster loading helps more guests join."}
+decision_line = "Captain decision record v1: " + json.dumps(decision, separators=(",", ":"), sort_keys=True)
+parity_cases = [decision]
+long_question = json.loads(json.dumps(decision))
+long_question["question"] = "q" * 1201
+parity_cases.append(long_question)
+long_pro = json.loads(json.dumps(decision))
+long_pro["options"][0]["pros"][0] = "p" * 1001
+parity_cases.append(long_pro)
+parity_expectations = []
+for index, candidate in enumerate(parity_cases):
+    shell_valid = subprocess.run(["/bin/bash", "-c", '. "$1/fm-decision-lib.sh"; fm_decision_json_is_valid "$2"',
+                                  "fm-decision-parity", str(repo / "bin"), json.dumps(candidate)],
+                                 capture_output=True).returncode == 0
+    parity_expectations.append((f"parity-{index}", candidate, shell_valid))
+decision_input = tmp / "decision-input.json"
+decision_input.write_text(json.dumps(decision))
+event_env = {**os.environ, "FM_ROOT_OVERRIDE": str(repo), "FM_HOME": str(home), "FM_STATE_OVERRIDE": str(home / "state")}
+event = subprocess.run([str(repo / "bin" / "fm-captain-hold.sh"), "decision-event", "worker", "--key", "route", "--input-file", str(decision_input)], env=event_env, capture_output=True, text=True)
+assert event.returncode == 0, event.stderr
+event_line = (home / "state" / "worker.status").read_text().strip()
+assert event_line.startswith("needs-decision [key=route]: ") and json.loads(event_line.split(": ", 1)[1]) == decision
+fold = subprocess.run(["/bin/bash", "-c", '. "$1/fm-classify-lib.sh"; scan_open_decisions "$2"',
+                       "fm-decision-consumer", str(repo / "bin"), str(home / "state")],
+                      capture_output=True, text=True)
+assert fold.returncode == 0 and fold.stdout.strip() == "worker\troute\tneeds-decision\t" + json.dumps(decision, separators=(",", ":"), sort_keys=True), fold.stderr
+with (home / "state" / "worker.status").open("a") as status_log:
+    status_log.write("needs-decision [key=malformed]: Pick one\n")
+fold = subprocess.run(["/bin/bash", "-c", '. "$1/fm-classify-lib.sh"; scan_open_decisions "$2"',
+                       "fm-decision-consumer", str(repo / "bin"), str(home / "state")],
+                      capture_output=True, text=True)
+assert "worker\tmalformed\tdecision-repair\tPick one" in fold.stdout, fold.stdout
+invalid_input = tmp / "invalid-decision.json"
+invalid_input.write_text(json.dumps({"schema": "fm-captain-decision.v1", "question": "Pick one"}))
+refused = subprocess.run([str(repo / "bin" / "fm-captain-hold.sh"), "decision-event", "worker", "--key", "invalid", "--input-file", str(invalid_input)], env=event_env, capture_output=True, text=True)
+assert refused.returncode != 0 and not (home / "state" / "worker.status").read_text().endswith("\nneeds-decision [key=invalid]:"), refused.stderr
+for field, update in (("question", "   "), ("context", " \t "), ("user_impact", "  "),
+                      ("option-title", "   "), ("pro", "  "), ("con", " \t "), ("recommendation", "  ")):
+    invalid = json.loads(json.dumps(decision))
+    if field == "option-title":
+        invalid["options"][0]["title"] = update
+    elif field == "pro":
+        invalid["options"][0]["pros"][0] = update
+    elif field == "con":
+        invalid["options"][0]["cons"][0] = update
+    else:
+        invalid[field] = update
+    invalid_path = tmp / f"invalid-{field}.json"
+    invalid_path.write_text(json.dumps(invalid))
+    rejected = subprocess.run([str(repo / "bin" / "fm-captain-hold.sh"), "decision-event", "worker",
+                               "--key", f"blank-{field}", "--input-file", str(invalid_path)],
+                              env=event_env, capture_output=True, text=True)
+    assert rejected.returncode != 0 and f"blank-{field}" not in (home / "state" / "worker.status").read_text(), (field, rejected.stderr)
+unanchored_env = {key: value for key, value in event_env.items() if key not in ("FM_HOME", "FM_STATE_OVERRIDE")}
+unanchored = subprocess.run([str(repo / "bin" / "fm-captain-hold.sh"), "decision-event", "worker",
+                             "--key", "unanchored", "--input-file", str(decision_input)],
+                            cwd=tmp, env=unanchored_env, capture_output=True, text=True)
+assert unanchored.returncode != 0 and "explicit FM_HOME" in unanchored.stderr, unanchored.stderr
 snapshot = {
     "schema": "fm-fleet-snapshot.v1",
     "generated": datetime.datetime.now(datetime.timezone.utc).isoformat(),
     "tasks": [
-        {"id": "worker", "issue": issue_url, "project": "alpha", "decision_keys": [], "endpoint": {"exists": True}, "backlog": {"repo": "alpha", "state": "in_flight", "links": [], "pr_url": pr_url}, "current_state": {"state": "working"}},
+        {"id": "worker", "issue": issue_url, "project": "alpha", "decision_keys": [], "endpoint": {"exists": True}, "paths": {"worktree": {"path": str(home / "projects" / "alpha"), "present": True}}, "backlog": {"repo": "alpha", "state": "in_flight", "links": [], "pr_url": pr_url}, "current_state": {"state": "working"}},
+        {"id": "unknown-worker", "project": "alpha", "backlog": {"repo": "alpha", "state": "queued"}, "current_state": {"state": "unknown"}},
         {"id": "unlinked", "project": "alpha", "backlog": {"repo": "alpha", "state": "in_flight"}, "current_state": {"state": "working"}},
+        {"id": "mate", "kind": "secondmate", "project": "alpha", "endpoint": {"exists": True}, "backlog": {"repo": "alpha", "state": "in_flight"}, "current_state": {"state": "working"}},
     ],
     "backlog": {"records": [
-        {"id": "next", "title": "Waiting task", "repo": "alpha", "state": "queued", "blocked_by_ids": ["worker"], "unresolved_blocker_ids": ["worker"]},
-        {"id": "held-call", "title": "Pick a route", "repo": "alpha", "state": "queued", "captain_actionable": True, "hold_reason": "Choose a route", "target_task_id": "worker"},
+        {"id": "worker", "title": "Guest route selection", "repo": "alpha", "state": "in_flight", "links": [issue_url], "pr_url": pr_url},
+        {"id": "next", "title": "Waiting task", "repo": "alpha", "state": "queued", "links": [issue_url], "blocked_by_ids": ["worker"], "unresolved_blocker_ids": ["worker"]},
+        {"id": "held-call", "title": "Pick a route", "repo": "alpha", "state": "queued", "captain_actionable": True, "hold_reason": "Choose a route", "target_task_id": "worker", "body_lines": [decision_line]},
+        {"id": "ready", "title": "Ready task", "repo": "alpha", "state": "queued", "links": [], "blocked_by_ids": [], "unresolved_blocker_ids": []},
+        {"id": "linked-shortcut", "title": "Complete issue #7", "repo": "alpha", "state": "queued", "links": [], "blocked_by_ids": [], "unresolved_blocker_ids": []},
+        {"id": "missing-reference", "title": "Imported task from #99", "repo": "alpha", "state": "queued", "links": [], "blocked_by_ids": [], "unresolved_blocker_ids": []},
+        {"id": "pr-reference", "title": "Carry from #8147 CodeRabbit Minor", "repo": "alpha", "state": "queued", "links": [], "blocked_by_ids": [], "unresolved_blocker_ids": []},
+        {"id": "unknown-worker", "title": "Queued prerequisite", "repo": "alpha", "state": "queued", "links": [], "blocked_by_ids": [], "unresolved_blocker_ids": []},
+        {"id": "waiting-on-queued", "title": "Wait for queued prerequisite", "repo": "alpha", "state": "queued", "links": [], "blocked_by_ids": ["unknown-worker"], "unresolved_blocker_ids": ["unknown-worker"]},
         {"id": "closed-pr", "title": "Closed pull request", "repo": "alpha", "state": "in_flight", "links": [issue_url], "pr_url": "https://github.com/example/alpha/pull/9"},
     ]},
     "main_inventory": {"valid": True, "reason": None},
     "secondmate_current": {"truncated": 0, "records": [
         {"id": "mate", "home": str(home / "projects" / "mate-home"), "remote": False, "registered": True,
          "current": {"state": "captain_decision", "reason": None}, "freshness": {"status": "fresh", "age_seconds": 0},
-         "active_children": [{"id": "mate-child", "state": "working", "repo": "alpha", "issue": issue_url, "pr_url": pr_url, "decision_keys": ["mate-held"]}],
+         "active_children": [{"id": "mate-child", "name": "Guest route follow-up", "state": "working", "repo": "alpha", "issue": issue_url, "pr_url": pr_url, "decision_keys": ["mate-held"]}],
          "decisions_open": [
-             {"id": "mate-child", "key": "mate-choice", "verb": "needs-decision", "summary": "Choose A", "target_task_id": "mate-child"},
-             {"id": "mate-held", "key": "mate-held", "verb": "captain-hold", "summary": "Choose B", "target_task_id": "mate-child"},
-             {"id": "mate-orphan-hold", "key": "mate-orphan-hold", "verb": "captain-hold", "summary": "Choose C"},
+             {"id": "mate-child", "key": "mate-choice", "verb": "needs-decision", "summary": json.dumps(decision), "target_task_id": "mate-child"},
+             {"id": "mate-held", "key": "mate-held", "verb": "captain-hold", "summary": json.dumps(decision), "target_task_id": "mate-child"},
+             {"id": "mate-orphan-hold", "key": "mate-orphan-hold", "verb": "captain-hold", "summary": json.dumps(decision)},
          ],
-         "queued": [{"id": "mate-next", "title": "Secondmate queued", "repo": "alpha", "blocked_by_ids": ["mate-child"], "unresolved_blocker_ids": ["mate-child"]}],
+         "queued": [{"id": "mate-next", "title": "Secondmate queued", "repo": "alpha", "blocked_by_ids": ["mate-child"], "unresolved_blocker_ids": ["mate-child"]},
+                    {"id": "mate-stale-dependency", "title": "Wait on pruned work", "repo": "alpha", "blocked_by_ids": ["finished-pruned"], "unresolved_blocker_ids": ["finished-pruned"]}],
          "omitted": []},
         {"id": "stale-mate", "registered": True, "current": {"state": "unknown", "reason": "structured home unavailable"},
          "freshness": {"status": "cached", "age_seconds": 100}, "omitted": [{"surface": "queued", "count": 2}]},
@@ -84,16 +159,50 @@ snapshot_path.write_text(json.dumps(snapshot))
 mate_home = home / "projects" / "mate-home"
 mate_home.mkdir(parents=True)
 (mate_home / "state").mkdir()
+(mate_home / "data").mkdir()
+(mate_home / "bin").mkdir()
+(mate_home / "AGENTS.md").write_text("# Firstmate test secondmate\n")
 (mate_home / ".fm-secondmate-home").write_text("mate\n")
+mate_event_env = {**os.environ, "FM_ROOT_OVERRIDE": str(repo), "FM_HOME": str(mate_home),
+                  "FM_STATE_OVERRIDE": str(mate_home / "state")}
+mate_event = subprocess.run([str(repo / "bin" / "fm-captain-hold.sh"), "decision-event", "mate-child",
+                             "--key", "mate-route", "--input-file", str(decision_input)],
+                            env=mate_event_env, capture_output=True, text=True)
+assert mate_event.returncode == 0, mate_event.stderr
+mate_fold = subprocess.run(["/bin/bash", "-c", '. "$1/fm-classify-lib.sh"; scan_open_decisions "$2"',
+                            "fm-secondmate-decision-consumer", str(repo / "bin"), str(mate_home / "state")],
+                           capture_output=True, text=True)
+assert mate_fold.returncode == 0, mate_fold.stderr
+mate_task, mate_key, mate_verb, mate_summary = mate_fold.stdout.strip().split("\t", 3)
+assert (mate_task, mate_key, mate_verb, json.loads(mate_summary)) == ("mate-child", "mate-route", "needs-decision", decision)
+snapshot["secondmate_current"]["records"][0]["decisions_open"].append({
+    "id": mate_task, "key": mate_key, "verb": mate_verb, "summary": mate_summary, "target_task_id": mate_task,
+})
+snapshot_path.write_text(json.dumps(snapshot))
 fake_gh = tmp / "fake-bin" / "gh"
 fake_gh.write_text(r'''#!/usr/bin/env python3
 import json, sys
 args = sys.argv[1:]
 path = next((arg for arg in args if arg.startswith("repos/")), "")
 if "/issues/7" in path:
-    out = {"number": 7, "title": "Exact issue title", "state": "open", "html_url": "https://github.com/example/alpha/issues/7"}
+    out = {"number": 7, "title": "Exact issue title", "state": "open", "html_url": "https://github.com/example/alpha/issues/7", "milestone": {"title": "Spring release"}}
 elif "graphql" in args:
     query = next(arg.split("=", 1)[1] for arg in args if arg.startswith("query="))
+    if "issue(number:" in query:
+        import re
+        if re.search(r'issue\(number:99\)', query):
+            sys.exit("issue 99 is unavailable")
+        if re.search(r'issue\(number:8147\)', query):
+            match = re.search(r'(issue\d+):repository', query)
+            print(json.dumps({"data": {match.group(1): {"issue": None}}}))
+            sys.exit(0)
+        match = re.search(r'(issue\d+):repository\(owner:"([^"]+)",name:"([^"]+)"\)\{issue\(number:(\d+)\)', query)
+        if not match:
+            sys.exit("invalid issue GraphQL query")
+        alias, owner, repo, number = match.groups()
+        out = {"data": {alias: {"issue": {"number": int(number), "url": f"https://github.com/{owner}/{repo}/issues/{number}", "title": "Exact issue title", "milestone": {"title": "Spring release"}}}}}
+        print(json.dumps(out))
+        sys.exit(0)
     depth = 0
     for char in query:
         if char == "{":
@@ -124,7 +233,16 @@ print(json.dumps(out))
 fake_gh.chmod(0o755)
 capture = tmp / "send.txt"
 decisions_path = tmp / "decisions.tsv"
-decisions_path.write_text("worker\tdecision-a\tneeds-decision\tShould we ship?\n")
+long_repair_note = "legacydecisionwithoutspaces" * 600
+decision_records = [
+    ("worker", "decision-a", "needs-decision", json.dumps(decision, separators=(",", ":"))),
+    ("worker", "legacy", "decision-repair", "Choose one"),
+    ("mate", "captain-hold-mate-child-1", "needs-decision", json.dumps(decision, separators=(",", ":"))),
+    *(("worker", key, "needs-decision", json.dumps(candidate, separators=(",", ":")))
+      for key, candidate, _ in parity_expectations),
+    ("worker", "long-repair", "decision-repair", long_repair_note),
+]
+decisions_path.write_text("\n".join("\t".join(record) for record in decision_records) + "\n")
 hold_capture = tmp / "hold-capture.txt"
 env = {**os.environ, "PATH": f"{tmp / 'fake-bin'}:{os.environ['PATH']}", "FM_CONSOLE_FIXTURE": str(snapshot_path), "FM_CONSOLE_SEND_CAPTURE": str(capture), "FM_CONSOLE_HOLD_CAPTURE": str(hold_capture), "FM_CONSOLE_DECISIONS_FILE": str(decisions_path), "BROWSER": "/usr/bin/true"}
 snapshot_count = tmp / "snapshot-count"
@@ -140,6 +258,7 @@ try:
     base = line.rstrip("/")
     page = urllib.request.urlopen(base + "/", timeout=3).read().decode()
     assert all(f">{tab}<" in page for tab in ("Status", "Open decisions", "Queue"))
+    assert "white-space:pre-wrap;overflow-wrap:anywhere" in page
     data = json.load(urllib.request.urlopen(base + "/api/data", timeout=3))
     rows = data["status"]["rows"]
     assert any(row["title"] == "Exact issue title" and row["issue_state"] == "open" for row in rows), rows
@@ -153,19 +272,67 @@ try:
     decisions = data["decisions"]
     assert {(item["owner"], item["task"], item["key"], item["verb"]) for item in decisions} == {
         ("main", "worker", "decision-a", "needs-decision"),
+        ("main", "worker", "legacy", "decision-repair"),
+        ("main", "worker", "long-repair", "decision-repair"),
+        *(("main", "worker", key, "needs-decision") for key, _, _ in parity_expectations),
         ("main", "worker", "held-call", "captain-hold"),
         ("mate", "mate-child", "mate-choice", "needs-decision"),
+        ("mate", "mate-child", "mate-route", "needs-decision"),
         ("mate", "mate-child", "mate-held", "captain-hold"),
         ("mate", None, "mate-orphan-hold", "captain-hold"),
     }, decisions
+    assert not any(item["key"] == "captain-hold-mate-child-1" for item in decisions), decisions
+    structured = next(item for item in decisions if item["key"] == "decision-a")
+    legacy = next(item for item in decisions if item["key"] == "legacy")
+    for key, candidate, shell_valid in parity_expectations:
+        actual = next(item for item in decisions if item["key"] == key)
+        assert actual["answerable"] is shell_valid, actual
+        assert actual["decision"] == (candidate if shell_valid else None), actual
+    long_repair = next(item for item in decisions if item["key"] == "long-repair")
+    assert long_repair["answerable"] is False and long_repair["note"] == long_repair_note
+    assert structured["answerable"] is True and structured["decision"]["question"] == decision["question"]
+    assert structured["project"] == "alpha" and structured["task_title"] == "Guest route selection", structured
+    assert structured["branch"] == "feature/guest-route", structured
+    assert {(work["kind"], work["url"]) for work in structured["work_links"]} == {
+        ("issue", issue_url), ("pull request", pr_url)}
+    assert legacy["answerable"] is False and legacy["decision"] is None
+    assert "this incoming event is retained for supervision" in page
+    mate_decision = next(item for item in decisions if item["key"] == "mate-choice")
+    assert mate_decision["answerable"] is True
+    assert mate_decision["project"] == "alpha" and mate_decision["task_title"] == "Guest route follow-up", mate_decision
+    assert mate_decision["branch"] == "Unavailable", mate_decision
+    assert {(work["kind"], work["url"]) for work in mate_decision["work_links"]} == {
+        ("issue", issue_url), ("pull request", pr_url)}
+    mate_route = next(item for item in decisions if item["key"] == "mate-route")
+    assert (mate_route["owner"], mate_route["task"], mate_route["key"], mate_route["answerable"]) == (
+        "mate", "mate-child", "mate-route", True)
+    assert mate_route["decision"] == decision, mate_route
     orphan_mate = next(item for item in decisions if item["key"] == "mate-orphan-hold")
     assert orphan_mate["answerable"] is True and orphan_mate["direct_hold"] is True
     queue = data["queue"]
-    assert next(row for row in queue if row["id"] == "next")["unresolved_blocker_ids"] == ["worker"]
+    next_row = next(row for row in queue if row["id"] == "next")
+    assert next_row["unresolved_blocker_ids"] == ["worker"]
+    assert next_row["start_reason"] == "Waiting for dependencies: worker (working)"
+    assert next(row for row in queue if row["id"] == "waiting-on-queued")["start_reason"] == "Waiting for dependencies: unknown-worker (queued)"
+    shortcut = next(row for row in queue if row["id"] == "linked-shortcut")
+    assert shortcut["issues"][0]["html_url"] == issue_url and shortcut["issues"][0]["title"] == "Exact issue title"
+    missing = next(row for row in queue if row["id"] == "missing-reference")
+    assert missing["issue_missing"] and missing["issues"] == [], missing
+    pr_reference = next(row for row in queue if row["id"] == "pr-reference")
+    assert pr_reference["issue_missing"] and pr_reference["issues"] == [], pr_reference
+    assert next_row["issues"][0]["title"] == "Exact issue title"
+    assert next_row["issues"][0]["title"] == "Exact issue title"
+    assert next_row["issues"][0]["milestone"]["title"] == "Spring release"
+    assert queue[0]["start_reason"] == "Ready to start now"
+    first_blocked = next(index for index, row in enumerate(queue) if row["start_reason"] != "Ready to start now")
+    assert all(row["start_reason"] == "Ready to start now" for row in queue[:first_blocked])
     assert any(row["id"] == "mate/mate-child" for row in queue)
     assert any(row["id"] == "mate/mate-next" and row["unresolved_blocker_ids"] == ["mate-child"] for row in queue)
-    assert next(row for row in queue if row["id"] == "next")["admission_state"] == "unknown"
-    assert "admission state " in page
+    assert next(row for row in queue if row["id"] == "mate/mate-next")["start_reason"] == "Waiting for dependencies: mate-child (working)"
+    assert next(row for row in queue if row["id"] == "mate/mate-stale-dependency")["start_reason"] == "Waiting for dependencies: finished-pruned (state unavailable)"
+    assert "admission state" not in page
+    assert "Home operations" in page
+    assert "Needs rewrite" in page
     assert data["status"]["generated_epoch"] == int(datetime.datetime.fromisoformat(snapshot["generated"]).timestamp()), (data["status"]["generated_epoch"], snapshot["generated"])
     assert snapshot_count.read_text() == "x", "one refresh should use one shared fleet snapshot"
     json.load(urllib.request.urlopen(base + "/api/data", timeout=3))
@@ -183,20 +350,30 @@ try:
     except urllib.error.HTTPError as exc:
         assert exc.code == 403
     match = re.search(r"const token=(\"[^\"]+\")", page)
-    assert match, "page token was not found"
+    assert match, f"page token was not found in {page[:500]!r}"
     request.add_header("X-FM-Token", json.loads(match.group(1)))
-    result = json.load(urllib.request.urlopen(request, timeout=3))
+    try:
+        result = json.load(urllib.request.urlopen(request, timeout=3))
+    except urllib.error.HTTPError as exc:
+        raise AssertionError(exc.read().decode()) from exc
     assert result["ok"] is True, result
     assert capture.read_text().strip() == f"{home.resolve()}\tworker --resolve-key decision-a -- --resolve-key is answer text"
-    assert len([line for line in gh_log.read_text().splitlines() if "graphql" in line]) == 2
+    graphql_calls = [line for line in gh_log.read_text().splitlines() if "graphql" in line]
+    assert len(graphql_calls) >= 3 and any("issue(number:99)" in line for line in graphql_calls), graphql_calls
     mate_body = json.dumps({"owner": "mate", "task": "mate-child", "key": "mate-choice", "answer": "Choose A"}).encode()
     mate_request = urllib.request.Request(base + "/api/answer", data=mate_body, method="POST", headers={"Content-Type": "application/json", "Origin": base, "X-FM-Token": json.loads(match.group(1))})
-    mate_result = json.load(urllib.request.urlopen(mate_request, timeout=3))
+    try:
+        mate_result = json.load(urllib.request.urlopen(mate_request, timeout=3))
+    except urllib.error.HTTPError as exc:
+        raise AssertionError("mate answer failed: " + exc.read().decode()) from exc
     assert mate_result["ok"] is True, mate_result
     assert f"{mate_home.resolve()}\tmate-child --resolve-key mate-choice -- Choose A" in capture.read_text()
     orphan_mate_body = json.dumps({"owner": "mate", "task": None, "key": "mate-orphan-hold", "answer": "Choose C"}).encode()
     orphan_mate_request = urllib.request.Request(base + "/api/answer", data=orphan_mate_body, method="POST", headers={"Content-Type": "application/json", "Origin": base, "X-FM-Token": json.loads(match.group(1))})
-    orphan_mate_result = json.load(urllib.request.urlopen(orphan_mate_request, timeout=3))
+    try:
+        orphan_mate_result = json.load(urllib.request.urlopen(orphan_mate_request, timeout=3))
+    except urllib.error.HTTPError as exc:
+        raise AssertionError("orphan mate answer failed: " + exc.read().decode()) from exc
     assert orphan_mate_result["ok"] is True, orphan_mate_result
     mate_hold = hold_capture.read_text()
     assert mate_hold.startswith(f"{mate_home.resolve()}\tanswer mate-orphan-hold --decision-file ") and mate_hold.endswith("\tChoose C"), mate_hold
@@ -207,6 +384,31 @@ try:
     except urllib.error.HTTPError as exc:
         assert json.load(exc)["ok"] is False
     assert len(capture.read_text().splitlines()) == 2
+    decisions_path.write_text("worker\tdecision-a\tneeds-decision\t" + json.dumps(decision, separators=(",", ":")) + "\n")
+    sample_proc = subprocess.Popen([sys.executable, str(repo / "bin" / "fm-console.py"), "--root", str(root),
+                                    "--home", str(home), "--port", "0", "--sample-data"],
+                                   stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, env=env)
+    try:
+        sample_base = sample_proc.stdout.readline().strip().rstrip("/")
+        assert sample_base.startswith("http://127.0.0.1:"), sample_base
+        sample_page = urllib.request.urlopen(sample_base + "/", timeout=3).read().decode()
+        assert "Sample data only. Nothing will be sent from this console." in sample_page
+        sample_data = json.load(urllib.request.urlopen(sample_base + "/api/data", timeout=3))
+        assert sample_data["sample_data"] is True
+        sample_token = json.loads(re.search(r"const token=(\"[^\"]+\")", sample_page).group(1))
+        sample_body = json.dumps({"owner": "main", "task": "worker", "key": "decision-a", "answer": "A"}).encode()
+        sample_request = urllib.request.Request(sample_base + "/api/answer", data=sample_body, method="POST",
+                                                headers={"Content-Type": "application/json", "Origin": sample_base,
+                                                         "X-FM-Token": sample_token})
+        try:
+            urllib.request.urlopen(sample_request, timeout=3)
+            raise AssertionError("sample-data console accepted an answer")
+        except urllib.error.HTTPError as exc:
+            assert exc.code == 409 and json.load(exc)["error"] == "Sample data only. Nothing was sent."
+        assert len(capture.read_text().splitlines()) == 2
+    finally:
+        sample_proc.terminate()
+        sample_proc.wait(timeout=5)
 finally:
     proc.terminate()
     proc.wait(timeout=5)
@@ -222,13 +424,24 @@ if command -v tasks-axi >/dev/null 2>&1; then
     --start --file data/backlog.md >/dev/null)
   printf 'window=firstmate:fm-worker\nworktree=%s/projects/worker\nproject=alpha\nharness=codex\nkind=scout\n' \
     "$real_home" > "$real_home/state/worker.meta"
-  printf 'needs-decision [key=route]: choose north or south\n' > "$real_home/state/worker.status"
   printf '# Worker report\n\nTwo routes remain open.\n' > "$real_home/data/worker/report.md"
+  cat > "$real_home/decision-input.json" <<'JSON'
+{"schema":"fm-captain-decision.v1","question":"Which route should the guests use?","context":"Guests need a route that works on older phones.","user_impact":"This affects how quickly guests can join.","options":[{"label":"A","title":"Keep the current route","pros":["Existing links keep working."],"cons":["Older phones may load slowly."]},{"label":"B","title":"Use the lighter route","pros":["More guests can join quickly."],"cons":["The update needs a short migration."]}],"recommended_option":"B","recommendation":"Choose B because faster loading helps more guests join."}
+JSON
+  printf 'needs-decision [key=route]: %s\n' "$(cat "$real_home/decision-input.json")" \
+    > "$real_home/state/worker.status"
+  if env FM_ROOT_OVERRIDE="$ROOT" FM_HOME="$real_home" \
+    FM_STATE_OVERRIDE="$real_home/state" FM_DATA_OVERRIDE="$real_home/data" \
+    FM_CONFIG_OVERRIDE="$real_home/config" "$ROOT/bin/fm-captain-hold.sh" hold missing-decision \
+      --title 'Missing decision' --reason 'missing decision' >/dev/null 2>&1; then
+    printf '%s\n' 'not ok - active captain hold accepted a missing structured decision' >&2
+    exit 1
+  fi
   env FM_ROOT_OVERRIDE="$ROOT" FM_HOME="$real_home" \
     FM_STATE_OVERRIDE="$real_home/state" FM_DATA_OVERRIDE="$real_home/data" \
     FM_CONFIG_OVERRIDE="$real_home/config" "$ROOT/bin/fm-captain-hold.sh" hold \
-      sample-route-call --title 'Choose a route' --reason 'route selection' \
-      --repo alpha --origin worker >/dev/null
+    sample-route-call --title 'Choose a route' --reason 'route selection' \
+      --repo alpha --origin worker --decision-file "$real_home/decision-input.json" >/dev/null
   env FM_ROOT_OVERRIDE="$ROOT" FM_HOME="$real_home" \
     FM_STATE_OVERRIDE="$real_home/state" FM_DATA_OVERRIDE="$real_home/data" \
     FM_CONFIG_OVERRIDE="$real_home/config" "$ROOT/bin/fm-captain-hold.sh" complete \
@@ -236,20 +449,25 @@ if command -v tasks-axi >/dev/null 2>&1; then
   env FM_ROOT_OVERRIDE="$ROOT" FM_HOME="$real_home" \
     FM_STATE_OVERRIDE="$real_home/state" FM_DATA_OVERRIDE="$real_home/data" \
     FM_CONFIG_OVERRIDE="$real_home/config" "$ROOT/bin/fm-captain-hold.sh" hold \
-      orphan-call --title 'Standalone route choice' --reason 'no worker remains' \
-      --repo alpha >/dev/null
+    orphan-call --title 'Standalone route choice' --reason 'no worker remains' \
+      --repo alpha --decision-file "$real_home/decision-input.json" >/dev/null
   cat > "$real_home/fakebin/tmux" <<'SH'
 #!/usr/bin/env bash
 exit 0
 SH
   chmod +x "$real_home/fakebin/tmux"
-  env PATH="$real_home/fakebin:$PATH" FM_ROOT_OVERRIDE="$ROOT" FM_HOME="$real_home" \
+  env PATH="$real_home/fakebin:$PATH" BROWSER=/usr/bin/true FM_ROOT_OVERRIDE="$ROOT" FM_HOME="$real_home" \
     FM_STATE_OVERRIDE="$real_home/state" FM_DATA_OVERRIDE="$real_home/data" \
     FM_CONFIG_OVERRIDE="$real_home/config" FM_SEND_SETTLE=0 \
     "$ROOT/bin/fm-console.py" --root "$ROOT" --home "$real_home" --port 0 \
     > "$real_home/console.url" 2> "$real_home/console.err" &
   console_pid=$!
-  trap 'kill "$console_pid" 2>/dev/null || true; rm -rf -- "$TMP"' EXIT
+  cleanup_console() {
+    kill "$console_pid" 2>/dev/null || true
+    wait "$console_pid" 2>/dev/null || true
+    cleanup
+  }
+  trap cleanup_console EXIT
   python3 - "$ROOT" "$real_home" "$console_pid" <<'PY'
 import json
 import datetime
@@ -313,7 +531,7 @@ PY
   printf '%s' "$show" | grep -F 'state: done' >/dev/null
   show=$(cd "$real_home" && tasks-axi show orphan-call --full --file data/backlog.md)
   printf '%s' "$show" | grep -F 'state: done' >/dev/null
-  trap 'rm -rf -- "$TMP"' EXIT
+  trap cleanup EXIT
 else
   echo 'skip: tasks-axi unavailable for captain-hold console integration'
 fi

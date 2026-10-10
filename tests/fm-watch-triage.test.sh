@@ -24,6 +24,7 @@ set -u
 
 WATCH="$ROOT/bin/fm-watch.sh"
 DRAIN="$ROOT/bin/fm-wake-drain.sh"
+VALID_DECISION='{"schema":"fm-captain-decision.v1","question":"Pick an option","context":"The current context","user_impact":"This affects the user","options":[{"label":"A","title":"Option A","pros":["A benefit"],"cons":["A cost"]},{"label":"B","title":"Option B","pros":["B benefit"],"cons":["B cost"]}],"recommended_option":"A","recommendation":"Choose A because it best fits the user need."}'
 
 TMP_ROOT=$(fm_test_tmproot fm-watch-triage-tests)
 
@@ -184,7 +185,7 @@ test_status_span_actionable_classifier() {
   dir=$(make_case classify-signal); state="$dir/state"
   printf 'working: step 1\nworking: step 2\n' > "$state/a.status"
   status_span_has_actionable "$state/a.status" 0 && fail "benign working: span classified actionable"
-  printf 'working: x\nneeds-decision: pick A or B\n' > "$state/b.status"
+  printf 'working: x\nneeds-decision: %s\n' "$VALID_DECISION" > "$state/b.status"
   status_span_has_actionable "$state/b.status" 0 || fail "captain-relevant span classified benign"
   # A failure and a merge result are captain-relevant and must always wake.
   printf 'failed: build broke on main\n' > "$state/d.status"
@@ -270,7 +271,7 @@ test_status_span_is_all_receipts_classifier() {
   # "current EOF": a later append past the requested end must not be read.
   printf 'receipt: delivery=aaaa1111bbbb2222\n' > "$state/later.status"
   size=$(size_of "$state/later.status")
-  printf 'needs-decision: pick one\n' >> "$state/later.status"
+  printf 'needs-decision: %s\n' "$VALID_DECISION" >> "$state/later.status"
   status_span_is_all_receipts "$state/later.status" 0 "$size" \
     || fail "a needs-decision: line appended AFTER the fixed end offset was wrongly read into the span"
   pass "status_span_is_all_receipts: absorbable only for the exact fixed-boundary receipt-only byte grammar"
@@ -282,12 +283,12 @@ test_status_span_is_all_receipts_classifier() {
 test_status_span_survives_a_later_routine_append() {
   local dir state event
   dir=$(make_case classify-masked); state="$dir/state"
-  printf 'working: setup\nneeds-decision: pick A or B\nworking: still tidying the branch\n' \
-    > "$state/mask.status"
+  printf 'working: setup\nneeds-decision: %s\nworking: still tidying the branch\n' \
+    "$VALID_DECISION" > "$state/mask.status"
   status_span_has_actionable "$state/mask.status" 0 \
     || fail "a needs-decision hidden behind a later working: line was classified routine"
   event=$(status_span_first_actionable "$state/mask.status" 0)
-  [ "$event" = "needs-decision: pick A or B" ] \
+  [ "$event" = "needs-decision: $VALID_DECISION" ] \
     || fail "the span reported '$event' instead of the decision it found"
   # The captain-reported shape: a finished release/install reported as done and
   # then followed by routine cleanup chatter must still reach the captain.
@@ -311,33 +312,33 @@ test_status_span_survives_a_later_routine_append() {
 test_status_span_respects_decision_closure() {
   local dir state event open
   dir=$(make_case classify-closure); state="$dir/state"
-  printf 'needs-decision [key=api]: pick A or B\nresolved [key=api]: took A\n' > "$state/closed.status"
+  printf 'needs-decision [key=api]: %s\nresolved [key=api]: took A\n' "$VALID_DECISION" > "$state/closed.status"
   status_span_has_actionable "$state/closed.status" 0 \
     && fail "a decision the same span already closed was still classified actionable"
   # Reopening the SAME key after a close must survive: the close belongs to the
   # earlier opening, not to the one that came after it.
-  printf 'needs-decision [key=api]: pick A or B\nresolved [key=api]: took A\nneeds-decision: [key=api] pick A or B\n' \
-    > "$state/reopened.status"
+  printf 'needs-decision [key=api]: %s\nresolved [key=api]: took A\nneeds-decision: [key=api] %s\n' \
+    "$VALID_DECISION" "$VALID_DECISION" > "$state/reopened.status"
   event=$(status_span_first_actionable "$state/reopened.status" 0) \
     || fail "a decision reopened under a key that was closed earlier was classified routine"
-  [ "$event" = "needs-decision: [key=api] pick A or B" ] \
+  [ "$event" = "needs-decision: [key=api] $VALID_DECISION" ] \
     || fail "the reopened key surfaced its closed opening instead of the live reopening: $event"
   # A terminal event is never retired by a later closure line.
   printf 'failed: build broke on main\nresolved [key=api]: unrelated\n' > "$state/term.status"
   status_span_has_actionable "$state/term.status" 0 \
     || fail "a failed: event was retired by an unrelated closure"
   # A live decision must survive a NEWER closure that belongs to another key.
-  printf 'needs-decision [key=api]: pick A or B\nneeds-decision [key=db]: pick a store\nresolved [key=db]: took sqlite\n' \
-    > "$state/two.status"
+  printf 'needs-decision [key=api]: %s\nneeds-decision [key=db]: %s\nresolved [key=db]: took sqlite\n' \
+    "$VALID_DECISION" "$VALID_DECISION" > "$state/two.status"
   event=$(status_span_first_actionable "$state/two.status" 0) \
     || fail "a still-open decision was retired by a newer closure under another key"
-  [ "$event" = "needs-decision [key=api]: pick A or B" ] \
+  [ "$event" = "needs-decision [key=api]: $VALID_DECISION" ] \
     || fail "the span reported '$event' instead of the decision still open"
-  printf 'needs-decision [key=pending-reply-x]: unrelated request\nworking: awaiting reconciliation\n' \
-    > "$state/rejected-reserved.status"
+  printf 'needs-decision [key=pending-reply-x]: %s\nworking: awaiting reconciliation\n' \
+    "$VALID_DECISION" > "$state/rejected-reserved.status"
   event=$(status_span_first_actionable "$state/rejected-reserved.status" 0) \
     || fail "a rejected reserved-key request was silently dropped"
-  [ "$event" = "reconciliation-required: needs-decision [key=pending-reply-x]: unrelated request" ] \
+  [ "$event" = "reconciliation-required: needs-decision [key=pending-reply-x]: $VALID_DECISION" ] \
     || fail "a rejected reserved-key request was not labeled for reconciliation: $event"
   open=$(status_open_decisions "$state/rejected-reserved.status")
   [ -z "$open" ] \
@@ -348,7 +349,7 @@ test_status_span_respects_decision_closure() {
 test_malformed_seen_signature_reads_the_whole_log() {
   local dir state f marker offset
   dir=$(make_case malformed-seen); state="$dir/state"; f="$state/task.status"
-  printf 'needs-decision: choose the release target\nworking: cleanup\n' > "$f"
+  printf 'needs-decision: %s\nworking: cleanup\n' "$VALID_DECISION" > "$f"
   marker="$state/.seen-task_status"
   printf '40' > "$marker"
   offset=$(bash -c '. "$1"; fm_wake_signal_seen_size "$2" "$3"' _ \
@@ -436,13 +437,17 @@ test_classifier_primitives() {
   [ "$(window_to_task "default:w1:p2" "$state")" = "herdr-task" ] || fail "window_to_task did not resolve opaque backend target through metadata"
   FM_CAPTAIN_RE='custom-verb:' status_is_captain_relevant "custom-verb: x" || fail "FM_CAPTAIN_RE override not honored"
   FM_CAPTAIN_RE='custom-verb:' status_is_captain_relevant "done: x" && fail "FM_CAPTAIN_RE override did not replace the default verb set"
+  FM_CAPTAIN_RE='custom-verb:' status_is_captain_relevant "needs-decision: incomplete question" \
+    || fail "FM_CAPTAIN_RE override suppressed a malformed decision repair diagnostic"
+  FM_CAPTAIN_RE='custom-verb:' status_is_captain_relevant "decision-repair [key=api]: malformed captain decision event requires repair" \
+    || fail "FM_CAPTAIN_RE override suppressed a decision repair diagnostic"
   FM_CAPTAIN_RE='merged|custom-verb:' status_is_captain_relevant "working: rebased onto merged #76" \
     && fail "FM_CAPTAIN_RE override bypassed working: suppression"
   FM_CAPTAIN_RE='checks green|custom-verb:' status_is_captain_relevant "paused: checks green pending approval" \
     && fail "FM_CAPTAIN_RE override bypassed paused: suppression"
   FM_CAPTAIN_RE='custom-verb:' status_is_captain_relevant "custom-verb: x" \
     || fail "nonterminal suppression weakened custom bare-line behavior"
-  printf 'needs-decision: should docs mention [key=prose]?\nneeds-decision [key=q1]: real choice\nresolved: docs still mention [key=q1]\nneeds-decision [key=bad key]: malformed\n' > "$state/keys.status"
+  printf 'needs-decision: should docs mention [key=prose]?\nneeds-decision [key=q1]: %s\nresolved: docs still mention [key=q1]\nneeds-decision [key=bad key]: malformed\n' "$VALID_DECISION" > "$state/keys.status"
   open=$(status_open_decisions "$state/keys.status")
   printf '%s' "$open" | grep -F $'q1\t' >/dev/null \
     || fail "a key token in resolved note prose closed the keyed decision"
@@ -817,7 +822,7 @@ test_secondmate_receipt_mixed_with_decision_surfaces() {
   dir=$(make_case secondmate-receipt-mixed); state="$dir/state"; fakebin="$dir/fakebin"
   out="$dir/watch.out"; drain_out="$dir/drain.out"
   printf 'kind=secondmate\n' > "$state/sm.meta"
-  printf 'receipt: delivery=aaaa1111bbbb2222\nneeds-decision: which vendor?\n' > "$state/sm.status"
+  printf 'receipt: delivery=aaaa1111bbbb2222\nneeds-decision: %s\n' "$VALID_DECISION" > "$state/sm.status"
   export FM_FAKE_CREW_STATE_sm='state: unknown · source: none · no current-state source available'
   watch_bg "$state" "$fakebin" "$out"
   pid=$!
@@ -837,7 +842,7 @@ test_secondmate_decision_then_receipt_surfaces() {
   dir=$(make_case secondmate-decision-then-receipt); state="$dir/state"; fakebin="$dir/fakebin"
   out="$dir/watch.out"; drain_out="$dir/drain.out"
   printf 'kind=secondmate\n' > "$state/sm.meta"
-  printf 'needs-decision: which vendor?\nreceipt: delivery=aaaa1111bbbb2222\n' > "$state/sm.status"
+  printf 'needs-decision: %s\nreceipt: delivery=aaaa1111bbbb2222\n' "$VALID_DECISION" > "$state/sm.status"
   export FM_FAKE_CREW_STATE_sm='state: unknown · source: none · no current-state source available'
   watch_bg "$state" "$fakebin" "$out"
   pid=$!
@@ -1759,7 +1764,7 @@ test_self_announced_close_does_not_rewake_but_next_note_does() {
   local dir state fakebin out status_file pid rc
   dir=$(make_case self-close-quiet); state="$dir/state"; fakebin="$dir/fakebin"; out="$dir/watch.out"
   status_file="$state/task.status"
-  printf 'needs-decision [key=k1]: pick one\n' > "$status_file"
+  printf 'needs-decision [key=k1]: %s\n' "$VALID_DECISION" > "$status_file"
   prime_status_seen "$state" "$status_file" || fail "could not prime the announced baseline"
   # The home's own bookkeeping close, written through the guarded
   # self-announced append this home's answerers use.
@@ -1779,7 +1784,7 @@ test_self_announced_close_does_not_rewake_but_next_note_does() {
   [ ! -s "$state/.wake-queue" ] || { reap "$pid"; fail "self-announced close enqueued a durable wake"; }
   # A later, different note on the SAME task still wakes: dedup is keyed on the
   # exact announced bytes, never on task identity.
-  printf 'needs-decision [key=k2]: a genuinely new decision\n' >> "$status_file"
+  printf 'needs-decision [key=k2]: %s\n' "$VALID_DECISION" >> "$status_file"
   wait_for_exit "$pid" 100 || fail "a later different note after a self-announced close was swallowed"
   grep -F "signal: $status_file" "$out" >/dev/null \
     || fail "the later note did not surface as a signal"
@@ -1793,7 +1798,7 @@ test_actionable_signal_surfaced() {
   dir=$(make_case actionable-signal); state="$dir/state"; fakebin="$dir/fakebin"
   out="$dir/watch.out"; drain_out="$dir/drain.out"
   status_file="$state/task.status"
-  printf 'working: setup\nneeds-decision: pick A or B\n' > "$status_file"
+  printf 'working: setup\nneeds-decision: %s\n' "$VALID_DECISION" > "$status_file"
   watch_bg "$state" "$fakebin" "$out"
   pid=$!
   wait_for_exit "$pid" 100 || fail "watcher did not exit for an actionable needs-decision signal"
@@ -1815,7 +1820,7 @@ test_needs_decision_signal_payload_marked_for_branch_exclusion() {
   dir=$(make_case needs-decision-payload); state="$dir/state"; fakebin="$dir/fakebin"
   out="$dir/watch.out"
   status_file="$state/task.status"
-  printf 'working: setup\nneeds-decision: pick A or B\n' > "$status_file"
+  printf 'working: setup\nneeds-decision: %s\n' "$VALID_DECISION" > "$status_file"
   watch_bg "$state" "$fakebin" "$out"
   pid=$!
   wait_for_exit "$pid" 100 || fail "watcher did not exit for an actionable needs-decision signal"
@@ -1834,8 +1839,8 @@ test_needs_decision_reconciliation_required_still_marked() {
   dir=$(make_case needs-decision-reconciliation); state="$dir/state"; fakebin="$dir/fakebin"
   out="$dir/watch.out"
   status_file="$state/task.status"
-  printf 'needs-decision [key=pending-reply-x]: unrelated request\nworking: awaiting reconciliation\n' \
-    > "$status_file"
+  printf 'needs-decision [key=pending-reply-x]: %s\nworking: awaiting reconciliation\n' \
+    "$VALID_DECISION" > "$status_file"
   watch_bg "$state" "$fakebin" "$out"
   pid=$!
   wait_for_exit "$pid" 100 || fail "watcher did not exit for a rejected-reserved-key needs-decision"
@@ -1931,7 +1936,7 @@ test_actionable_signal_survives_a_later_routine_append() {
   # the newly appended span, not merely a whole-file re-read.
   printf 'working: setup\n' > "$status_file"
   sig=$(seen_sig "$status_file"); printf '%s' "$sig" > "$state/.seen-task_status"
-  printf 'needs-decision: pick A or B\nworking: still tidying the branch\n' >> "$status_file"
+  printf 'needs-decision: %s\nworking: still tidying the branch\n' "$VALID_DECISION" >> "$status_file"
   # Positive evidence the crew is still working, so the no-verb fallback cannot
   # rescue the wake: only reading the event itself can surface it.
   export FM_FAKE_CREW_STATE='state: working · source: pane · validating (running)'
@@ -1976,7 +1981,7 @@ test_routine_appends_after_a_classified_event_stay_absorbed() {
   status_file="$state/task.status"
   # The decision is BEHIND the classified position, so only the new routine line
   # is in the span. A supervisor that re-read the whole log would wake again here.
-  printf 'working: setup\nneeds-decision: pick A or B\n' > "$status_file"
+  printf 'working: setup\nneeds-decision: %s\n' "$VALID_DECISION" > "$status_file"
   sig=$(seen_sig "$status_file"); printf '%s' "$sig" > "$state/.seen-task_status"
   printf 'working: still tidying the branch\n' >> "$status_file"
   export FM_FAKE_CREW_STATE='state: working · source: pane · validating (running)'
@@ -2954,7 +2959,7 @@ run_hold() {  # <dir> <args...>
 }
 
 make_hold_home() {  # <name> <status-line> <hold|nohold>
-  local name=$1 line=$2 hold=$3 dir state
+  local name=$1 line=$2 hold=$3 dir state decision_file
   dir=$(make_case "$name"); state="$dir/state"
   mkdir -p "$dir/data" "$dir/config"
   cp "$ROOT/.tasks.toml" "$dir/.tasks.toml" || return 1
@@ -2962,7 +2967,10 @@ make_hold_home() {  # <name> <status-line> <hold|nohold>
   (cd "$dir" && tasks-axi add held-merge 'delivered work' --file data/backlog.md) >/dev/null 2>&1 \
     || return 1
   if [ "$hold" = hold ]; then
-    run_hold "$dir" hold held-merge --reason 'awaiting the captain on the merge' || return 1
+    decision_file="$dir/decision.json"
+    printf '%s\n' "$VALID_DECISION" > "$decision_file"
+    run_hold "$dir" hold held-merge --decision-file "$decision_file" \
+      --reason 'awaiting the captain on the merge' || return 1
   fi
   printf 'window=test:fm-held-merge\nkind=ship\nharness=grok\nbackend=tmux\n' \
     > "$state/held-merge.meta"
@@ -3172,7 +3180,8 @@ test_reheld_captain_call_starts_its_own_resurface_window() {
   printf 'go ahead\n' > "$dir/decision.txt"
   run_hold "$dir" answer held-merge --decision-file "$dir/decision.txt" --release \
     || fail "could not record the captain's answer"
-  run_hold "$dir" hold held-merge --reason 'awaiting the captain a second time' \
+  run_hold "$dir" hold held-merge --decision-file "$dir/decision.json" \
+    --reason 'awaiting the captain a second time' \
     || fail "could not re-hold the task as a second captain call"
 
   hold_watch_surface "$dir" "$out" "$capture" 'idle, elapsed 3s' \
@@ -5213,7 +5222,7 @@ test_heartbeat_backstop_surfaces_a_masked_status() {
   out="$dir/watch.out"
   # Same miss as below, but the captain-relevant event is followed by a routine
   # append, so its last line reads benign. The backstop must still catch it.
-  printf 'working: setup\nneeds-decision: pick A or B\nworking: tidying the branch\n' \
+  printf 'working: setup\nneeds-decision: %s\nworking: tidying the branch\n' "$VALID_DECISION" \
     > "$state/miss.status"
   sig=$(seen_sig "$state/miss.status"); printf '%s' "$sig" > "$state/.seen-miss_status"
   PATH="$fakebin:$PATH" FM_STATE_OVERRIDE="$state" FM_POLL=1 FM_SIGNAL_GRACE=1 \
@@ -5290,7 +5299,7 @@ test_afk_signal_records_heartbeat_endpoint() {
   local dir state fakebin out status_file pid
   dir=$(make_case afk-heartbeat-endpoint); state="$dir/state"; fakebin="$dir/fakebin"
   out="$dir/watch.out"; status_file="$state/task.status"
-  printf 'needs-decision: choose release target\nworking: preparing both targets\n' > "$status_file"
+  printf 'needs-decision: %s\nworking: preparing both targets\n' "$VALID_DECISION" > "$status_file"
   date '+%s' > "$state/.afk"
   export FM_FAKE_CREW_STATE='state: working · source: pane · validating (running)'
   watch_bg "$state" "$fakebin" "$out"

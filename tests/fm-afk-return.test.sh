@@ -25,6 +25,7 @@ install_runner() {  # <case-dir>
   cp "$ROOT/bin/fm-afk-return.sh" "$dir/bin/"
   cp "$ROOT/bin/fm-wake-lib.sh" "$dir/bin/"
   cp "$ROOT/bin/fm-classify-lib.sh" "$dir/bin/"
+  cp "$ROOT/bin/fm-decision-lib.sh" "$dir/bin/"
   # fm-timeout-lib.sh: the shared hard bound fm-classify-lib.sh sources for the
   # wedge detector's bounded worktree write probe.
   cp "$ROOT/bin/fm-timeout-lib.sh" "$dir/bin/"
@@ -246,7 +247,9 @@ window=synthetic:fm-decision-task
 backend=tmux
 kind=ship
 EOF
-  printf 'needs-decision [key=api-shape]: captain must choose the synthetic API shape\n' > "$dir/home/state/decision-task.status"
+  printf 'needs-decision [key=api-shape]: %s\n' \
+    "$(fm_test_captain_decision_json 'Choose the synthetic API shape')" \
+    > "$dir/home/state/decision-task.status"
   date +%s > "$dir/home/state/.afk"
   printf '1784074271\t1\tsignal\tdecision-task.status\tsignal: synthetic decision\n' > "$dir/home/state/.fake-drain"
   out=$(run_return "$dir" begin) || fail "approval decision should not be treated as a firstmate blocker: $out"
@@ -269,7 +272,7 @@ test_evidence_publication_failure_preserves_wake_for_redrain() {
     "$dir/bin/fm-afk-return.sh" begin 3< "$dir/read-only-output" >&3 2> "$dir/failed.err"
   rc=$?
   set -e
-  [ "$rc" -eq 3 ] || fail "evidence publication failure should retain catch-up (rc=$rc)"
+  [ "$rc" -eq 3 ] || fail "evidence publication failure should retain catch-up (rc=$rc): $(cat "$dir/failed.err")"
   [ -s "$dir/home/state/.fake-drain" ] || fail "publication failure removed the unhandled durable wake"
   [ ! -e "$dir/home/state/.fake-drain-acks" ] || fail "publication failure acknowledged the wake before delivery"
   [ -s "$gate" ] || fail "publication failure did not retain the catch-up gate"
@@ -387,7 +390,10 @@ test_return_brief_composes_from_record_store_and_held_set() {
   printf 'window=synthetic:fm-fix-windows\nbackend=tmux\nkind=ship\n' > "$dir/home/state/fix-windows.meta"
   printf 'blocked [key=token]: firstmate can refresh the token\n' > "$dir/home/state/fix-windows.status"
   printf 'window=synthetic:fm-other\nbackend=tmux\nkind=ship\n' > "$dir/home/state/other.meta"
-  printf 'blocked [key=dep]: needs the upstream dependency\nneeds-decision [key=pick]: choose the target\n' > "$dir/home/state/other.status"
+  printf '%s\n%s\n' \
+    'blocked [key=dep]: needs the upstream dependency' \
+    'needs-decision [key=pick]: {"schema":"fm-captain-decision.v1","question":"choose the target","context":"The target is unclear","user_impact":"The choice affects the user","options":[{"label":"A","title":"Target A","pros":["A benefit"],"cons":["A cost"]},{"label":"B","title":"Target B","pros":["B benefit"],"cons":["B cost"]}],"recommended_option":"A","recommendation":"Choose A because it best meets the user need."}' \
+    > "$dir/home/state/other.status"
   printf 'window=synthetic:fm-dead\nbackend=tmux\nkind=scout\n' > "$dir/home/state/dead.meta"
   printf 'failed: the reproduction never compiled\n' > "$dir/home/state/dead.status"
   outcome_in "$dir" append --task fix-windows --verdict captain \

@@ -14,10 +14,12 @@ set -u
 TEARDOWN="$ROOT/bin/fm-teardown.sh"
 BEARINGS="$ROOT/bin/fm-bearings-snapshot.sh"
 TMP_ROOT=$(fm_test_tmproot fm-captain-hold)
+DECISION_FILE="$TMP_ROOT/decision.json"
 TASKS_AXI_BIN=$(command -v tasks-axi || true)
 
 command -v jq >/dev/null 2>&1 || { echo "skip: jq not found"; exit 0; }
 command -v tasks-axi >/dev/null 2>&1 || { echo "skip: tasks-axi not found"; exit 0; }
+fm_test_captain_decision "$DECISION_FILE" 'Which approach should continue?'
 
 make_home() {  # <name>
   local home="$TMP_ROOT/$1" fakebin
@@ -81,6 +83,27 @@ tasks_in() {  # <home> <tasks-axi args...>
 }
 
 run_captain() {  # <home> <command args...>
+  local home=$1 command=${2:-} arg needs_decision=1
+  shift
+  shift || :
+  if [ "$command" = hold ]; then
+    for arg in "$@"; do
+      case "$arg" in --decision-file) needs_decision=0 ;; esac
+    done
+    if [ "$needs_decision" = 1 ]; then
+      set -- "$command" "$@" --decision-file "$DECISION_FILE"
+    else
+      set -- "$command" "$@"
+    fi
+  else
+    set -- "$command" "$@"
+  fi
+  PATH="$home/fakebin:$PATH" REAL_TASKS_AXI="$TASKS_AXI_BIN" \
+    FM_HOME="$home" FM_STATE_OVERRIDE="$home/state" FM_DATA_OVERRIDE="$home/data" \
+    FM_CONFIG_OVERRIDE="$home/config" "$ROOT/bin/fm-captain-hold.sh" "$@"
+}
+
+run_captain_raw() {  # <home> <command args...>; never supplies fixture decision JSON
   local home=$1
   shift
   PATH="$home/fakebin:$PATH" REAL_TASKS_AXI="$TASKS_AXI_BIN" \
@@ -183,8 +206,17 @@ SH
 # The retired command surface, kept for one release as a shim; in-flight
 # pre-collapse work still drives the lifecycle through these spellings.
 run_shim() {  # <home> <command args...>
-  local home=$1
+  local home=$1 command=${2:-} arg needs_decision=1
   shift
+  shift || :
+  if [ "$command" = hold ]; then
+    for arg in "$@"; do
+      case "$arg" in --decision-file) needs_decision=0 ;; esac
+    done
+    if [ "$needs_decision" = 1 ]; then set -- "$command" "$@" --decision-file "$DECISION_FILE"; else set -- "$command" "$@"; fi
+  else
+    set -- "$command" "$@"
+  fi
   PATH="$home/fakebin:$PATH" REAL_TASKS_AXI="$TASKS_AXI_BIN" \
     FM_HOME="$home" FM_STATE_OVERRIDE="$home/state" FM_DATA_OVERRIDE="$home/data" \
     FM_CONFIG_OVERRIDE="$home/config" "$ROOT/bin/fm-decision-hold.sh" "$@"
@@ -608,7 +640,7 @@ SH
   PATH="$fb:$PATH" REAL_TASKS_AXI="$TASKS_AXI_BIN" \
     FM_HOME="$home" FM_STATE_OVERRIDE="$home/state" \
     FM_DATA_OVERRIDE="$home/data" FM_CONFIG_OVERRIDE="$home/config" \
-    "$ROOT/bin/fm-captain-hold.sh" hold "$id" --reason "captain must decide" >/dev/null \
+    "$ROOT/bin/fm-captain-hold.sh" hold "$id" --reason "captain must decide" --decision-file "$DECISION_FILE" >/dev/null \
     || fail "holding on a beads-configured home failed without a markdown backlog"
   assert_grep "hold $id" "$log" \
     "the captain-hold mutation never reached the configured backend"
@@ -1121,6 +1153,86 @@ EOF
   pass "a deferred captain call leaves the live Captain's Call until its date and stays answerable"
 }
 
+test_new_deferred_holds_require_decisions_and_existing_holds_preserve_them() {
+  local home until id show existing_record before after
+  home=$(make_home structured-deferrals)
+  tasks_in "$home" add queued-work "Existing queued work" --kind ship --repo sample >/dev/null \
+    || fail "could not add the existing queued task"
+  tasks_in "$home" add in-flight-work "Existing in-flight work" --kind ship --repo sample --start >/dev/null \
+    || fail "could not add the existing in-flight task"
+  for id in queued-work in-flight-work; do
+    before=$(cat "$home/data/backlog.md")
+    if run_captain_raw "$home" hold "$id" --reason "Choose a route" >"$home/$id.out" 2>"$home/$id.err"; then
+      fail "existing unstructured task $id was accepted as a captain hold"
+    fi
+    assert_grep 'requires --decision-file' "$home/$id.err" \
+      "existing task $id refusal did not explain the structured-decision requirement"
+    after=$(cat "$home/data/backlog.md")
+    [ "$after" = "$before" ] || fail "refused hold changed backlog bytes for $id"
+    show=$(tasks_in "$home" show "$id" --full)
+    assert_contains "$show" 'held: no' "refused hold changed existing task $id hold state"
+  done
+  for until in 2000-01-01 "$(date -u +%Y-%m-%d)" 2999-12-31; do
+    id="existing-deferred-${until//-/}"
+    tasks_in "$home" add "$id" "Existing deferred work $until" --kind ship --repo sample >/dev/null \
+      || fail "could not add existing task $id for deferral validation"
+    before=$(cat "$home/data/backlog.md")
+    if run_captain_raw "$home" hold "$id" --reason "Captain needs to choose a route" \
+      --until "$until" >"$home/$id.out" 2>"$home/$id.err"; then
+      fail "existing unstructured task $id was accepted for deferral"
+    fi
+    assert_grep 'requires --decision-file' "$home/$id.err" \
+      "existing deferred task $id refusal did not explain the structured-decision requirement"
+    after=$(cat "$home/data/backlog.md")
+    [ "$after" = "$before" ] || fail "refused deferred hold changed backlog bytes for $id"
+
+    id="unstructured-${until//-/}"
+    if run_captain_raw "$home" hold "$id" --title "Choose a user route" \
+      --reason "Captain needs to choose a route" --until "$until" >"$home/$id.out" 2>"$home/$id.err"; then
+      fail "new unstructured captain hold with --until $until was accepted"
+    fi
+    assert_grep 'requires --decision-file' "$home/$id.err" "the dated hold refusal did not explain the structured-decision requirement"
+    if tasks_in "$home" show "$id" --full >/dev/null 2>&1; then
+      fail "refused unstructured deferred hold $id still created a task"
+    fi
+  done
+
+  tasks_in "$home" add existing-unstructured-hold "Legacy captain hold" --kind captain --repo sample >/dev/null \
+    || fail "could not add existing unstructured captain task"
+  tasks_in "$home" hold existing-unstructured-hold --reason "Old captain call" --kind captain >/dev/null \
+    || fail "could not create the legacy unstructured captain hold fixture"
+  before=$(cat "$home/data/backlog.md")
+  if run_captain_raw "$home" hold existing-unstructured-hold --reason "Revisit legacy call" \
+    >"$home/existing-unstructured-hold.out" 2>"$home/existing-unstructured-hold.err"; then
+    fail "an existing unstructured captain hold was accepted without a replacement decision"
+  fi
+  assert_grep 'must preserve' "$home/existing-unstructured-hold.err" \
+    "existing unstructured captain hold refusal did not identify the invalid preservation record"
+  after=$(cat "$home/data/backlog.md")
+  [ "$after" = "$before" ] || fail "refused unstructured re-hold changed backlog bytes"
+
+  tasks_in "$home" add existing-structured "Choose the account route" --kind captain --repo sample >/dev/null \
+    || fail "could not add the existing structured captain task"
+  run_captain_raw "$home" hold existing-structured --reason "Captain needs to choose the account route" \
+    --decision-file "$DECISION_FILE" >/dev/null \
+    || fail "could not create the existing structured captain hold"
+  show=$(tasks_in "$home" show existing-structured --full)
+  existing_record=$(printf '%s\n' "$show" | sed -n 's/^  body: .*Captain decision record v1: //p' | head -1)
+  [ -n "$existing_record" ] || fail 'the initial captain hold did not retain its structured decision'
+  run_captain_raw "$home" hold existing-structured --reason "Captain needs to revisit the account route" \
+    >/dev/null || fail 'an existing structured hold could not be re-held without replacement JSON'
+  for until in 2000-01-01 "$(date -u +%Y-%m-%d)" 2999-12-31; do
+    run_captain_raw "$home" hold existing-structured --reason "Captain needs to revisit the account route" \
+      --until "$until" >/dev/null || fail "an existing structured hold could not be deferred to $until without replacement JSON"
+    show=$(tasks_in "$home" show existing-structured --full)
+    printf '%s\n' "$show" | grep -F 'Captain decision record v1:' >/dev/null \
+      || fail "deferring an existing structured hold to $until removed its decision"
+    after=$(printf '%s\n' "$show" | sed -n 's/^  body: .*Captain decision record v1: //p' | head -1)
+    [ "$after" = "$existing_record" ] || fail "deferring an existing structured hold to $until changed its decision record"
+  done
+  pass 'new deferred holds require structured decisions for past, due, and future dates, and existing holds keep theirs'
+}
+
 # The recorded-answer guard survives an out-of-band close: a bare tasks-axi done
 # fails verify until answer records the captain's word, and an ordinary finished
 # task can never be dressed up as an answered captain call.
@@ -1368,13 +1480,13 @@ EOF
     || fail "could not create quoted-record captain call"
   run_captain "$mate" hold quoted-record-call --reason "quoted record choice pending" \
     --origin quoted-origin >/dev/null || fail "quoted-record hold failed"
-  assert_grep 'needs-decision [key=captain-hold-quoted-record-call-1]: captain hold quoted-record-call: quoted record choice pending' \
-    "$channel" "body prose was incorrectly counted as a resolution record"
+  assert_grep 'needs-decision [key=captain-hold-quoted-record-call-1]: {"context":' \
+    "$channel" "the parent channel did not receive the structured decision"
 
   run_captain "$mate" hold mate-call --title "Choose the mate release" \
     --reason "release choice pending" --repo sample >/dev/null \
     || fail "mate hold failed"
-  assert_grep 'needs-decision [key=captain-hold-mate-call-1]: captain hold mate-call: release choice pending' \
+  assert_grep 'needs-decision [key=captain-hold-mate-call-1]: {"context":' \
     "$channel" "the mate's hold did not reach the parent channel"
   run_captain "$mate" hold mate-call --reason "release choice pending" >/dev/null \
     || fail "repeated mate hold failed"
@@ -1384,17 +1496,17 @@ EOF
   printf 'ship it later\n' > "$decision"
   run_captain "$mate" answer mate-call --decision-file "$decision" --release >/dev/null \
     || fail "mate release answer failed"
-  assert_grep 'resolved [key=captain-hold-mate-call-1]: captain hold mate-call: released' \
+  assert_grep 'resolved [key=captain-hold-mate-call-1]: released' \
     "$channel" "the released answer did not close the parent decision"
 
   run_captain "$mate" hold mate-call --reason "second release choice" >/dev/null \
     || fail "re-hold after release failed"
-  assert_grep 'needs-decision [key=captain-hold-mate-call-2]: captain hold mate-call: second release choice' \
+  assert_grep 'needs-decision [key=captain-hold-mate-call-2]: {"context":' \
     "$channel" "a re-held task did not open a distinct parent decision"
   printf 'ship it\n' > "$decision"
   run_captain "$mate" answer mate-call --decision-file "$decision" >/dev/null \
     || fail "mate close answer failed"
-  assert_grep 'resolved [key=captain-hold-mate-call-2]: captain hold mate-call: answered' \
+  assert_grep 'resolved [key=captain-hold-mate-call-2]: answered' \
     "$channel" "the closing answer did not close the second parent decision"
   run_captain "$mate" answer mate-call --decision-file "$decision" >/dev/null \
     || fail "idempotent answer retry failed"
@@ -1462,13 +1574,13 @@ test_secondmate_reconcile_publishes_before_request_retirement() {
   assert_contains "$show" "Resolution mode: reconciled" \
     "request retirement failure lost the reconciled resolution mode"
   [ -f "$request" ] || fail "the request retired despite its forced retirement failure"
-  [ "$(grep -c 'resolved \[key=captain-hold-reconcile-channel-call-1\]: captain hold reconcile-channel-call: reconciled' "$channel")" -eq 1 ] \
+  [ "$(grep -c 'resolved \[key=captain-hold-reconcile-channel-call-1\]: reconciled' "$channel")" -eq 1 ] \
     || fail "the parent resolution was not published before retirement failed: $(cat "$channel")"
 
   run_captain "$mate" reconcile close reconcile-channel-call --evidence-file "$evidence" >/dev/null \
     || fail "the closed reconciliation could not finish publication and retirement"
   [ ! -e "$request" ] || fail "the retry did not retire the published reconcile request"
-  [ "$(grep -c 'resolved \[key=captain-hold-reconcile-channel-call-1\]: captain hold reconcile-channel-call: reconciled' "$channel")" -eq 1 ] \
+  [ "$(grep -c 'resolved \[key=captain-hold-reconcile-channel-call-1\]: reconciled' "$channel")" -eq 1 ] \
     || fail "the reconciliation retry duplicated or changed its parent resolution: $(cat "$channel")"
   tasks_in "$mate" add answer-channel-call "Answer the mate call" --kind ship --repo sample >/dev/null \
     || fail "could not create the normal-answer channel call"
@@ -1488,12 +1600,12 @@ test_secondmate_reconcile_publishes_before_request_retirement() {
   show=$(tasks_in "$mate" show answer-channel-call --full)
   assert_contains "$show" "state: done" "request retirement failure reversed the captain answer"
   [ -f "$request" ] || fail "the normal-answer retry trigger retired after its forced failure"
-  [ "$(grep -c 'resolved \[key=captain-hold-answer-channel-call-1\]: captain hold answer-channel-call: answered' "$channel")" -eq 1 ] \
+  [ "$(grep -c 'resolved \[key=captain-hold-answer-channel-call-1\]: answered' "$channel")" -eq 1 ] \
     || fail "the normal answer did not publish before retirement failed: $(cat "$channel")"
   run_captain "$mate" answer answer-channel-call --decision-file "$mate/answer.txt" >/dev/null \
     || fail "the normal-answer retry could not finish request retirement"
   [ ! -e "$request" ] || fail "the normal-answer retry left its request pending"
-  [ "$(grep -c 'resolved \[key=captain-hold-answer-channel-call-1\]: captain hold answer-channel-call: answered' "$channel")" -eq 1 ] \
+  [ "$(grep -c 'resolved \[key=captain-hold-answer-channel-call-1\]: answered' "$channel")" -eq 1 ] \
     || fail "the normal-answer retry duplicated its parent resolution: $(cat "$channel")"
   pass "secondmate resolutions publish before retiring durable retry triggers"
 }
@@ -3052,7 +3164,7 @@ EOF
   PATH="$home/fakebin:$PATH" FM_HOME="$home" FM_STATE_OVERRIDE="$home/state" \
     FM_DATA_OVERRIDE="$data" FM_CONFIG_OVERRIDE="$home/config" \
     "$ROOT/bin/fm-captain-hold.sh" hold "$id" \
-    --reason "captain must choose after relocated interrupted cleanup" >/dev/null \
+    --reason "captain must choose after relocated interrupted cleanup" --decision-file "$DECISION_FILE" >/dev/null \
     || fail "could not hold the relocated answer-before-replay fixture"
   PATH="$home/fakebin:$PATH" FM_HOME="$home" FM_STATE_OVERRIDE="$home/state" \
     FM_DATA_OVERRIDE="$data" FM_CONFIG_OVERRIDE="$home/config" \
@@ -3129,7 +3241,7 @@ EOF
   PATH="$home/fakebin:$PATH" FM_HOME="$home" FM_STATE_OVERRIDE="$home/state" \
     FM_DATA_OVERRIDE="$data" FM_CONFIG_OVERRIDE="$home/config" \
     "$ROOT/bin/fm-captain-hold.sh" hold "$id" \
-    --reason "captain must choose the relocated sample outcome" >/dev/null \
+    --reason "captain must choose the relocated sample outcome" --decision-file "$DECISION_FILE" >/dev/null \
     || fail "could not hold the relocated work item"
   PATH="$home/fakebin:$PATH" FM_HOME="$home" FM_STATE_OVERRIDE="$home/state" \
     FM_DATA_OVERRIDE="$data" FM_CONFIG_OVERRIDE="$home/config" \
@@ -4002,6 +4114,7 @@ test_release_frees_held_work
 test_hold_stamp_precedes_hold_visibility
 test_interrupted_answer_preserves_hold_age
 test_deferral_leaves_captains_call_until_due
+test_new_deferred_holds_require_decisions_and_existing_holds_preserve_them
 test_out_of_band_close_is_recordable
 test_visual_review_uses_shared_completion_owner
 test_none_inventory_and_resolved_prose_do_not_create_holds

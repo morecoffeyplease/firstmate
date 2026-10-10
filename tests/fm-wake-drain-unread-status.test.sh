@@ -16,6 +16,12 @@ DRAIN="$ROOT/bin/fm-wake-drain.sh"
 
 TMP_ROOT=$(fm_test_tmproot fm-wake-drain-unread-status-tests)
 
+decision_json() {  # <question>
+  local path="$TMP_ROOT/captain-decision.json"
+  fm_test_captain_decision "$path" "$1"
+  jq -c . "$path"
+}
+
 # Establish the durable last-presentation cursor by draining once over a
 # bootstrap line so later appends are "new since last drain".
 prime_cursor() {  # <state> <status-file>
@@ -268,10 +274,11 @@ test_weak_identity_still_presents_and_advances() {
   dir=$(make_case weak-identity); state="$dir/state"
   out="$dir/first.out"; second="$dir/second.out"; reader="$dir/identity-reader"
   printf '#!/usr/bin/env bash\nprintf "weak:7:8"\n' > "$reader"; chmod +x "$reader"
-  printf 'needs-decision [key=release]: choose target\nnote: release context attached\n' > "$state/weak.status"
+  printf 'needs-decision [key=release]: %s\nnote: release context attached\n' \
+    "$(decision_json 'Choose target')" > "$state/weak.status"
   FM_STATUS_IDENTITY_READER="$reader" FM_STATE_OVERRIDE="$state" "$DRAIN" > "$out" \
     || fail "drain failed with the platform-strength fallback identity"
-  grep -F 'weak [key=release] needs-decision: choose target' "$out" >/dev/null \
+  grep -F '"question":"Choose target"' "$out" >/dev/null \
     || fail "weak identity omitted OPEN DECISIONS: $(cat "$out")"
   grep -F 'weak note: release context attached' "$out" >/dev/null \
     || fail "weak identity omitted unread status: $(cat "$out")"
@@ -299,13 +306,13 @@ test_open_decisions_fold_is_unchanged() {
   dir=$(make_case open-decisions-regression)
   state="$dir/state"
   out="$dir/drain.out"
-  printf 'needs-decision [key=api-shape]: pick REST or RPC\n' > "$state/task6.status"
+  printf 'needs-decision [key=api-shape]: %s\n' "$(decision_json 'Choose REST or RPC')" > "$state/task6.status"
   printf 'working: continuing other work\n' >> "$state/task6.status"
   printf 'note: re-read acknowledgement\n' >> "$state/task6.status"
 
   FM_STATE_OVERRIDE="$state" "$DRAIN" > "$out" || fail "drain failed on a buried needs-decision plus a note"
 
-  grep -F 'task6 [key=api-shape] needs-decision: pick REST or RPC' "$out" >/dev/null \
+  grep -F '"question":"Choose REST or RPC"' "$out" >/dev/null \
     || fail "OPEN DECISIONS no longer surfaces a buried needs-decision: $(cat "$out")"
   grep -F 'task6 note: re-read acknowledgement' "$out" >/dev/null \
     || fail "the unread note was not surfaced alongside the still-open decision: $(cat "$out")"

@@ -20,8 +20,12 @@
 # and secondmate-home ownership aligned with the work that discovered the call.
 #
 # Usage:
-#   fm-captain-hold.sh hold <task-id> --reason <reason> \
-#     [--title <title>] [--repo <repo>] [--origin <origin-id>] [--until YYYY-MM-DD]
+#   fm-captain-hold.sh hold <task-id> [--reason <reason>] \
+#     [--decision-file <json>] [--title <title>] [--repo <repo>] [--origin <origin-id>] [--until YYYY-MM-DD]
+#   fm-captain-hold.sh decision-event <task-id> --key <key> --input-file <json>
+# New captain holds require --decision-file; --until only defers an existing structured captain hold.
+# Decision JSON uses schema fm-captain-decision.v1 with question, context,
+# user_impact, options[{label,title,pros[],cons[]}], recommended_option, and recommendation.
 #   fm-captain-hold.sh answer <task-id> --decision-file <path> [--release]
 #   fm-captain-hold.sh answers [<legacy-origin> | --any-origin] --source <provenance>   (keyed answers on stdin)
 #   fm-captain-hold.sh reconcile-requests --source-id <source-id> --source <provenance>   (task ids on stdin)
@@ -201,6 +205,8 @@ set -eu
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 FM_ROOT="${FM_ROOT_OVERRIDE:-$(cd "$SCRIPT_DIR/.." && pwd)}"
+FM_HOME_EXPLICIT=0
+[ -n "${FM_HOME:-}" ] && FM_HOME_EXPLICIT=1
 FM_HOME="${FM_HOME:-${FM_ROOT_OVERRIDE:-$FM_ROOT}}"
 STATE="${FM_STATE_OVERRIDE:-$FM_HOME/state}"
 DATA="${FM_DATA_OVERRIDE:-$FM_HOME/data}"
@@ -220,13 +226,15 @@ DATA="${FM_DATA_OVERRIDE:-$FM_HOME/data}"
 # shellcheck source=bin/fm-parent-channel-lib.sh
 # shellcheck disable=SC1091
 . "$SCRIPT_DIR/fm-parent-channel-lib.sh"
+# shellcheck source=bin/fm-decision-lib.sh disable=SC1091
+. "$SCRIPT_DIR/fm-decision-lib.sh"
 
 PARENT_HOLD_PUBLISHED=0
 publish_parent_hold() {  # <task-id> <occurrence> <verb> <note>
   local id=$1 occurrence=$2 verb=$3 note=$4 rc=0
   PARENT_HOLD_PUBLISHED=0
   fm_parent_channel_report_captain_hold "$FM_HOME" "$STATE" \
-    "$verb [key=captain-hold-$id-$occurrence]: captain hold $id: $(fm_parent_channel_clean_note "$note")" || rc=$?
+    "$verb [key=captain-hold-$id-$occurrence]: $(fm_parent_channel_clean_note "$note" 32768)" || rc=$?
   case "$rc" in
     0|1) PARENT_HOLD_PUBLISHED=1 ;;
     *) printf 'actionable: task %s is held for the captain in this home but that did not reach the parent channel (rc=%s)\n' "$id" "$rc" >&2 ;;
@@ -804,8 +812,55 @@ verify_entry_durable() {  # <origin-or-empty> <entry>; prints "<id> <how>"
   verify_hold_durable "${resolved%% *}"
 }
 
+write_captain_decision_record() {  # <task-id> <shown-body> <compact-json>
+  local id=$1 body=$2 decision=$3 tmp
+  body=$(decode_shown_value "$body") || fail "could not decode the existing body for $id"
+  body=$(printf '%s\n' "$body" | sed '/^Captain decision record v1: /d')
+  body=${body%$'\n'}
+  body=$(printf '%s\n\nCaptain decision record v1: %s' "$body" "$decision")
+  tmp=$(umask 077; mktemp "${TMPDIR:-/tmp}/fm-captain-decision.XXXXXX") \
+    || fail 'cannot stage the captain decision record'
+  if ! printf '%s\n' "$body" > "$tmp" || ! tasks_axi update "$id" --body-file "$tmp" >/dev/null; then
+    rm -f -- "$tmp"
+    fail "could not record the captain decision on $id"
+  fi
+  rm -f -- "$tmp"
+}
+
+command_decision_event() {
+  local id=${1:-} key='' input='' decision status_file home_real
+  [ "$#" -ge 1 ] || { usage >&2; exit 2; }
+  shift
+  while [ "$#" -gt 0 ]; do
+    case "$1" in
+      --key) shift; key=${1:-} ;;
+      --input-file) shift; input=${1:-} ;;
+      *) usage >&2; exit 2 ;;
+    esac
+    shift
+  done
+  validate_slug task-id "$id"
+  validate_slug decision-key "$key"
+  [ -n "$input" ] || fail '--input-file is required'
+  [ "$FM_HOME_EXPLICIT" = 1 ] || fail 'decision-event requires an explicit FM_HOME for the owning Firstmate home'
+  home_real=$(CDPATH='' cd -- "$FM_HOME" 2>/dev/null && pwd -P) || fail 'FM_HOME is not an available Firstmate home'
+  [ -d "$home_real/data" ] && [ -d "$home_real/state" ] && [ -d "$home_real/bin" ] \
+    && [ -f "$home_real/AGENTS.md" ] \
+    || fail 'FM_HOME does not identify an initialized Firstmate home'
+  fm_decision_validate "$input" || fail 'decision event was not created'
+  decision=$(fm_decision_compact "$input") || fail 'cannot serialize the captain decision'
+  mkdir -p "$STATE" || fail 'cannot create the state directory'
+  [ -d "$STATE" ] && [ ! -L "$STATE" ] || fail 'state directory is unsafe'
+  status_file="$STATE/$id.status"
+  if [ -e "$status_file" ] || [ -L "$status_file" ]; then
+    [ -f "$status_file" ] && [ ! -L "$status_file" ] || fail "status file is unsafe: $status_file"
+  fi
+  printf 'needs-decision [key=%s]: %s\n' "$key" "$decision" >> "$status_file" \
+    || fail "cannot append the captain decision event for $id"
+}
+
 command_hold() {
-  local id=${1:-} title='' reason='' repo='' origin='' until='' show state existing_title body='' hold_kind hold_set occurrence
+  local id=${1:-} title='' reason='' repo='' origin='' until='' decision_file='' decision='' question='' show state existing_title body='' hold_kind hold_set occurrence existing_decision='' decision_tmp
   local existing_hold_kind='' existing_held='' preserve_hold_set=0
   [ "$#" -ge 1 ] || { usage >&2; exit 2; }
   shift
@@ -816,13 +871,22 @@ command_hold() {
       --repo) shift; repo=${1:-} ;;
       --origin) shift; origin=${1:-} ;;
       --until) shift; until=${1:-} ;;
+      --decision-file) shift; decision_file=${1:-} ;;
       *) usage >&2; exit 2 ;;
     esac
     shift
   done
   validate_slug task-id "$id"
-  validate_one_line reason "$reason"
-  case "$reason" in *'('*|*')'*) fail "reason must not contain parentheses (tasks-axi hold contract)" ;; esac
+  if [ -n "$decision_file" ]; then
+    fm_decision_validate "$decision_file" || fail 'captain hold was not created'
+    decision=$(fm_decision_compact "$decision_file") || fail 'cannot serialize the captain decision'
+    question=$(jq -r '.question' <<<"$decision" | tr -d '()' | tr '\r\n' '  ')
+    [ -z "$reason" ] && reason=$question
+  fi
+  if [ -n "$reason" ]; then
+    validate_one_line reason "$reason"
+    case "$reason" in *'('*|*')'*) fail "reason must not contain parentheses (tasks-axi hold contract)" ;; esac
+  fi
   if [ -n "$origin" ]; then
     validate_slug origin-id "$origin"
   fi
@@ -853,7 +917,27 @@ command_hold() {
       existing_title=$(show_field_value "$show" title)
       [ "$existing_title" = "$title" ] || fail "existing task $id has a different title"
     fi
+    if [ -z "$decision" ]; then
+      [ "$existing_hold_kind" = captain ] \
+        || fail 'a captain hold on existing work requires --decision-file unless an existing structured captain hold can be preserved'
+      existing_decision=$(decode_shown_value "$(show_field "$show" body)") \
+        || fail "could not decode the existing body for $id"
+      existing_decision=$(printf '%s\n' "$existing_decision" | sed -n 's/^Captain decision record v1: //p' | head -1)
+      [ -n "$existing_decision" ] \
+        || fail 'a captain hold without --decision-file must preserve an existing structured captain decision'
+      decision_tmp=$(umask 077; mktemp "${TMPDIR:-/tmp}/fm-captain-decision.XXXXXX") \
+        || fail 'cannot stage the existing captain decision record'
+      if ! printf '%s\n' "$existing_decision" > "$decision_tmp" || ! fm_decision_validate "$decision_tmp"; then
+        rm -f -- "$decision_tmp"
+        fail 'a captain hold without --decision-file must preserve a valid structured captain decision'
+      fi
+      decision=$(fm_decision_compact "$decision_tmp") || { rm -f -- "$decision_tmp"; fail 'cannot serialize the existing captain decision'; }
+      rm -f -- "$decision_tmp"
+      question=$(jq -r '.question' <<<"$decision" | tr -d '()' | tr '\r\n' '  ')
+      [ -z "$reason" ] && reason=$question
+    fi
   else
+    [ -n "$decision" ] || fail 'a new captain hold requires --decision-file with context, lettered options, pros and cons, and a recommendation'
     [ -n "$title" ] || fail "--title is required to create task $id"
     validate_one_line title "$title"
     if [ -z "$repo" ] && [ -n "$origin" ] && [ -f "$STATE/$origin.meta" ]; then
@@ -872,11 +956,17 @@ command_hold() {
         || fail "could not create task $id"
     fi
   fi
+  validate_one_line reason "$reason"
+  case "$reason" in *'('*|*')'*) fail "reason must not contain parentheses (tasks-axi hold contract)" ;; esac
   # Publish the timestamp before the captain-hold annotation. A concurrent
   # snapshot may see the harmless stamp by itself, but can never see a newly
   # held task without the timestamp that defines this hold lifecycle's age.
   task_show_or_fail "$id" "task $id disappeared before recording its hold-set stamp"
   write_hold_set_stamp "$id" "$(show_field "$show" body)" "$hold_set" "$preserve_hold_set"
+  if [ -n "$decision" ]; then
+    task_show_or_fail "$id" "task $id disappeared before recording its decision"
+    write_captain_decision_record "$id" "$(show_field "$TASK_SHOW_OUTPUT" body)" "$decision"
+  fi
   task_show_or_fail "$id" "task $id disappeared while recording its hold-set stamp"
   [ -n "$(body_hold_set_timestamp "$(show_field_value "$show" body)")" ] \
     || fail "task $id did not retain its hold-set stamp"
@@ -894,7 +984,7 @@ command_hold() {
   occurrence=$(( $(resolution_record_count "$(show_field "$show" body)") + 1 ))
   [ -n "$(body_hold_set_timestamp "$(show_field_value "$show" body)")" ] \
     || fail "task $id lost its hold-set stamp while being held"
-  publish_parent_hold "$id" "$occurrence" needs-decision "$reason"
+  publish_parent_hold "$id" "$occurrence" needs-decision "${decision:-$reason}"
   printf '%s\n' "$id"
 }
 
@@ -1914,6 +2004,7 @@ command_open() {  # <task-id> [--identity] [--distinguish-absent]
 
 case "${1:-}" in
   hold) shift; command_hold "$@" ;;
+  decision-event) shift; command_decision_event "$@" ;;
   answer) shift; command_answer "$@" ;;
   answers) shift; command_answers "$@" ;;
   reconcile-requests) shift; command_reconcile_requests "$@" ;;

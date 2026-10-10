@@ -807,8 +807,10 @@ test_scout_and_secondmate_scaffold() {
 }
 
 test_worker_role_scope() {
-  local kind home brief
+  local kind home brief external
   home="$TMP_ROOT/worker-role"
+  mkdir -p "$home/state" "$home/bin"
+  printf '# Test home\n' > "$home/AGENTS.md"
   for kind in direct-PR local-only scout; do
     if [ "$kind" = scout ]; then
       FM_HOME="$home" "$ROOT/bin/fm-brief.sh" "$kind" arbitrary-project-name --scout >/dev/null || fail "scout scaffold failed"
@@ -818,6 +820,30 @@ test_worker_role_scope() {
     brief="$home/data/$kind/brief.md"
     assert_no_grep '# Current worker role contract' "$brief" "$kind scaffolded a second owner of the role scope fm-spawn.sh delivers"
   done
+  brief="$home/data/direct-PR/brief.md"
+  assert_grep "FM_HOME='$home' FM_ROOT_OVERRIDE='$ROOT' FM_STATE_OVERRIDE='$home/state' '$ROOT/bin/fm-captain-hold.sh' decision-event 'direct-PR' --key '<key>' --input-file '<decision.json>'" "$brief" \
+    "worker decision instructions must use the absolute Firstmate tool and owning-home paths"
+  external="$TMP_ROOT/external-worker"
+  mkdir -p "$external"
+  fm_test_captain_decision "$TMP_ROOT/decision.json" 'Which user outcome should ship?'
+  python3 - "$brief" "$external" "$TMP_ROOT/decision.json" "$home/state/direct-PR.status" <<'PY'
+import json
+import pathlib
+import re
+import subprocess
+import sys
+
+brief, cwd, decision, status = map(pathlib.Path, sys.argv[1:])
+source = brief.read_text()
+command = re.search(r"`(FM_HOME=.*? decision-event 'direct-PR' --key '<key>' --input-file '<decision.json>')`", source)
+assert command, "the generated worker brief has no executable decision-event command"
+rendered = command.group(1).replace("--key '<key>'", "--key test-choice")
+rendered = rendered.replace("--input-file '<decision.json>'", "--input-file '" + str(decision) + "'")
+subprocess.run(["/bin/bash", "-c", rendered], cwd=cwd, check=True, capture_output=True, text=True)
+record = status.read_text().strip()
+assert record.startswith("needs-decision [key=test-choice]: "), record
+assert json.loads(record.split(": ", 1)[1])["question"] == "Which user outcome should ship?", record
+PY
   FM_HOME="$home" FM_SECONDMATE_CHARTER='Supervise assigned work.' \
     "$ROOT/bin/fm-brief.sh" supervisor --secondmate --no-projects >/dev/null || fail "secondmate scaffold failed"
   brief="$home/data/supervisor/brief.md"

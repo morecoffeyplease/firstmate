@@ -16,6 +16,11 @@ set -u
 BEARINGS="$ROOT/bin/fm-bearings-snapshot.sh"
 TASKS_AXI_BIN=$(command -v tasks-axi || true)
 TMP_ROOT=$(fm_test_tmproot fm-bearings)
+DECISION_FILE="$TMP_ROOT/captain-decision.json"
+fm_test_captain_decision "$DECISION_FILE" 'Which change should we make for users?'
+decision_json() {  # <question>
+  jq -cS --arg question "$1" '.question = $question' "$DECISION_FILE"
+}
 # Keep disposable homes outside the snapshot's fixture repo boundary even when
 # TMPDIR is inside an isolated source worktree.
 FM_ROOT_OVERRIDE="$TMP_ROOT/fixture-root"
@@ -154,7 +159,7 @@ EOF
     "mode=secondmate" \
     "home=$mate" \
     "projects=firstmate"
-  printf 'needs-decision [key=race]: pick subscribe order\n' > "$home/state/mate.status"
+  printf 'needs-decision [key=race]: %s\n' "$(decision_json 'Pick subscribe order')" > "$home/state/mate.status"
   printf 'done: an unrelated subtask finished\n' >> "$home/state/mate.status"
   fm_write_meta "$home/state/external-wait.meta" \
     "window=firstmate:fm-external-wait" \
@@ -183,7 +188,7 @@ EOF
     "window=firstmate:fm-mate" "worktree=$mate/projects/mate" "project=firstmate" \
     "harness=claude" "kind=ship" "mode=direct-PR"
   record_claude_state "$mate/state" mate idle
-  printf 'needs-decision [key=race]: pick subscribe order\n' > "$mate/state/mate.status"
+  printf 'needs-decision [key=race]: %s\n' "$(decision_json 'Pick subscribe order')" > "$mate/state/mate.status"
 }
 
 refresh_local_secondmate_ledgers() {  # <parent-home>
@@ -215,8 +220,14 @@ run() {  # <home> <fakebin> <args...>
 }
 
 run_captain() {  # <home> <fakebin> <command args...>
-  local home=$1 fakebin=$2
+  local home=$1 fakebin=$2 command=${3:-} arg needs_decision=1
   shift 2
+  if [ "$command" = hold ]; then
+    for arg in "$@"; do
+      case "$arg" in --decision-file) needs_decision=0 ;; esac
+    done
+    if [ "$needs_decision" = 1 ]; then set -- "$@" --decision-file "$DECISION_FILE"; fi
+  fi
   PATH="$fakebin:$PATH" REAL_TASKS_AXI="$TASKS_AXI_BIN" FM_ROOT_OVERRIDE="$ROOT" \
     FM_HOME="$home" FM_STATE_OVERRIDE="$home/state" FM_DATA_OVERRIDE="$home/data" \
     FM_CONFIG_OVERRIDE="$home/config" "$ROOT/bin/fm-captain-hold.sh" "$@"
@@ -489,7 +500,7 @@ EOF
   fm_write_meta "$mate/state/phase8.meta" \
     "window=firstmate:fm-phase8" "worktree=$mate/projects/phase8" "project=sample" \
     "harness=codex" "kind=ship" "mode=direct-PR"
-  printf 'working [key=phase8]: implementing Phase 8 parity\nneeds-decision [key=release]: choose release A or B\n' \
+  printf 'working [key=phase8]: implementing Phase 8 parity\nneeds-decision [key=release]: %s\n' "$(decision_json 'Choose release A or B')" \
     > "$mate/state/phase8.status"
   fakebin=$(make_fakebin "$home")
   json=$(run "$home" "$fakebin" --json)
@@ -530,7 +541,7 @@ EOF
     "window=firstmate:fm-phase8" "worktree=$mate/projects/phase8" "project=sample" \
     "harness=claude" "kind=ship" "mode=direct-PR"
   record_claude_state "$mate/state" phase8 idle
-  printf 'needs-decision [key=release]: choose release A or B\n' > "$mate/state/phase8.status"
+  printf 'needs-decision [key=release]: %s\n' "$(decision_json 'Choose release A or B')" > "$mate/state/phase8.status"
   fakebin=$(make_fakebin "$home")
   json=$(run "$home" "$fakebin" --json)
   printf '%s' "$json" | jq -e '
@@ -738,7 +749,19 @@ test_parent_decision_is_untrusted_contradiction_only() {
   make_valid_secondmate_home authority "$mate"
   append_secondmate_registry "$home" authority "$mate"
   fm_write_secondmate_meta "$home/state/authority.meta" "$mate" "firstmate:fm-authority" sample
-  printf 'needs-decision [key=stale]: old parent question\n' > "$home/state/authority.status"
+  mkdir -p "$home/projects/local-task"
+  fm_write_meta "$home/state/local-task.meta" \
+    "window=firstmate:fm-local-task" \
+    "worktree=$home/projects/local-task" \
+    "project=sample" \
+    "harness=claude" \
+    "kind=ship" \
+    "mode=ship"
+  record_claude_state "$home/state" local-task idle
+  printf 'needs-decision [key=malformed]: incomplete local question\n' > "$home/state/local-task.status"
+  printf 'needs-decision [key=stale]: %s\n' \
+    "$(jq -cS --arg question 'old parent question' '.question = $question' "$DECISION_FILE")" \
+    > "$home/state/authority.status"
   fakebin=$(make_fakebin "$home")
   refresh_local_secondmate_ledgers "$home"
   canonical=$(PATH="$fakebin:$PATH" FM_HOME="$home" FM_SNAPSHOT_NOW=2026-07-11T18:00:00Z \
@@ -750,11 +773,23 @@ test_parent_decision_is_untrusted_contradiction_only() {
       and .contradiction == true
       and (.parent_event.open_decisions | any(.key == "stale" and .verb == "needs-decision"))
   ' >/dev/null || fail "parent decision crossed structured-home authority boundary: $canonical"
+  printf '%s' "$canonical" | jq -e '
+    .tasks[] | select(.id == "local-task")
+    | .current_state.state == "blocked"
+      and .hints.blocked_event == true
+      and any(.hints.open_decisions[]; .key == "malformed" and .verb == "decision-repair")
+  ' >/dev/null || fail "malformed local decision was not retained as a blocked repair diagnostic: $canonical"
   json=$(run "$home" "$fakebin" --json)
   printf '%s' "$json" | jq -e '
     (.secondmates | any(.[]; .id == "authority" and .state == "no_active_work" and .contradiction == true))
       and (.decisions_open | any(.[]; .id == "authority") | not)
   ' >/dev/null || fail "bearings promoted a stale parent decision: $json"
+  json=$(run "$home" "$fakebin" --json)
+  printf '%s' "$json" | jq -e '
+    (.secondmates | any(.[]; .id == "authority" and .state == "no_active_work" and .contradiction == true))
+      and (.in_flight | any(.[]; .id == "local-task" and .state == "blocked" and .doing == "incomplete local question"))
+      and (.decisions_open | any(.[]; .id == "local-task") | not)
+  ' >/dev/null || fail "a malformed local decision was not retained only as a repair diagnostic: $json"
   pass "parent decisions remain untrusted contradiction evidence"
 }
 
@@ -778,7 +813,7 @@ test_parent_evidence_reconciles_by_verb_and_key() {
   printf 'paused: legacy pause without an identity\n' >> "$home/state/hold.status"
   printf 'blocked [key=vendor-release]: waiting for vendor release\n' > "$home/state/blocked.status"
   printf 'blocked: legacy block without an identity\n' >> "$home/state/blocked.status"
-  printf 'needs-decision [key=stale-route]: choose the old route\n' > "$home/state/decision.status"
+  printf 'needs-decision [key=stale-route]: %s\n' "$(decision_json 'Choose the old route')" > "$home/state/decision.status"
   printf 'working: legacy work without an identity\n' >> "$home/state/decision.status"
   cat > "$hold/data/backlog.md" <<'EOF'
 ## In flight
@@ -810,7 +845,7 @@ EOF
     "window=firstmate:fm-$child" "worktree=$decision/projects/$child" "project=sample" \
     "harness=claude" "kind=ship" "mode=direct-PR"
   record_claude_state "$decision/state" "$child" idle
-  printf 'needs-decision [key=live-route]: choose the current route\n' > "$decision/state/$child.status"
+  printf 'needs-decision [key=live-route]: %s\n' "$(decision_json 'Choose the current route')" > "$decision/state/$child.status"
   fakebin=$(make_fakebin "$home")
   refresh_local_secondmate_ledgers "$home"
   canonical=$(PATH="$fakebin:$PATH" FM_HOME="$home" FM_SNAPSHOT_NOW=2026-07-11T18:00:00Z \
@@ -864,7 +899,7 @@ EOF
     "window=firstmate:fm-parked" "worktree=$mate/projects/parked" "project=sample" \
     "harness=claude" "kind=ship" "mode=direct-PR"
   record_claude_state "$mate/state" parked idle
-  printf 'needs-decision [key=parked]: choose a route\n' > "$mate/state/parked.status"
+  printf 'needs-decision [key=parked]: %s\n' "$(decision_json 'Choose a route')" > "$mate/state/parked.status"
   fakebin=$(make_fakebin "$home")
   refresh_local_secondmate_ledgers "$home"
   canonical=$(PATH="$fakebin:$PATH" FM_HOME="$home" FM_SNAPSHOT_NOW=2026-07-11T18:00:00Z \
@@ -1474,7 +1509,7 @@ write_large_fixture() {  # <home> <count>
       "kind=scout" \
       "mode=scout" \
       "pr=https://github.com/acme/repo-$i/pull/$i"
-    printf 'needs-decision [key=q%s]: choose %s\n' "$i" "$i" > "$home/state/$id.status"
+    printf 'needs-decision [key=q%s]: %s\n' "$i" "$(decision_json "Choose $i")" > "$home/state/$id.status"
     i=$((i + 1))
   done
 }
@@ -1588,7 +1623,7 @@ test_completed_scout_report_not_pending() {
     "harness=codex" \
     "kind=scout" \
     "mode=scout"
-  printf 'needs-decision: adopt approach A or B for Lavish issue 103\n' > "$home/state/lavish-103.status"
+  printf 'needs-decision: %s\n' "$(decision_json 'Adopt approach A or B for Lavish issue 103')" > "$home/state/lavish-103.status"
   printf 'done: report ready at data/lavish-103/report.md\n' >> "$home/state/lavish-103.status"
   printf '# Lavish 103\nThe open question is whether to adopt approach A or B; this needs a captain decision.\n' > "$home/data/lavish-103/report.md"
   json=$(run "$home" "$fakebin" --json)

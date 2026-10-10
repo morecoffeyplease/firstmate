@@ -39,7 +39,16 @@ case_dir() {  # <name>
 # incremental fold agrees with it on the exact same input - the two consumption
 # strategies must never diverge on what is open.
 assert_fold() {  # <status-file> <expected> <label>
-  local f=$1 expected=$2 label=$3 full incr
+  local f=$1 expected=$2 label=$3 full incr line invalid=0
+  while IFS= read -r line || [ -n "$line" ]; do
+    if [ "$(status_line_verb "$line")" = needs-decision ] \
+      && ! fm_decision_json_is_valid "$(status_line_note "$line")"; then
+      invalid=1
+    fi
+  done < "$f"
+  if [ "$invalid" = 1 ]; then
+    expected=${expected//$'\t'needs-decision$'\t'/$'\t'decision-repair$'\t'}
+  fi
   full=$(status_open_decisions "$f")
   incr=$(status_open_decisions_incremental "$f")
   [ "$full" = "$expected" ] \
@@ -79,6 +88,16 @@ test_bare_keyless_line_still_folds_to_default() {
   printf 'resolved: went with blue\n' >> "$dir/bare.status"
   assert_fold "$dir/bare.status" "" "bare keyless resolution"
   pass "a keyless needs-decision still opens and closes the default key"
+}
+
+test_structured_event_is_admitted_as_a_decision() {
+  local dir decision expected
+  dir=$(case_dir structured-event)
+  decision='{"schema":"fm-captain-decision.v1","question":"Which route?","context":"Guests need a stable path.","user_impact":"This determines whether guests can join.","options":[{"label":"A","title":"Keep the current route","pros":["No migration."],"cons":["Older clients may fail."]},{"label":"B","title":"Use the new route","pros":["Supports all guests."],"cons":["Needs a migration."]}],"recommended_option":"B","recommendation":"Choose B to support all guests."}'
+  printf 'needs-decision [key=route]: %s\n' "$decision" > "$dir/route.status"
+  expected=$(printf 'route\tneeds-decision\t%s\n' "$decision")
+  assert_fold "$dir/route.status" "$expected" "valid structured event"
+  pass "a schema-valid event remains a captain decision"
 }
 
 test_resolution_closes_across_positions() {
@@ -264,6 +283,7 @@ test_incremental_agrees_with_full_fold_across_appends() {
 
 test_stated_key_is_honored_in_both_positions
 test_bare_keyless_line_still_folds_to_default
+test_structured_event_is_admitted_as_a_decision
 test_resolution_closes_across_positions
 test_blocked_is_position_tolerant_like_needs_decision
 test_two_colon_form_decisions_stay_distinct
@@ -323,7 +343,7 @@ EOF
     || fail "a colon-first resolution was not seen: '$(status_key_closing_verb "$f" route)'"
 
   printf 'needs-decision [key=route]: re-opened after a bad answer\n' >> "$f"
-  [ "$(status_key_closing_verb "$f" route)" = needs-decision ] \
+  [ "$(status_key_closing_verb "$f" route)" = decision-repair ] \
     || fail "a re-opened key still reported closed: '$(status_key_closing_verb "$f" route)'"
 
   printf 'resolved [key=route]: answered: south after all\n' >> "$f"
@@ -415,7 +435,7 @@ test_closing_verb_filter_preserves_terminal_chronology() {
         [ "$kind" != secondmate ] || expected=blocked
         [ "$(status_key_closing_verb "$f" "$want")" = "$expected" ] || fail "$kind/$want lost $terminal chronology"
         printf 'needs-decision: [key=%s] reopened\nnote: more cleanup\n' "$want" >> "$f"
-        [ "$(status_key_closing_verb "$f" "$want")" = needs-decision ] || fail "$kind/$want lost a post-terminal reopening"
+        [ "$(status_key_closing_verb "$f" "$want")" = decision-repair ] || fail "$kind/$want lost a post-terminal reopening"
       done
     done
   done
@@ -437,7 +457,7 @@ test_bare_prose_cannot_impersonate_a_terminal_declaration() {
       printf 'needs-decision [key=route]: A or B?\npaused: waiting on the vendor\nSteps remaining:\n %s\n' \
         "$word" > "$f"
       assert_fold "$f" "$open" "$kind: bare '$word' prose"
-      [ "$(status_key_closing_verb "$f" route)" = needs-decision ] \
+      [ "$(status_key_closing_verb "$f" route)" = decision-repair ] \
         || fail "$kind: bare '$word' prose closed a still-open key"
       f="$dir/$kind-$word-real.status"
       printf 'kind=%s\n' "$kind" > "$dir/$kind-$word-real.meta"

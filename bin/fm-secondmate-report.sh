@@ -36,10 +36,14 @@
 #   fm-secondmate-report.sh done abcdef0123456789 "audit clean"
 #   fm-secondmate-report.sh --doc done abcdef0123456789 data/x/report.md "see report"
 #   fm-secondmate-report.sh --receipt abcdef0123456789
+#   fm-secondmate-report.sh needs-decision abcdef0123456789 '{"schema":"fm-captain-decision.v1",...}'
+#   fm-secondmate-report.sh --doc needs-decision abcdef0123456789 data/x/decision.json
 set -eu
 
 CALLER_FM_HOME=${FM_HOME:-}
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=bin/fm-decision-lib.sh
+. "$SCRIPT_DIR/fm-decision-lib.sh"
 # shellcheck source=bin/fm-pending-reply-lib.sh
 . "$SCRIPT_DIR/fm-pending-reply-lib.sh"
 # shellcheck source=bin/fm-parent-channel-lib.sh
@@ -125,13 +129,25 @@ if [ "$DOC_MODE" = 1 ]; then
   DOC_PATH=$1
   shift
   NOTE=$*
+else
+  NOTE=$*
+fi
+if [ "$VERB" = needs-decision ]; then
+  if [ "$DOC_MODE" = 1 ]; then
+    fm_decision_validate "$DOC_PATH" || exit 1
+    decision=$(fm_decision_compact "$DOC_PATH") || exit 1
+  else
+    fm_decision_validate_json "$NOTE" || exit 1
+    decision=$(fm_decision_compact_json "$NOTE") || exit 1
+  fi
+  line="$VERB [$token]: $decision"
+elif [ "$DOC_MODE" = 1 ]; then
   if [ -n "$NOTE" ]; then
     line="$VERB [$token]: $(fm_parent_channel_clean_note "$NOTE") ($(fm_parent_channel_clean_note "$DOC_PATH") via-helper)"
   else
     line="$VERB [$token]: $(fm_parent_channel_clean_note "$DOC_PATH") (via-helper)"
   fi
 else
-  NOTE=$*
   line="$VERB [$token]: $(fm_parent_channel_clean_note "$NOTE") (via-helper)"
 fi
 fm_parent_channel_report_correlated "$HOME_DIR" "$STATE_DIR" "$line" || {

@@ -411,7 +411,7 @@ EOF
 
 render_return_brief() {  # <evidence-file> <blockers-file> <since-epoch>
   local evidence=$1 blockers=$2 since=$3 now record superseded superseded_at archive_dir stamp
-  local tag task key summary count routine captain live held_err last verb rows status
+  local tag task key summary question count routine captain live held_err last verb rows status
   now=$(date +%s)
   printf '=== Return brief'
   if [ -n "$since" ]; then
@@ -472,7 +472,9 @@ render_return_brief() {  # <evidence-file> <blockers-file> <since-epoch>
     while IFS="$(printf '\t')" read -r key verb summary; do
       [ "$verb" = needs-decision ] || continue
       count=$((count + 1))
-      printf '  - %s [key=%s] needs your decision: %s\n' "$task" "$key" "$(printf '%s' "$summary" | clean_field)"
+      question=$(printf '%s' "$summary" | jq -r 'if .schema == "fm-captain-decision.v1" and (.question | type == "string") then .question else empty end' 2>/dev/null || true)
+      [ -n "$question" ] || question=$summary
+      printf '  - %s [key=%s] needs your decision: %s\n' "$task" "$key" "$(printf '%s' "$question" | clean_field)"
     done <<EOF
 $(status_open_decisions "$status")
 EOF
@@ -524,7 +526,7 @@ EOF
 }
 
 return_reconcile() {
-  local evidence blockers drain_err drained wake_ack_line wake_ack_through wake_ack_generation wedge escalations lifecycle_ok=1 since contract_since superseded_record retained_record
+  local evidence blockers drain_err drained wake_ack_line wake_ack_through wake_ack_generation wedge escalations lifecycle_ok=1 since contract_since superseded_record retained_record brief
   local archived_contract tag kind text retained_live restored_epoch
   evidence=$(mktemp "$STATE/.afk-return-evidence.XXXXXX") || return 1
   blockers=$(mktemp "$STATE/.afk-return-blockers.XXXXXX") || { rm -f "$evidence"; return 1; }
@@ -668,7 +670,20 @@ EOF
     append_evidence lifecycle "status file unreadable: $STATUS_SCAN_ERROR; catch-up stays gated" "$evidence"
     lifecycle_ok=0
   fi
-  render_return_brief "$evidence" "$blockers" "$since"
+  brief=$(mktemp "$STATE/.afk-return-brief.XXXXXX") \
+    || { rm -f "$evidence" "$blockers" "$drain_err"; return 1; }
+  if ! render_return_brief "$evidence" "$blockers" "$since" > "$brief"; then
+    rm -f "$brief" "$evidence" "$blockers" "$drain_err"
+    return 1
+  fi
+  if ! cat "$brief"; then
+    append_evidence lifecycle 'recovery brief publication failed; retry catch-up before ordinary work' "$evidence"
+    write_gate "$evidence" "$blockers" || { rm -f "$brief" "$evidence" "$blockers" "$drain_err"; return 1; }
+    printf 'fm-afk-return: recovery brief could not be published; catch-up remains pending\n' >&2
+    rm -f "$brief" "$evidence" "$blockers" "$drain_err"
+    return 3
+  fi
+  rm -f "$brief"
   if [ "$HELD_READ_FAILED" -eq 1 ]; then
     append_evidence lifecycle "held set unreadable: $HELD_READ_PATH; catch-up stays gated" "$evidence"
     lifecycle_ok=0
