@@ -175,6 +175,10 @@ mate_fold = subprocess.run(["/bin/bash", "-c", '. "$1/fm-classify-lib.sh"; scan_
 assert mate_fold.returncode == 0, mate_fold.stderr
 mate_task, mate_key, mate_verb, mate_summary = mate_fold.stdout.strip().split("\t", 3)
 assert (mate_task, mate_key, mate_verb, json.loads(mate_summary)) == ("mate-child", "mate-route", "needs-decision", decision)
+snapshot["secondmate_current"]["records"][0]["decisions_open"].append({
+    "id": mate_task, "key": mate_key, "verb": mate_verb, "summary": mate_summary, "target_task_id": mate_task,
+})
+snapshot_path.write_text(json.dumps(snapshot))
 fake_gh = tmp / "fake-bin" / "gh"
 fake_gh.write_text(r'''#!/usr/bin/env python3
 import json, sys
@@ -273,6 +277,7 @@ try:
         *(("main", "worker", key, "needs-decision") for key, _, _ in parity_expectations),
         ("main", "worker", "held-call", "captain-hold"),
         ("mate", "mate-child", "mate-choice", "needs-decision"),
+        ("mate", "mate-child", "mate-route", "needs-decision"),
         ("mate", "mate-child", "mate-held", "captain-hold"),
         ("mate", None, "mate-orphan-hold", "captain-hold"),
     }, decisions
@@ -298,6 +303,10 @@ try:
     assert mate_decision["branch"] == "Unavailable", mate_decision
     assert {(work["kind"], work["url"]) for work in mate_decision["work_links"]} == {
         ("issue", issue_url), ("pull request", pr_url)}
+    mate_route = next(item for item in decisions if item["key"] == "mate-route")
+    assert (mate_route["owner"], mate_route["task"], mate_route["key"], mate_route["answerable"]) == (
+        "mate", "mate-child", "mate-route", True)
+    assert mate_route["decision"] == decision, mate_route
     orphan_mate = next(item for item in decisions if item["key"] == "mate-orphan-hold")
     assert orphan_mate["answerable"] is True and orphan_mate["direct_hold"] is True
     queue = data["queue"]
