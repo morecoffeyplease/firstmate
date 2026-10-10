@@ -732,18 +732,32 @@ function scanCodex(R, block, file) {
     } else if (entry.type === "response_item" && /_call$/.test(payload.type ?? "")) {
       const at = Date.parse(entry.timestamp ?? "") || Date.now();
       const closed = Date.parse(R.closed?.[gen] ?? "") || Infinity;
-      const commands = codexCommands(payload).filter((command) => !helperCall(command));
+      const all = codexCommands(payload);
+      const commands = all.filter((command) => !helperCall(command));
       if (!commands.length) continue;
       if (at < closed) {
         if (gen > 0 && R.log.turn === 0) R.same_turn_calls += 1;
         else violate(R, gen === 0 ? "worked-before-admission" : "worked-before-refresh", `stage ${gen === 0 ? "start" : `c${gen}`}`);
       }
       for (const skill of R.skills.filter((item) => item.required?.before_commands)) {
-        if (!commands.some((command) => commandMatches(skill.required.before_commands, command))) continue;
+        const hit = all.findIndex((command) => !helperCall(command) && commandMatches(skill.required.before_commands, command));
+        if (hit < 0) continue;
         R.triggered[skill.name] = (R.triggered[skill.name] ?? 0) + 1;
         const answer = R.answers[skill.name];
-        if (!(answer?.gen === gen && Date.parse(answer.at) <= at)) violate(R, "trigger-skipped", `${skill.name} c${gen}`);
+        if (answer?.gen === gen && Date.parse(answer.at) <= at) continue;
+        // One call can finish reading the skill and then run the command. That
+        // is in order only when the read comes first in the same call, so it
+        // is judged when the call's output is logged.
+        const readFirst = all.slice(0, hit).some((command) => helperCall(command) && command.includes(` serve `) && command.includes(q(skill.name)));
+        if (readFirst && payload.call_id) (R.log.pending ??= {})[payload.call_id] = { skill: skill.name, gen };
+        else violate(R, "trigger-skipped", `${skill.name} c${gen}`);
       }
+    } else if (entry.type === "response_item" && /_call_output$/.test(payload.type ?? "") && R.log.pending?.[payload.call_id]) {
+      const { skill, gen: due } = R.log.pending[payload.call_id];
+      delete R.log.pending[payload.call_id];
+      const answer = R.answers[skill];
+      const done = Date.parse(entry.timestamp ?? "") || Date.now();
+      if (!(answer?.gen === due && Date.parse(answer.at) <= done)) violate(R, "trigger-skipped", `${skill} c${due}`);
     }
   }
   while (R.compactions < R.log.compactions) openStage(R, "compact");

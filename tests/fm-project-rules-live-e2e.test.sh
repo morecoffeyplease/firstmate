@@ -178,6 +178,18 @@ say() { lab pane send-text "$PANE" "$1" >/dev/null && sleep 1.5 && lab pane send
 # field evaluates an expression written in this file over the task record;
 # no outside input reaches it.
 field() { "$PR" status "$STATE" "$ID" | node -e 'let s="";process.stdin.on("data",d=>s+=d).on("end",()=>{const r=JSON.parse(s);let v;try{v=new Function(...Object.keys(r),"return ("+process.argv[1]+")")(...Object.values(r))}catch{v=undefined}process.stdout.write(String(v))})' "$1"; }
+# A message typed while the tool is still compacting is summarized away with
+# the rest of the history, so the next stage is sent only once the compaction
+# is on record.
+wait_compactions() {  # <count>
+  local waited=0
+  while [ "$waited" -lt 300 ]; do
+    "$PR" detect "$STATE" "$ID" >/dev/null 2>&1 || true
+    [ "$(field compactions)" -lt "$1" ] 2>/dev/null || { sleep 20; return 0; }
+    sleep 5; waited=$((waited + 5))
+  done
+  fail "$TOOL $VERSION: the forced compaction never appeared on record"
+}
 wait_status() {  # <line> <seconds>
   local waited=0
   while [ "$waited" -lt "$2" ]; do
@@ -198,6 +210,14 @@ stage_task() {  # <stage letter>
   local trigger=
   [ -z "$TRIGGER" ] || trigger="Then run exactly \`$TRIGGER\` and append the last line it prints."
   printf '%s' "Stage $1. First do whatever your project rules gate requires right now. Then, without searching and without opening any instruction or rule file yourself, append to $REPORT a section headed '## $1' listing every token of the form FMQ-<LETTERS>-<digits> literally visible in your context, one per line. $trigger $(children_task | sed "s/\\\$STAGE/$1/g") Never tell a child any token. Then append the status line 'working: $1 written' and end your turn."
+}
+
+# A long line typed into a busy terminal can lose its start, so a later stage
+# is written to a file and only a short pointer is typed.
+send_stage() {  # <letter>
+  local file="$HOME_DIR/data/$ID/stage-$1.md"
+  stage_task "$1" > "$file"
+  say "Read the file $file now and do exactly what it says."
 }
 
 spawn_worker() {  # <tool> <run>
@@ -248,9 +268,9 @@ check_stage() {
     assert_equals true "$(field 'Object.values(triggered).some((n) => n > 0)')" "$TOOL $VERSION stage $stage: the triggering command must be recognized in the tool's real hook or log format"
   fi
   [ "$TOOL" != claude ] || assert_contains "$(grep '^EXPLORE:' "$REPORT" | tail -1)" "refused" "$TOOL $VERSION stage $stage: an Explore child must be refused"
-  "$PR" ready "$STATE" "$ID" || fail "$TOOL $VERSION stage $stage: readiness must pass once the stage is answered"
   alarms=$("$PR" scan "$STATE" "$ID" | grep -v ' same-turn-calls ' || true)
   assert_equals "" "$alarms" "$TOOL $VERSION stage $stage: the scan of the tool's own log must raise no alarm"
+  alarms=$("$PR" ready "$STATE" "$ID" 2>&1) || fail "$TOOL $VERSION stage $stage: readiness must pass once the stage is answered: $alarms"
   assert_equals true "$(field "log.evidence[$gen]")" "$TOOL $VERSION stage $stage: the tool's own log must hold the whole block for generation $gen"
   pass "$TOOL $VERSION stage $stage: report and log agree (block $(field block_bytes) bytes, generation $gen)"
 }
@@ -370,8 +390,8 @@ for TOOL_NAME in $TOOLS; do
     spawn_worker "$TOOL_NAME" "$run"
     check_stage A 0
     if [ "$run" -eq 1 ]; then check_independent_coverage; check_prepare; check_sizes; check_refused_launch "$TOOL_NAME"; fi
-    say "/compact"; sleep 45
-    say "$(stage_task B)"
+    say "/compact"; wait_compactions 1
+    send_stage B
     check_stage B 1
     say "$([ "$TOOL" = claude ] && printf /exit || printf /quit)"
     run=$((run + 1))
@@ -387,8 +407,8 @@ for TOOL_NAME in $TOOLS; do
   auto_gen=$(field compactions)
   if [ "$auto_gen" -ge 1 ] 2>/dev/null; then
     check_stage C "$auto_gen"
-    say "/compact"; sleep 45
-    say "$(stage_task D)"
+    say "/compact"; wait_compactions "$((auto_gen + 1))"
+    send_stage D
     check_stage D "$((auto_gen + 1))"
     printf '%s\t%s\tautomatic\tpass\n' "$TOOL" "$VERSION" >> "$RESULT"
   else

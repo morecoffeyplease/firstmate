@@ -301,7 +301,7 @@ codex_fixture() {
   fm_write_meta "$STATE/t1.meta" "worktree=$COPY" "harness=codex" "kind=ship" "spawn_gen=s$(( $(date +%s) - 60 )).1.1"
 }
 codex_log() {
-  node -e 'const fs=require("fs");const [state,copy,bin,file,js]=process.argv.slice(1);const block=fs.readFileSync(state+"/t1.project-rules.d/block.txt","utf8");const dev=(t)=>({type:"response_item",payload:{type:"message",role:"developer",content:[{type:"input_text",text:t}]}});const agents=()=>({type:"response_item",payload:{type:"message",role:"user",content:[{type:"input_text",text:"# AGENTS.md instructions for "+copy+"\n\n# Agents core\n\nNever rename the widget.\n"}]}});const call=(cmd,ts)=>({type:"response_item",timestamp:ts||new Date().toISOString(),payload:{type:"custom_tool_call",name:"exec",input:"text(await tools.exec_command({cmd:"+JSON.stringify(cmd)+"}));\n"}});const started=()=>({type:"event_msg",payload:{type:"task_started"}});const event=()=>({type:"event_msg",payload:{type:"item_completed",item:{type:"ContextCompaction"}}});const compacted=(history)=>({type:"compacted",payload:{replacement_history:history||[]}});const rows=eval(js);fs.appendFileSync(file,rows.map(r=>typeof r==="string"?r:JSON.stringify(r)).join("\n")+(process.env.NO_NEWLINE?"":"\n"))' "$STATE" "$COPY" "$ROOT/bin" "$LOG" "$1"
+  node -e 'const fs=require("fs");const [state,copy,bin,file,js]=process.argv.slice(1);const block=fs.readFileSync(state+"/t1.project-rules.d/block.txt","utf8");const dev=(t)=>({type:"response_item",payload:{type:"message",role:"developer",content:[{type:"input_text",text:t}]}});const agents=()=>({type:"response_item",payload:{type:"message",role:"user",content:[{type:"input_text",text:"# AGENTS.md instructions for "+copy+"\n\n# Agents core\n\nNever rename the widget.\n"}]}});const q=(t)=>"\x27"+t+"\x27";const call=(cmd,ts)=>({type:"response_item",timestamp:ts||new Date().toISOString(),payload:{type:"custom_tool_call",name:"exec",input:"text(await tools.exec_command({cmd:"+JSON.stringify(cmd)+"}));\n"}});const started=()=>({type:"event_msg",payload:{type:"task_started"}});const event=()=>({type:"event_msg",payload:{type:"item_completed",item:{type:"ContextCompaction"}}});const compacted=(history)=>({type:"compacted",payload:{replacement_history:history||[]}});const rows=eval(js);fs.appendFileSync(file,rows.map(r=>typeof r==="string"?r:JSON.stringify(r)).join("\n")+(process.env.NO_NEWLINE?"":"\n"))' "$STATE" "$COPY" "$ROOT/bin" "$LOG" "$1"
 }
 
 test_codex_scan_start_and_mid_turn_compaction() {
@@ -366,6 +366,25 @@ test_codex_scan_reads_every_command_shape() {
     assert_contains "$("$PR" scan "$STATE" t1)" "trigger-skipped tests c0" "Codex command shape $n must be recognized"
   done
   pass "the Codex scan finds a triggering command in every call shape: JSON arguments, batches, each quote style, a variable, and a shell action"
+}
+
+test_codex_read_then_run_in_one_call_is_in_order() {
+  local read_cmd='"await tools.exec_command({cmd:"+JSON.stringify(q(bin+"/fm-project-rules.sh")+" serve "+q(state)+" "+q("t1")+" "+q("tests")+" abc")+"});"'
+  local run_cmd='"await tools.exec_command({cmd:\"bun run test\"});"'
+  admit xbatch codex >/dev/null; codex_fixture xbatch
+  codex_log '[started(),dev(block),agents()]'; close_stage
+  codex_log "[{type:'response_item',timestamp:new Date().toISOString(),payload:{type:'custom_tool_call',call_id:'c1',name:'exec',input:$read_cmd+$run_cmd}}]"
+  "$PR" detect "$STATE" t1
+  assert_equals 1 "$(field triggered.tests)" "the command inside the batched call must be recognized"
+  assert_equals 0 "$(field violations.length)" "a call that reads the skill and then runs the command is not judged before its output"
+  read_all tests >/dev/null
+  codex_log "[{type:'response_item',timestamp:new Date(Date.now()+2000).toISOString(),payload:{type:'custom_tool_call_output',call_id:'c1',output:'ok'}}]"
+  assert_equals "" "$("$PR" scan "$STATE" t1)" "a skill read to the end inside the same call, before the command, is in order"
+  admit xbatch2 codex >/dev/null; codex_fixture xbatch2
+  codex_log '[started(),dev(block),agents()]'; close_stage
+  codex_log "[{type:'response_item',timestamp:new Date().toISOString(),payload:{type:'custom_tool_call',call_id:'c2',name:'exec',input:$run_cmd+$read_cmd}}]"
+  assert_contains "$("$PR" scan "$STATE" t1)" "trigger-skipped tests c0" "a call that runs the command before reading the skill is a violation"
+  pass "one Codex call that finishes the skill and then runs its command is accepted, and the reverse order is not"
 }
 
 test_codex_scan_is_idempotent_and_cursor_safe() {
@@ -580,6 +599,7 @@ test_claude_scan_reports_changed_rules_and_stale_stage
 test_codex_scan_start_and_mid_turn_compaction
 test_codex_scan_between_turn_compaction_and_triggers
 test_codex_scan_reads_every_command_shape
+test_codex_read_then_run_in_one_call_is_in_order
 test_codex_scan_is_idempotent_and_cursor_safe
 test_codex_missing_evidence_and_witness
 test_a_slow_pattern_counts_as_a_match
