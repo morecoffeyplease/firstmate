@@ -449,13 +449,12 @@ test_hook_allows_when_another_session_holds_fleet_lock() {
   sleep 60 &
   owner=$!
   printf '%s\n' "$owner" > "$dir/state/.lock"
+  ln -s /bin/bash "$dir/claude"
   fakebin=$(fm_fakebin "$TMP_ROOT/read-only-lock-bin")
   cat > "$fakebin/ps" <<EOF
 #!/usr/bin/env bash
 case " \$* " in
-  *" -p $owner "*)
-    case " \$* " in *comm=*) printf 'codex\\n' ;; *) printf 'codex\\n' ;; esac
-    ;;
+  *" -p $owner "*) printf 'codex\\n' ;;
   *) exec /bin/ps "\$@" ;;
 esac
 EOF
@@ -463,24 +462,21 @@ EOF
   for mode in default claude; do
     if [ "$mode" = claude ]; then
       out=$(printf '{"stop_hook_active":false,"session_id":"sess-readonly-mode"}' \
-        | PATH="$fakebin:$BLIND_BIN:$PATH" CLAUDECODE=1 FM_HOME="$dir" FM_CLAUDE_AUTOARM_SYNC_WAIT_MS=100 \
-          bash "$dir/bin/fm-turnend-guard.sh" --claude 2>&1); status=$?
+        | PATH="$fakebin:$BLIND_BIN:$PATH" CLAUDECODE=1 FM_HOME="$dir" \
+          "$dir/claude" -c "\"\$FM_HOME/bin/fm-turnend-guard.sh\" --claude" 2>&1); status=$?
+      assert_contains "$out" "SUPERVISION IS OWNED BY ANOTHER LIVE SESSION" \
+        "Claude lock-refused stop must explain the verified ownership boundary"
     else
       out=$(printf '{"stop_hook_active":false,"session_id":"sess-readonly-mode"}' \
         | PATH="$fakebin:$BLIND_BIN:$PATH" CLAUDECODE=1 FM_HOME="$dir" \
           bash "$dir/bin/fm-turnend-guard.sh" 2>&1); status=$?
-    fi
-    expect_code 0 "$status" "$mode session refused the live fleet lock must allow its stop"
-    if [ "$mode" = claude ]; then
-      assert_contains "$out" "SUPERVISION IS OWNED BY ANOTHER LIVE SESSION" \
-        "Claude lock-refused stop must explain the verified ownership boundary"
-    else
       [ -z "$out" ] || fail "$mode read-only lock-refused stop should be silent, got: $out"
     fi
+    expect_code 0 "$status" "$mode session refused the live fleet lock must allow its stop"
   done
   kill "$owner" 2>/dev/null || true
   wait "$owner" 2>/dev/null || true
-  pass "fm-turnend-guard: default lock-refused stops stay silent and Claude reports verified foreign ownership"
+  pass "fm-turnend-guard: default stays silent and Claude reports verified foreign ownership"
 }
 
 test_hook_blocks_lock_owner_without_watcher() {
