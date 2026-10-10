@@ -834,8 +834,8 @@ fm_busy_cursor_turn_state() {  # <transcript>
 
 # Codex's own rollout transcript is append-only JSONL under
 # <CODEX_HOME>/sessions/YYYY/MM/DD/rollout-*.jsonl. fm-spawn records the
-# sessions root, exact worktree, a unique binding id, and all matching prior
-# rollout files so a reused worktree never reads its previous worker's turns.
+# sessions root, exact worktree, and a unique binding id. Existing tasks resolve
+# their rollout from the task spawn generation on read.
 fm_busy_codex_binding_path() {  # <state-dir> <id>
   printf '%s/%s.codex-session' "$1" "$2"
 }
@@ -857,16 +857,6 @@ fm_busy_codex_binding_field() {  # <state-dir> <id> <key>
   return 1
 }
 
-fm_busy_codex_binding_has_prior() {  # <state-dir> <id> <rollout>
-  local path line
-  path=$(fm_busy_codex_binding_path "$1" "$2")
-  [ -f "$path" ] || return 1
-  while IFS= read -r line || [ -n "$line" ]; do
-    [ "$line" = "prior_rollout=$3" ] && return 0
-  done < "$path"
-  return 1
-}
-
 # fm_busy_codex_meta_field: read exactly one nonempty key from task metadata.
 fm_busy_codex_meta_field() {  # <meta-file> <key>
   local file=$1 key=$2 count value
@@ -878,62 +868,20 @@ fm_busy_codex_meta_field() {  # <meta-file> <key>
   printf '%s' "$value"
 }
 
-# Existing Codex tasks predate rollout binding. Bind only when task metadata
-# names one canonical worktree and exactly one existing rollout has that exact
-# cwd. Refuse symlinked records/paths and ambiguous worktrees, matching spawn's
-# exact-identity rule without guessing which old conversation belongs to it.
-fm_busy_codex_bind_existing_rollout() {  # <state-dir> <id>
-  local state=$1 id=$2 meta binding workspace canonical_workspace codex_home sessions_root
-  local candidate selected='' count=0 temp
-  case "$id" in ''|*[!A-Za-z0-9._-]*) return 1 ;; esac
-  meta="$state/$id.meta"
-  binding=$(fm_busy_codex_binding_path "$state" "$id")
-  [ ! -e "$binding" ] && [ ! -L "$binding" ] || return 1
-  workspace=$(fm_busy_codex_meta_field "$meta" worktree) || return 1
-  case "$workspace" in /*) ;; *) return 1 ;; esac
-  [ -d "$workspace" ] && [ ! -L "$workspace" ] || return 1
-  canonical_workspace=$(cd "$workspace" 2>/dev/null && pwd -P) || return 1
-  [ "$canonical_workspace" = "$workspace" ] || return 1
-  codex_home=${CODEX_HOME:-$HOME/.codex}
-  [ -d "$codex_home" ] || return 1
-  sessions_root=$(cd "$codex_home" 2>/dev/null && pwd -P)/sessions
-  [ -d "$sessions_root" ] && [ ! -L "$sessions_root" ] || return 1
-  while IFS= read -r candidate; do
-    [ -n "$candidate" ] || continue
-    count=$((count + 1))
-    selected=$candidate
-  done <<EOF
-$(fm_busy_codex_matching_rollouts "$sessions_root" "$workspace")
-EOF
-  [ "$count" -eq 1 ] || return 1
-  [ -f "$selected" ] && [ ! -L "$selected" ] || return 1
-  case "$selected" in "$sessions_root"/*) ;; *) return 1 ;; esac
-  temp=$(mktemp "$state/.$id.codex-session.XXXXXX") || return 1
-  {
-    printf 'sessions_root=%s\n' "$sessions_root"
-    printf 'workspace_root=%s\n' "$workspace"
-    printf 'binding_id=existing.%s.%s\n' "$$" "$(date +%s)"
-  } > "$temp" || { rm -f -- "$temp"; return 1; }
-  if ! ln "$temp" "$binding" 2>/dev/null; then
-    rm -f -- "$temp"
-    return 1
-  fi
-  rm -f -- "$temp"
-  return 0
-}
-
-# fm_busy_codex_matching_rollouts: main rollout files whose session_meta cwd is
-# exactly this task's worktree. A depth-bounded walk excludes any future nested
-# helper logs and reads only the first JSONL record in each file.
-fm_busy_codex_matching_rollouts() {  # <sessions-root> <workspace-root>
-  local root=$1 workspace=$2
-  [ -d "$root" ] || return 1
+# Resolve an old Codex task without mutating state. Rollout names carry their
+# start time; among this task's rollouts, the newest write is authoritative.
+# Multiple files changing during inspection or an equal newest write time is ambiguous.
+fm_busy_codex_select_rollout() {  # <sessions-root> <workspace-root> <spawn-epoch>
+  local root=$1 workspace=$2 spawn_epoch=$3
+  [ -d "$root" ] && [ ! -L "$root" ] || return 1
   command -v node >/dev/null 2>&1 || return 1
-  node - "$root" "$workspace" <<'NODE'
+  node - "$root" "$workspace" "$spawn_epoch" <<'NODE'
 const fs = require("fs");
 const path = require("path");
-const [root, workspace] = process.argv.slice(2);
-
+const [root, workspace, spawnEpochText] = process.argv.slice(2);
+const spawnEpoch = Number(spawnEpochText);
+if (!Number.isSafeInteger(spawnEpoch) || spawnEpoch < 0) process.exit(1);
+const candidates = [];
 function directories(parent) {
   try {
     return fs.readdirSync(parent, { withFileTypes: true })
@@ -943,24 +891,36 @@ function directories(parent) {
     return [];
   }
 }
-
+function rolloutStart(file) {
+  const match = path.basename(file).match(/^rollout-(\d{4}-\d\d-\d\d)T(\d\d)-(\d\d)-(\d\d)(?:[.-]|$)/);
+  if (!match) return NaN;
+  const [year, month, day] = match[1].split("-").map(Number);
+  return new Date(year, month - 1, day, Number(match[2]), Number(match[3]), Number(match[4])).getTime() / 1000;
+}
 function matchingWorkspace(file) {
   let descriptor;
   try {
+    const before = fs.statSync(file, { bigint: true });
     descriptor = fs.openSync(file, "r");
     const buffer = Buffer.alloc(65536);
     const length = fs.readSync(descriptor, buffer, 0, buffer.length, 0);
     const newline = buffer.indexOf(10, 0);
-    if (newline < 0 || newline >= length) return false;
+    if (newline < 0 || newline >= length) return null;
     const record = JSON.parse(buffer.subarray(0, newline).toString("utf8"));
-    return record?.type === "session_meta" && record?.payload?.cwd === workspace;
+    const after = fs.statSync(file, { bigint: true });
+    const matches = record?.type === "session_meta" && record?.payload?.cwd === workspace;
+    if (!matches) return null;
+    return {
+      mtimeNs: after.mtimeNs,
+      file,
+      volatile: before.size !== after.size || before.mtimeNs !== after.mtimeNs,
+    };
   } catch {
-    return false;
+    return null;
   } finally {
     if (descriptor !== undefined) fs.closeSync(descriptor);
   }
 }
-
 for (const year of directories(root)) {
   for (const month of directories(year)) {
     for (const day of directories(month)) {
@@ -973,31 +933,62 @@ for (const year of directories(root)) {
       for (const entry of entries) {
         if (!entry.isFile() || !entry.name.startsWith("rollout-") || !entry.name.endsWith(".jsonl")) continue;
         const file = path.join(day, entry.name);
-        if (matchingWorkspace(file)) process.stdout.write(`${file}\n`);
+        const started = rolloutStart(file);
+        if (!Number.isFinite(started) || started < spawnEpoch) continue;
+        const match = matchingWorkspace(file);
+        if (match) candidates.push(match);
       }
     }
   }
 }
+if (!candidates.length) process.exit(1);
+if (candidates.filter((candidate) => candidate.volatile).length > 1) {
+  process.stdout.write("unknown-concurrent\n");
+  process.exit(0);
+}
+candidates.sort((left, right) => left.mtimeNs < right.mtimeNs ? 1 : left.mtimeNs > right.mtimeNs ? -1 : 0);
+if (candidates.length > 1 && candidates[0].mtimeNs === candidates[1].mtimeNs) process.exit(1);
+process.stdout.write(`${candidates[0].file}\n`);
 NODE
 }
 
-# fm_busy_codex_rollout_log: the one new rollout for this task's exact
-# worktree, or failure if there is no candidate, more than one candidate, or
-# the binding is absent. Ambiguity remains unknown instead of guessing.
+# fm_busy_codex_rollout_log: resolve the newest rollout started since this
+# task's recorded spawn generation for its exact worktree.
 fm_busy_codex_rollout_log() {  # <state-dir> <id>
-  local root workspace candidate selected=''
-  root=$(fm_busy_codex_binding_field "$1" "$2" sessions_root) || return 1
-  workspace=$(fm_busy_codex_binding_field "$1" "$2" workspace_root) || return 1
-  [ -n "$(fm_busy_codex_binding_field "$1" "$2" binding_id 2>/dev/null || true)" ] || return 1
-  while IFS= read -r candidate; do
-    [ -n "$candidate" ] || continue
-    fm_busy_codex_binding_has_prior "$1" "$2" "$candidate" && continue
-    [ -z "$selected" ] || return 1
-    selected=$candidate
-  done <<EOF
-$(fm_busy_codex_matching_rollouts "$root" "$workspace")
-EOF
-  [ -n "$selected" ] && [ -f "$selected" ] && [ ! -L "$selected" ] || return 1
+  local state=$1 id=$2 root workspace meta spawn_gen spawn_epoch codex_home canonical_workspace
+  meta="${FM_CREW_STATE_META_OVERRIDE:-$state/$id.meta}"
+  spawn_gen=$(fm_busy_codex_meta_field "$meta" spawn_gen) || return 1
+  case "$spawn_gen" in s[0-9]*.*.*) ;; *) return 1 ;; esac
+  spawn_epoch=${spawn_gen#s}
+  spawn_epoch=${spawn_epoch%%.*}
+  case "$spawn_epoch" in ''|*[!0-9]*) return 1 ;; esac
+  if [ -e "$(fm_busy_codex_binding_path "$state" "$id")" ] || [ -L "$(fm_busy_codex_binding_path "$state" "$id")" ]; then
+    local binding
+    binding=$(fm_busy_codex_binding_path "$state" "$id")
+    [ -f "$binding" ] && [ ! -L "$binding" ] || return 1
+    root=$(fm_busy_codex_binding_field "$state" "$id" sessions_root) || return 1
+    workspace=$(fm_busy_codex_binding_field "$state" "$id" workspace_root) || return 1
+  else
+    workspace=$(fm_busy_codex_meta_field "$meta" worktree) || return 1
+    case "$workspace" in /*) ;; *) return 1 ;; esac
+    [ -d "$workspace" ] && [ ! -L "$workspace" ] || return 1
+    canonical_workspace=$(cd "$workspace" 2>/dev/null && pwd -P) || return 1
+    [ "$canonical_workspace" = "$workspace" ] || return 1
+    codex_home=${CODEX_HOME:-$HOME/.codex}
+    [ -d "$codex_home" ] || return 1
+    root=$(cd "$codex_home" 2>/dev/null && pwd -P)/sessions
+  fi
+  case "$root" in /*) ;; *) return 1 ;; esac
+  [ -d "$root" ] && [ ! -L "$root" ] || return 1
+  canonical_workspace=$(cd "$workspace" 2>/dev/null && pwd -P) || return 1
+  [ "$canonical_workspace" = "$workspace" ] || return 1
+  local canonical_root
+  canonical_root=$(cd "$root" 2>/dev/null && pwd -P) || return 1
+  [ "$canonical_root" = "$root" ] || return 1
+  local selected
+  selected=$(fm_busy_codex_select_rollout "$root" "$workspace" "$spawn_epoch") || return 1
+  [ "$selected" != unknown-concurrent ] || return 1
+  [ -f "$selected" ] && [ ! -L "$selected" ] || return 1
   case "$selected" in "$root"/*) ;; *) return 1 ;; esac
   printf '%s' "$selected"
 }
@@ -1267,10 +1258,6 @@ fm_busy_codex_herdr_classify() {  # <target> <id> <state-dir>
   if [ "$process_state" != agent ]; then
     printf 'unknown codex-process-unverified'
     return 0
-  fi
-  if [ ! -e "$(fm_busy_codex_binding_path "$state" "$id")" ] \
-    && [ ! -L "$(fm_busy_codex_binding_path "$state" "$id")" ]; then
-    fm_busy_codex_bind_existing_rollout "$state" "$id" >/dev/null 2>&1 || true
   fi
   rollout=$(fm_busy_codex_rollout_log "$state" "$id") || {
     printf 'unknown codex-rollout-unavailable'

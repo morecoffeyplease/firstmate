@@ -2,7 +2,7 @@
 # Prompt-submitting live guard for Codex current-state classification on Herdr.
 #
 # This opt-in test launches the installed Codex in an isolated named Herdr lab
-# session, checks on-read binding for an existing worker, normal turns, a long
+# session, checks read-only discovery for an existing worker, normal turns, a long
 # shell command, an actual approval prompt, and ordinary prose that mentions input.
 # It spends model tokens and never targets the default Herdr session.
 set -u
@@ -18,7 +18,7 @@ pass() { printf 'ok - %s\n' "$1"; }
 note() { printf '# %s\n' "$1"; }
 
 HERDR_LAB_HELPER="$ROOT/bin/fm-herdr-lab.sh"
-HERDR_LAB_SESSION=$("$HERDR_LAB_HELPER" name fm-52-codex-state-live)
+HERDR_LAB_SESSION=$("$HERDR_LAB_HELPER" name fm-52-codex-state)
 SCRATCH="$ROOT/.fm-codex-herdr-live-$$"
 SHIM="$SCRATCH/fakebin"
 STATE="$SCRATCH/state"
@@ -66,6 +66,7 @@ worktree=$SCRATCH/workspace
 kind=ship
 harness=codex
 backend=herdr
+spawn_gen=s$(date +%s).$$.1
 herdr_session=$HERDR_LAB_SESSION
 herdr_pane_id=$PANE
 EOF
@@ -146,10 +147,10 @@ if [ -e "$STATE/codex.codex-session" ]; then
 fi
 send_turn 'Use the shell to run sleep 8, then reply with exactly READY and make no changes.'
 wait_state working 60
-if [ ! -s "$STATE/codex.codex-session" ]; then
-  fail "reading a pre-existing live Codex worker did not write its rollout binding"
+if [ -e "$STATE/codex.codex-session" ] || [ -L "$STATE/codex.codex-session" ]; then
+  fail "reading a pre-existing live Codex worker wrote a rollout binding"
 fi
-pass "real $CODEX_VERSION worker spawned without a binding is discovered on read"
+pass "real $CODEX_VERSION worker spawned without a binding is discovered read-only"
 WORKING=$(state_line)
 case "$WORKING" in
   *"state: working"*"codex-rollout"*) pass "real $CODEX_VERSION reports a started Codex turn as working" ;;

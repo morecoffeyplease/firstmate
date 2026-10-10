@@ -341,8 +341,9 @@
 # the tracked project-scope .cursor/hooks.json in its own home, whose stop-hook
 # park owns that home's supervision (docs/supervision-protocols/cursor.md).
 # Codex on Herdr writes its turn lifecycle to its own rollout JSONL; the spawn
-# binds the pane to one new rollout by exact worktree and excludes prior files
-# in state/<id>.codex-session. Other Codex backends remain unknown until their
+# records the sessions root, exact worktree, and binding id in
+# state/<id>.codex-session. The reader filters by spawn generation and selects
+# the newest write. Other Codex backends remain unknown until their
 # own live-verified semantic source is wired.
 # claude is the one harness whose pre-launch setup can REFUSE the spawn: before
 # any per-task state exists, and before its worktree .claude/settings.local.json
@@ -4451,11 +4452,6 @@ EOF
       printf 'sessions_root=%s\n' "$CODEX_SESSIONS_ROOT"
       printf 'workspace_root=%s\n' "$WT"
       printf 'binding_id=%s\n' "$CODEX_BINDING_ID"
-      while IFS= read -r CODEX_PRIOR_ROLLOUT; do
-        [ -n "$CODEX_PRIOR_ROLLOUT" ] && printf 'prior_rollout=%s\n' "$CODEX_PRIOR_ROLLOUT"
-      done <<EOF
-$(fm_busy_codex_matching_rollouts "$CODEX_SESSIONS_ROOT" "$WT" || true)
-EOF
     } >"$STATE/$ID.codex-session"
     ;;
   grok*)

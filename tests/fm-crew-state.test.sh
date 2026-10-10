@@ -50,6 +50,7 @@ new_codex_case() {  # <name> <id>
     "kind=ship" \
     "harness=codex" \
     "backend=herdr" \
+    "spawn_gen=s1791529200.101.1" \
     "herdr_session=$session" \
     "herdr_workspace_id=w1" \
     "herdr_tab_id=w1:t1" \
@@ -89,8 +90,8 @@ run_codex_state() {  # <case-dir> <id> [pane-capture]
 write_codex_rollout() {  # <case-dir> <id> <jsonl-records>
   local dir=$1 id=$2 records=$3
   printf '%s\n' "{\"type\":\"session_meta\",\"payload\":{\"cwd\":\"$dir/worktree\"}}" \
-    > "$dir/codex/sessions/2026/10/09/rollout-test.jsonl"
-  printf '%b\n' "$records" >> "$dir/codex/sessions/2026/10/09/rollout-test.jsonl"
+    > "$dir/codex/sessions/2026/10/09/rollout-2026-10-09T00-00-00-test.jsonl"
+  printf '%b\n' "$records" >> "$dir/codex/sessions/2026/10/09/rollout-2026-10-09T00-00-00-test.jsonl"
 }
 
 write_idle_record() {  # <case-dir> <id>
@@ -235,20 +236,67 @@ Press enter to confirm or esc to cancel')
   pass 'Codex pane capture reports a needs-input prompt as blocked'
 }
 
-test_codex_herdr_ignores_previous_rollout() {
+test_codex_herdr_excludes_pre_spawn_rollouts() {
   local dir out
   dir=$(new_codex_case codex-prior codex-prior)
+  mkdir -p "$dir/codex/sessions/2026/10/08"
+  rm -f "$dir/state/codex-prior.codex-session"
   printf '%s\n%s\n' \
     "{\"type\":\"session_meta\",\"payload\":{\"cwd\":\"$dir/worktree\"}}" \
     '{"type":"event_msg","payload":{"type":"task_started","turn_id":"old-turn"}}' \
-    > "$dir/codex/sessions/2026/10/09/rollout-prior.jsonl"
-  printf 'prior_rollout=%s/codex/sessions/2026/10/09/rollout-prior.jsonl\n' "$dir" \
-    >> "$dir/state/codex-prior.codex-session"
+    > "$dir/codex/sessions/2026/10/08/rollout-2026-10-08T23-59-59-prior.jsonl"
   write_codex_rollout "$dir" codex-prior \
     '{"type":"event_msg","payload":{"type":"task_started","turn_id":"turn-1"}}\n{"type":"event_msg","payload":{"type":"task_complete","turn_id":"turn-1"}}'
   out=$(run_codex_state "$dir" codex-prior)
   assert_contains "$out" 'state: idle' 'a prior active rollout must not bind to a replacement worker'
-  pass 'Codex rollout binding excludes the previous worker incarnation'
+  pass 'Codex rollout resolution excludes pre-spawn sessions without a sidecar'
+}
+
+test_codex_reused_worktree_selects_latest_rollout_after_spawn_read_only() {
+  local dir out current newer binding
+  dir=$(new_codex_case codex-reused codex-reused)
+  binding="$dir/state/codex-reused.codex-session"
+  rm -f "$binding"
+  mkdir -p "$dir/codex/sessions/2026/10/08"
+  printf '%s\n%s\n' \
+    "{\"type\":\"session_meta\",\"payload\":{\"cwd\":\"$dir/worktree\"}}" \
+    '{"type":"event_msg","payload":{"type":"task_started","turn_id":"old"}}' \
+    > "$dir/codex/sessions/2026/10/08/rollout-2026-10-08T23-59-59-old.jsonl"
+  current="$dir/codex/sessions/2026/10/09/rollout-2026-10-09T00-00-01-current.jsonl"
+  newer="$dir/codex/sessions/2026/10/09/rollout-2026-10-09T00-00-02-restart.jsonl"
+  printf '%s\n%s\n' \
+    "{\"type\":\"session_meta\",\"payload\":{\"cwd\":\"$dir/worktree\"}}" \
+    '{"type":"event_msg","payload":{"type":"task_started","turn_id":"current"}}' > "$current"
+  printf '%s\n%s\n%s\n' \
+    "{\"type\":\"session_meta\",\"payload\":{\"cwd\":\"$dir/worktree\"}}" \
+    '{"type":"event_msg","payload":{"type":"task_started","turn_id":"restart"}}' \
+    '{"type":"event_msg","payload":{"type":"task_complete","turn_id":"restart"}}' > "$newer"
+  touch -t 202610090000.01 "$current"
+  touch -t 202610090000.02 "$newer"
+  out=$(run_codex_state "$dir" codex-reused)
+  assert_contains "$out" 'state: idle' 'the newest restarted Codex rollout wins for a reused worktree'
+  [ ! -e "$binding" ] || fail 'reading current state must not create a Codex binding sidecar'
+  pass 'Codex state selects the newest post-spawn rollout without writing on read'
+}
+
+test_codex_simultaneous_rollouts_stay_unknown() {
+  local dir out first second
+  dir=$(new_codex_case codex-simultaneous codex-simultaneous)
+  rm -f "$dir/state/codex-simultaneous.codex-session"
+  first="$dir/codex/sessions/2026/10/09/rollout-2026-10-09T00-00-03-first.jsonl"
+  second="$dir/codex/sessions/2026/10/09/rollout-2026-10-09T00-00-04-second.jsonl"
+  printf '%s\n%s\n' \
+    "{\"type\":\"session_meta\",\"payload\":{\"cwd\":\"$dir/worktree\"}}" \
+    '{"type":"event_msg","payload":{"type":"task_started","turn_id":"first"}}' > "$first"
+  printf '%s\n%s\n' \
+    "{\"type\":\"session_meta\",\"payload\":{\"cwd\":\"$dir/worktree\"}}" \
+    '{"type":"event_msg","payload":{"type":"task_started","turn_id":"second"}}' > "$second"
+  touch -t 202610090000.05 "$first" "$second"
+  out=$(run_codex_state "$dir" codex-simultaneous)
+  assert_contains "$out" 'state: unknown' 'equally recent eligible rollouts are ambiguous'
+  assert_not_contains "$out" 'state: idle' 'ambiguous rollouts cannot claim idle'
+  assert_not_contains "$out" 'state: working' 'ambiguous rollouts cannot claim working'
+  pass 'Codex stays unknown when eligible rollout writes cannot be distinguished'
 }
 
 test_codex_herdr_unknown_without_rollout_stays_unknown() {
@@ -278,8 +326,10 @@ test_missing_endpoint_does_not_trust_status_log
 test_codex_herdr_busy_never_reads_idle_during_background_command
 test_codex_herdr_long_tool_call_never_reads_idle
 test_codex_herdr_idle_at_prompt
+test_codex_reused_worktree_selects_latest_rollout_after_spawn_read_only
+test_codex_simultaneous_rollouts_stay_unknown
 test_codex_herdr_needs_input_prompt_is_blocked
-test_codex_herdr_ignores_previous_rollout
+test_codex_herdr_excludes_pre_spawn_rollouts
 test_codex_herdr_unknown_without_rollout_stays_unknown
 test_usage_error_is_distinct
 
