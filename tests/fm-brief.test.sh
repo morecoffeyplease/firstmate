@@ -735,6 +735,10 @@ test_ship_brief_teaches_review_escalation_and_lane_checks() {
     "ship brief did not trigger diagnosis for a repeated failure"
   assert_grep "cheapest observation that would distinguish them" "$brief" \
     "ship brief did not require a discriminating observation before another fix"
+  assert_grep "more than 2x the lane size target" "$brief" \
+    "ship brief did not require the proportionate-scope check"
+  assert_grep "recommend parking and shrinking it" "$brief" \
+    "ship brief did not recommend parking and shrinking oversized changes"
   assert_grep "Do not make another fix before completing this pass" "$brief" \
     "ship brief did not stop fixes until differential diagnosis is complete"
   assert_grep "larger-model shape review at round 3" "$brief" \
