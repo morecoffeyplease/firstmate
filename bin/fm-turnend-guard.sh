@@ -66,7 +66,10 @@
 # auto-arm (bin/fm-claude-stop-autoarm.sh), which fires on the same Stop event:
 #   1. a live identity-matched watcher with a fresh beacon - or, in away mode, a
 #      live identity-matched daemon with a fresh beacon - allows immediately;
-#   2. otherwise wait briefly (FM_CLAUDE_AUTOARM_SYNC_WAIT_MS, default 800ms)
+#   2. an unhealthy session with a verified live session-lock owner outside its
+#      harness ancestry exits with a read-only diagnostic instead of blocking a
+#      session that cannot repair supervision without stealing ownership;
+#   3. otherwise wait briefly (FM_CLAUDE_AUTOARM_SYNC_WAIT_MS, default 800ms)
 #      for the auto-arm to claim this home (a live OPEN generation claim in the
 #      state/.claude-autoarm-epoch ledger - fm_autoarm_claim_open - or a legacy
 #      build's lock-holding claim under the legacy abandonment proof) or to
@@ -75,7 +78,7 @@
 #      without consuming a continuation, so one event epoch yields exactly one recovery turn;
 #      the first fresh exhausted-failure epoch preserves the bounded progression,
 #      while later fresh failed epochs consume it instead of resetting it;
-#   3. only when neither materializes is the auto-arm genuinely absent: re-block
+#   4. only when neither materializes is the auto-arm genuinely absent: re-block
 #      with the repair banner, bounded to FM_CLAUDE_TURNEND_BLOCK_BUDGET
 #      (default 3) consecutive blocks per session - safely below Claude Code's
 #      hard 8-consecutive-block override - then allow one loud attended
@@ -184,18 +187,25 @@ budget_reset() {
 }
 
 fm_supervision_status "$STATE" "$GRACE"
-if [ "$FM_SUP_NEEDED" = false ]; then
-  [ -e "$FAILURE_NOTICE" ] || budget_reset
+if [ "$CLAUDE_MODE" -eq 1 ] && fm_session_lock_foreign_owner_live "$STATE"; then
+  # Preserve the normal silent healthy-watcher path, but never let this
+  # read-only session reset turn-end state or block on recovery it cannot own.
+  if [ "$FM_SUP_NEEDED" = false ] || fm_watcher_healthy "$STATE" "$WATCH" "$GRACE" "$FM_HOME"; then
+    exit 0
+  fi
+  printf '{"systemMessage":"FIRSTMATE SUPERVISION IS OWNED BY ANOTHER LIVE SESSION: this read-only session cannot and should not arm or repair the watcher (lock owner pid %s). Allowing this turn to end safely; the owning session must restore supervision."}\n' \
+    "$FM_SESSION_LOCK_FOREIGN_OWNER_PID"
   exit 0
 fi
-# A live firstmate session that owns the fleet lock is responsible for watcher
-# continuity. This hook may run in another session that was refused that lock;
-# that session is read-only and cannot repair supervision, so let its stop pass.
-if ! fm_session_lock_owned_by_self "$STATE"; then
+if [ "$CLAUDE_MODE" -eq 0 ] && ! fm_session_lock_owned_by_self "$STATE"; then
   session_lock_pid=$(cat "$STATE/.lock" 2>/dev/null || true)
   if [ -n "$session_lock_pid" ] && fm_harness_pid_alive "$session_lock_pid"; then
     exit 0
   fi
+fi
+if [ "$FM_SUP_NEEDED" = false ]; then
+  [ -e "$FAILURE_NOTICE" ] || budget_reset
+  exit 0
 fi
 # One owner of the "supervision is on, let this turn end" exit contract, shared
 # by every proof of supervision below.

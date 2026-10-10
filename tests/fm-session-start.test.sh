@@ -197,8 +197,8 @@ SH
 }
 
 # make_fake_ps_claude <fakebin>: harness_pid()/holder_alive() (fm-lock.sh) walk
-# `ps` output looking for a harness command name; this fake reports EVERY
-# queried pid as a live `claude` harness unless a stable harness pid is set.
+# `ps` output looking for a harness command name; each child gets a distinct
+# pid under one stable harness, plus any explicitly named competing holder.
 make_fake_ps_claude() {
   local fakebin=$1
   make_fake_ps_harness "$fakebin" claude
@@ -213,6 +213,7 @@ set -u
 # for, so a case that builds a pi (or codex) fixture gets pi (or codex) ancestry
 # without having to repeat it per run; FM_FAKE_HARNESS still overrides it.
 harness=\${FM_FAKE_HARNESS:-$harness}
+FM_FAKE_HARNESS_PID=\${FM_FAKE_HARNESS_PID:-$SESSION_START_TEST_HARNESS_PID}
 SH
   cat >> "$fakebin/ps" <<'SH'
 pid=
@@ -223,7 +224,7 @@ for argument in "$@"; do
 done
 case "$*" in
   *"comm="*)
-    if [ -z "${FM_FAKE_HARNESS_PID:-}" ] || [ "$pid" = "$FM_FAKE_HARNESS_PID" ] \
+    if [ "$pid" = "$FM_FAKE_HARNESS_PID" ] \
       || [ "$pid" = "${FM_FAKE_LIVE_HOLDER_PID:-}" ]; then
       printf '/usr/local/bin/%s\n' "$harness"
     else
@@ -232,7 +233,7 @@ case "$*" in
     exit 0
     ;;
   *"args="*)
-    if [ -z "${FM_FAKE_HARNESS_PID:-}" ] || [ "$pid" = "$FM_FAKE_HARNESS_PID" ] \
+    if [ "$pid" = "$FM_FAKE_HARNESS_PID" ] \
       || [ "$pid" = "${FM_FAKE_LIVE_HOLDER_PID:-}" ]; then
       printf '%s\n' "$harness"
     else
@@ -241,8 +242,12 @@ case "$*" in
     exit 0
     ;;
   *"ppid="*)
-    [ -n "${FM_FAKE_HARNESS_PID:-}" ] || exit 1
-    /bin/ps -o ppid= -p "$pid"
+    if [ "$pid" = "$FM_FAKE_HARNESS_PID" ]; then
+      printf '0\n'
+    else
+      printf '%s\n' "$FM_FAKE_HARNESS_PID"
+    fi
+    exit 0
     ;;
 esac
 exit 1
@@ -869,7 +874,8 @@ EOF
   printf '%s\n' "$holder_pid" > "$home/state/.lock"
 
   status=0
-  out=$(run_session_start "$home" "$root" "$fakebin:$BASE_PATH") || status=$?
+  out=$(FM_FAKE_LIVE_HOLDER_PID="$holder_pid" \
+    run_session_start "$home" "$root" "$fakebin:$BASE_PATH") || status=$?
   kill "$holder_pid" 2>/dev/null || true
   wait "$holder_pid" 2>/dev/null || true
 
@@ -955,7 +961,8 @@ EOF
   sleep 300 &
   holder_pid=$!
   printf '%s\n' "$holder_pid" > "$home/state/.lock"
-  out=$(FM_TRACE_CONTEXT=off run_session_start "$home" "$root" "$fakebin:$BASE_PATH")
+  out=$(FM_FAKE_LIVE_HOLDER_PID="$holder_pid" FM_TRACE_CONTEXT=off \
+    run_session_start "$home" "$root" "$fakebin:$BASE_PATH")
   kill "$holder_pid" 2>/dev/null || true
   wait "$holder_pid" 2>/dev/null || true
   assert_contains "$out" "READ-ONLY SESSION" "trace-context refusal fixture did not enter read-only mode"
@@ -1000,7 +1007,9 @@ case "$*" in
       printf '%s\n' bash
     fi
     ;;
-  *"ppid="*) printf '%s\n' "$FM_FAKE_HARNESS_PID" ;;
+  *"ppid="*)
+    if [ "$pid" = "$FM_FAKE_HARNESS_PID" ]; then printf '0\n'; else printf '%s\n' "$FM_FAKE_HARNESS_PID"; fi
+    ;;
   *) exit 1 ;;
 esac
 SH
@@ -2423,7 +2432,8 @@ EOF
   sleep 300 &
   holder_pid=$!
   printf '%s\n' "$holder_pid" > "$home/state/.lock"
-  readonly_out=$(FM_HOME="$home" FM_ROOT_OVERRIDE="$root" PATH="$fakebin:$BASE_PATH" \
+  readonly_out=$(FM_FAKE_LIVE_HOLDER_PID="$holder_pid" \
+    FM_HOME="$home" FM_ROOT_OVERRIDE="$root" PATH="$fakebin:$BASE_PATH" \
     env -u CLAUDECODE -u PI_CODING_AGENT -u FM_PI_HARNESS -u GROK_AGENT \
     "$SESSION_START" --reemit)
   kill "$holder_pid" 2>/dev/null || true

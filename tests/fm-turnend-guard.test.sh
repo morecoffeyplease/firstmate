@@ -443,39 +443,32 @@ test_hook_blocks_when_unhealthy_in_primary() {
 }
 
 test_hook_allows_when_another_session_holds_fleet_lock() {
-  local dir owner fakebin out status mode
+  local dir owner out status mode
   dir=$(make_primary_dir "$TMP_ROOT/hook-read-only-lock")
   : > "$dir/state/task1.meta"
-  sleep 60 &
+  ln -s /bin/bash "$dir/claude"
+  ln -s /bin/bash "$dir/codex"
+  "$dir/codex" -c 'while :; do sleep 60; done' &
   owner=$!
   printf '%s\n' "$owner" > "$dir/state/.lock"
-  fakebin=$(fm_fakebin "$TMP_ROOT/read-only-lock-bin")
-  cat > "$fakebin/ps" <<EOF
-#!/usr/bin/env bash
-case " \$* " in
-  *" -p $owner "*)
-    case " \$* " in *comm=*) printf 'codex\\n' ;; *) printf 'codex\\n' ;; esac
-    ;;
-  *) exec /bin/ps "\$@" ;;
-esac
-EOF
-  chmod +x "$fakebin/ps"
   for mode in default claude; do
     if [ "$mode" = claude ]; then
       out=$(printf '{"stop_hook_active":false,"session_id":"sess-readonly-mode"}' \
-        | PATH="$fakebin:$BLIND_BIN:$PATH" CLAUDECODE=1 FM_HOME="$dir" FM_CLAUDE_AUTOARM_SYNC_WAIT_MS=100 \
-          bash "$dir/bin/fm-turnend-guard.sh" --claude 2>&1); status=$?
+        | CLAUDECODE=1 FM_HOME="$dir" \
+          "$dir/claude" -c "exec -a claude bash \"\$FM_HOME/bin/fm-turnend-guard.sh\" --claude" 2>&1); status=$?
+      assert_contains "$out" "SUPERVISION IS OWNED BY ANOTHER LIVE SESSION" \
+        "Claude lock-refused stop must explain the verified ownership boundary"
     else
       out=$(printf '{"stop_hook_active":false,"session_id":"sess-readonly-mode"}' \
-        | PATH="$fakebin:$BLIND_BIN:$PATH" CLAUDECODE=1 FM_HOME="$dir" \
+        | CLAUDECODE=1 FM_HOME="$dir" \
           bash "$dir/bin/fm-turnend-guard.sh" 2>&1); status=$?
+      [ -z "$out" ] || fail "$mode read-only lock-refused stop should be silent, got: $out"
     fi
     expect_code 0 "$status" "$mode session refused the live fleet lock must allow its stop"
-    [ -z "$out" ] || fail "$mode read-only lock-refused stop should be silent, got: $out"
   done
   kill "$owner" 2>/dev/null || true
   wait "$owner" 2>/dev/null || true
-  pass "fm-turnend-guard: default and Claude modes allow stops when another live firstmate session owns the fleet lock"
+  pass "fm-turnend-guard: default stays silent and Claude reports verified foreign ownership"
 }
 
 test_hook_blocks_lock_owner_without_watcher() {
@@ -1697,10 +1690,9 @@ test_hook_claude_mode_integrated_monotonic_fail_open() {
 }
 
 # The auto-arm's ledger epoch advances only when the hook reaches its
-# generation claim. A live harness-named process outside the hook's ancestry
-# holding state/.lock keeps the hook inert by its identity contract, so the
-# ledger stays at the exhausted-failure epoch the hook wrote before it went
-# quiet. This test keeps that foreign lock in place for each auto-arm attempt,
+# generation claim. An unowned hook stays inert while a live foreign harness
+# owns state/.lock, so the ledger stays at the exhausted-failure epoch the hook
+# wrote before it went quiet. This test keeps that foreign lock in place for each auto-arm attempt,
 # then clears it before invoking the guard so it can test that repeated
 # re-blocks against an unchanged epoch still reach the attended fail-open.
 hold_session_lock_from_foreign_harness() {  # sets FOREIGN_LOCK_HOLDER
@@ -1713,7 +1705,6 @@ hold_session_lock_from_foreign_harness() {  # sets FOREIGN_LOCK_HOLDER
   FOREIGN_LOCK_HOLDER=$!
   printf '%s\n' "$FOREIGN_LOCK_HOLDER" > "$dir/state/.lock"
 }
-
 test_hook_claude_mode_frozen_epoch_reaches_bounded_fail_open() {
   local dir out status guard_out guard_status holder i pid identity count epoch_line
   dir=$(make_primary_dir "$TMP_ROOT/hook-claude-frozen-epoch")
@@ -1751,6 +1742,8 @@ test_hook_claude_mode_frozen_epoch_reaches_bounded_fail_open() {
       assert_present "$dir/state/.claude-autoarm-failure-alarmed" "the frozen-epoch fail-open did not consume its episode alarm"
     fi
   done
+  kill "$holder" 2>/dev/null || true
+  wait "$holder" 2>/dev/null || true
 
   guard_out=$(FM_CLAUDE_AUTOARM_SYNC_WAIT_MS=100 run_hook_claude "$dir" true); guard_status=$?
   expect_code 2 "$guard_status" "a later unhealthy stop after the frozen-epoch alarm must remain attended"
@@ -1763,8 +1756,6 @@ test_hook_claude_mode_frozen_epoch_reaches_bounded_fail_open() {
   identity=$(watcher_identity "$dir" "$pid") || {
     kill "$pid" 2>/dev/null || true
     wait "$pid" 2>/dev/null || true
-    kill "$holder" 2>/dev/null || true
-    wait "$holder" 2>/dev/null || true
     fail "could not identify the frozen-epoch recovery watcher"
   }
   record_watcher_lock "$dir" "$pid" "$identity"
@@ -1772,8 +1763,6 @@ test_hook_claude_mode_frozen_epoch_reaches_bounded_fail_open() {
   guard_out=$(run_hook_claude "$dir" true); guard_status=$?
   kill "$pid" 2>/dev/null || true
   wait "$pid" 2>/dev/null || true
-  kill "$holder" 2>/dev/null || true
-  wait "$holder" 2>/dev/null || true
   rm -rf "$dir/state/.watch.lock"
   expect_code 0 "$guard_status" "a healthy watcher must still allow the stop after a frozen-epoch alarm"
   [ -z "$guard_out" ] || fail "healthy allow after the frozen-epoch alarm produced output: $guard_out"

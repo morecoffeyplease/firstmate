@@ -368,6 +368,7 @@ E2E_ROOT="$E2E/root"
 E2E_HOME="$E2E/home"
 E2E_FAKEBIN="$E2E/fakebin"
 mkdir -p "$E2E_HOME/state" "$E2E_HOME/data" "$E2E_HOME/config" "$E2E_FAKEBIN"
+fm_git_identity fmtest fmtest@example.invalid
 git init -q -b main "$E2E_ROOT"
 git -C "$E2E_ROOT" commit -q --allow-empty -m init
 
@@ -375,17 +376,24 @@ make_hanging_tasks_axi "$E2E_FAKEBIN"
 # The reconcile sweep this half asserts on runs only under a verified fleet
 # lock, and fm-lock.sh finds its holder by walking the invoking process tree
 # through `ps`. A CI runner's ancestry carries no harness process, so the lock
-# would be refused there and the sweep silently skipped. Pin the lock evidence
-# the same way tests/fm-session-start.test.sh's make_fake_ps_harness does:
-# every queried pid reports a live `claude` harness, independent of whatever
-# process tree the test itself was launched from.
+# would be refused there and the sweep silently skipped. Pin each child beneath
+# this test's stable harness pid, with a completed root boundary.
 cat > "$E2E_FAKEBIN/ps" <<'SH'
 #!/usr/bin/env bash
 set -u
+pid=
+previous=
+for argument in "$@"; do
+  [ "$previous" = -p ] && pid=$argument
+  previous=$argument
+done
 case "$*" in
-  *"comm="*) printf '%s\n' '/usr/local/bin/claude'; exit 0 ;;
-  *"args="*) printf '%s\n' 'claude'; exit 0 ;;
-  *"ppid="*) exit 1 ;;
+  *"comm="*) if [ "$pid" = "$FM_FAKE_HARNESS_PID" ]; then printf '%s\n' /usr/local/bin/claude; else printf '%s\n' /bin/bash; fi
+    exit 0 ;;
+  *"args="*) if [ "$pid" = "$FM_FAKE_HARNESS_PID" ]; then printf '%s\n' claude; else printf '%s\n' bash; fi
+    exit 0 ;;
+  *"ppid="*) if [ "$pid" = "$FM_FAKE_HARNESS_PID" ]; then printf '0\n'; else printf '%s\n' "$FM_FAKE_HARNESS_PID"; fi
+    exit 0 ;;
 esac
 exit 1
 SH
@@ -407,7 +415,7 @@ fm_write_meta "$E2E_HOME/state/wedged-task.meta" \
 DIGEST="$E2E/digest.out"
 DIGEST_START=$(date +%s)
 env -u CLAUDECODE -u PI_CODING_AGENT -u FM_PI_HARNESS -u GROK_AGENT \
-  FM_HOME="$E2E_HOME" FM_ROOT_OVERRIDE="$E2E_ROOT" PATH="$E2E_FAKEBIN:$BASE_PATH" \
+  FM_FAKE_HARNESS_PID=$$ FM_HOME="$E2E_HOME" FM_ROOT_OVERRIDE="$E2E_ROOT" PATH="$E2E_FAKEBIN:$BASE_PATH" \
   FM_BACKLOG_ROW_TIMEOUT_SECS="$BOUND_SECS" \
   "$ROOT/bin/fm-session-start.sh" > "$DIGEST" 2>&1 || true
 DIGEST_ELAPSED=$(elapsed_since "$DIGEST_START")
