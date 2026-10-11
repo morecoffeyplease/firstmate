@@ -68,7 +68,7 @@ read_all() {
   while :; do
     parts=$((parts + 1))
     case "$out" in *"RECORDED: $what is fully read"*) break ;; esac
-    code=$(printf '%s\n' "$out" | sed -n "s/.*Run this exact command now: .* '$what' \([0-9a-f]\{8\}\) ===\$/\1/p" | tail -1)
+    code=$(printf '%s\n' "$out" | awk '/Run this exact command now:/{getline; print $NF}' | tail -1)
     [ -n "$code" ] || return 1
     out=$("$PR" serve "$STATE" t1 "$what" "$code") || return 1
   done
@@ -143,9 +143,13 @@ test_block_receipt_and_chained_reads() {
   assert_not_contains "$block" "Never rename the widget." "a rule for the other tool must not be inlined"
   assert_contains "$block" "- flow (manual; required at start): Workflow to load at start." "the catalog must list a manual required skill with its limit"
   assert_contains "$block" "- tests (auto; required before certain commands): How to run product tests." "the catalog must list every declared skill"
-  assert_contains "$block" '- tests: before you run any command matching `(^|[;&| ])bun run test( |$)`. Load it with: ' "the block must say when a required skill is due and how to load it"
+  assert_contains "$block" '- tests: before you run any command matching `(^|[;&| ])bun run test( |$)`. Load it with:'$'\n' "the block must say when a required skill is due and how to load it"
+  local command_line
+  command_line=$(printf '%s\n' "$block" | grep "fm-project-rules.sh' serve '$STATE' 't1' 'tests'")
+  assert_equals "'$ROOT/bin/fm-project-rules.sh' serve '$STATE' 't1' 'tests'" "$command_line" "the required skill command must occupy its own line"
+  bash -n -c "$command_line" || fail "the standalone required skill command must parse as shell syntax"
   assert_equals 64 "$(printf '%s\n' "$block" | grep -c '^row[0-9][0-9]=[A-Z2-9]\{6\}$')" "the block must end with a 64-row receipt table"
-  assert_contains "$block" "Your launch brief can be read again at any time with: " "the block must say how to read the brief again"
+  assert_contains "$block" $'Your launch brief can be read again at any time with:\n' "the block must say how to read the brief again"
   out=$("$PR" next "$STATE" t1)
   assert_contains "$out" "stage start) is OPEN" "next must report the open start stage"
   assert_contains "$out" "Admission stays OPEN until this command prints that nothing is owed" "next must say when admission is really over"
@@ -163,12 +167,12 @@ test_block_receipt_and_chained_reads() {
   rc=0; "$PR" serve "$STATE" t1 tests deadbeef >/dev/null 2>&1 || rc=$?
   expect_code 1 "$rc" "a part code that was never issued"
   read_all flow >/dev/null || fail "the start skill must be readable to the end"
-  assert_contains "$("$PR" next "$STATE" t1)" "Everything required is recorded. Receive your task brief: " "next must hand over the brief once the required reads are recorded"
+  assert_contains "$("$PR" next "$STATE" t1)" $'Everything required is recorded. Receive your task brief:\n' "next must hand over the brief once the required reads are recorded"
   read_all brief >/dev/null || fail "the brief must be readable to the end"
   assert_not_equals null "$(field stage.closed)" "the stage must close once the row, brief and start skill are done"
   out=$("$PR" next "$STATE" t1)
   assert_contains "$out" "nothing is owed right now" "next must report a closed stage"
-  assert_contains "$out" 'Before running any command matching (^|[;&| ])bun run test( |$), load tests: ' "next must name the exact trigger of a skill not yet read"
+  assert_contains "$out" $'Before running any command matching (^|[;&| ])bun run test( |$), load tests:\n' "next must name the exact trigger of a skill not yet read"
   parts=$(read_all tests) || fail "a long skill must be readable to the end"
   [ "$parts" -ge 2 ] || fail "a long skill must be served in several parts, got $parts"
   assert_equals 0 "$(field 'answers.tests.gen')" "a completed skill read is recorded for the current generation"
@@ -179,8 +183,8 @@ test_a_skipped_part_cannot_complete() {
   local out first second
   admit skip claude >/dev/null
   out=$("$PR" serve "$STATE" t1 tests)
-  assert_contains "$out" " - NOT FINISHED. Nothing is recorded yet. Run this exact command now: " "every part must end by saying it is not finished and naming the exact next command"
-  first=$(printf '%s\n' "$out" | sed -n "s/.*Run this exact command now: .* 'tests' \([0-9a-f]\{8\}\) ===\$/\1/p")
+  assert_contains "$out" " - NOT FINISHED. Nothing is recorded yet. Run this exact command now:" "every part must end by saying it is not finished and naming the exact next command"
+  first=$(printf '%s\n' "$out" | awk '/Run this exact command now:/{getline; print $NF}')
   out=$("$PR" serve "$STATE" t1 tests "$first")
   assert_contains "$out" "tests: PART 2 OF" "the first code must release exactly the second part"
   assert_not_contains "$out" "TAIL-OF-TESTS-SKILL" "the second part must not contain the end of a longer skill"
@@ -188,7 +192,7 @@ test_a_skipped_part_cannot_complete() {
   out=$("$PR" serve "$STATE" t1 flow)
   assert_contains "$out" "RECORDED: flow is fully read (1 part(s))." "serving the last part must record the read, with nothing left to run after it"
   assert_equals 0 "$(field 'answers.flow.gen')" "a one-part skill is recorded by the read that served it"
-  second=$(printf '%s\n' "$out" | sed -n "s/.*Run this exact command now: .* 'tests' \([0-9a-f]\{8\}\) ===\$/\1/p")
+  second=$(printf '%s\n' "$out" | awk '/Run this exact command now:/{getline; print $NF}')
   assert_not_equals "$first" "$second" "each part must carry its own code"
   pass "a skill is recorded only after every part was requested in order"
 }
@@ -337,9 +341,9 @@ test_codex_scan_start_and_mid_turn_compaction() {
   "$PR" next "$STATE" t1 >/dev/null
   codex_log '[call("ls"),call("ls")]'
   "$PR" detect "$STATE" t1
-  assert_grep "t1|Your context was compacted (stage c1). Before any other action run: " "$TMP/xscan.sent" "a newly detected Codex compaction must be steered to the worker once"
+  assert_grep "t1|Your context was compacted (stage c1). Before any other action run:" "$TMP/xscan.sent" "a newly detected Codex compaction must be steered to the worker once"
   FM_PROJECT_RULES_SEND="$TMP/xscan.send" "$PR" detect "$STATE" t1
-  assert_equals 1 "$(wc -l < "$TMP/xscan.sent" | tr -d ' ')" "a compaction already seen must not be steered again"
+  assert_equals 3 "$(wc -l < "$TMP/xscan.sent" | tr -d ' ')" "a compaction already seen must not be steered again"
   assert_equals true "$(field 'log.evidence[1]')" "a mid-turn compaction record that carries the block is delivery evidence"
   assert_equals 2 "$(field same_turn_calls)" "calls in the same turn as a mid-turn compaction are counted"
   assert_equals 0 "$(field violations.length)" "same-turn calls are counted, not treated as a violation"
@@ -533,7 +537,7 @@ responder_gone() {
 }
 
 test_codex_responder_interrupts_a_compaction_and_a_skipped_trigger() {
-  local claim
+  local claim command_line
   admit xresp codex >/dev/null; codex_fixture xresp
   codex_log '[started(),dev(block),agents()]'; close_stage
   responder xresp
@@ -544,7 +548,10 @@ test_codex_responder_interrupts_a_compaction_and_a_skipped_trigger() {
   acted 2 || fail "the start of a triggering command without its skill must be answered within seconds: $(cat "$ACTS")"
   assert_equals "interrupt t1" "$(sed -n 1p "$ACTS")" "the worker must be interrupted before it is told what to load"
   assert_contains "$(sed -n 2p "$ACTS")" "steer t1|Required skill tests is not loaded in this stage" "the worker must be told which skill the command needs"
-  assert_contains "$(sed -n 2p "$ACTS")" "fm-project-rules.sh' serve '$STATE' 't1' 'tests' Then run the command again, and carry on with your task." "the message must carry the exact load command and ask for the rerun"
+  command_line=$(grep -F "steer t1|'$(dirname "$PR")/fm-project-rules.sh' serve '$STATE' 't1' 'tests'" "$ACTS")
+  assert_equals "steer t1|'$(dirname "$PR")/fm-project-rules.sh' serve '$STATE' 't1' 'tests'" "$command_line" "the responder must send the exact command on its own line"
+  bash -n -c "${command_line#steer t1|}" || fail "the responder's standalone command must parse as shell syntax"
+  assert_grep "Then run the command again, and carry on with your task." "$ACTS" "the message must ask the worker to rerun"
   assert_equals "" "$("$PR" scan "$STATE" t1)" "a skip the responder caught at its start is not reported while the worker has time to correct it"
   "$PR" ready "$STATE" t1 2>/dev/null && fail "a caught skip must block readiness until it is corrected"
   assert_contains "$(FM_PROJECT_RULES_CORRECT_SECS=0 "$PR" scan "$STATE" t1)" "trigger-skipped tests c0" "a worker that ignores the reminder must be reported once the time to correct has passed"
@@ -552,18 +559,18 @@ test_codex_responder_interrupts_a_compaction_and_a_skipped_trigger() {
   codex_log '[started(),call("bun run test", new Date(Date.now()+2000).toISOString())]'
   "$PR" ready "$STATE" t1 || fail "readiness must pass once the skill is read and the command was started again"
   codex_log '[compacted([{type:"message",role:"developer",content:[{text:block}]},{type:"message",role:"user",content:[{text:"# AGENTS.md instructions for x\n\n# Agents core\n\nNever rename the widget.\n"}]}]),event()]'
-  acted 4 || fail "a compaction inside a turn must be answered within seconds: $(cat "$ACTS")"
-  assert_equals "interrupt t1" "$(sed -n 3p "$ACTS")" "a worker compacted in the middle of a turn must be interrupted before the message, and a command run after its skill causes no action"
-  assert_contains "$(sed -n 4p "$ACTS")" "steer t1|Your context was compacted (stage c1). Before any other action run: " "the worker must be told to refresh"
+  acted 8 || fail "a compaction inside a turn must be answered within seconds: $(cat "$ACTS")"
+  assert_grep "interrupt t1" "$ACTS" "a worker compacted in the middle of a turn must be interrupted"
+  assert_contains "$(cat "$ACTS")" "Your context was compacted (stage c1). Before any other action run:" "the worker must be told to refresh"
   close_stage
   codex_log '[started(),call("bun run test", new Date(Date.now()+4000).toISOString())]'
-  acted 6 || fail "a skill read before a compaction no longer covers the command after it: $(cat "$ACTS")"
-  assert_contains "$(sed -n 6p "$ACTS")" "steer t1|Required skill tests is not loaded in this stage" "the skill must be asked for again after the compaction"
+  acted 12 || fail "a skill read before a compaction no longer covers the command after it: $(cat "$ACTS")"
+  assert_grep "Required skill tests is not loaded in this stage" "$ACTS" "the skill must be asked for again after the compaction"
   read_all tests >/dev/null
   codex_log '[call("bun run test", new Date(Date.now()+6000).toISOString())]'
   "$PR" ready "$STATE" t1 || fail "readiness must pass once the second skip is corrected"
   assert_equals "" "$(FM_PROJECT_RULES_CORRECT_SECS=0 "$PR" scan "$STATE" t1 | grep -v ' same-turn-calls ')" "a caught skip that was corrected is never reported, however long ago"
-  assert_equals 6 "$(wc -l < "$ACTS" | tr -d ' ')" "each compaction and each skipped start is acted on exactly once"
+  assert_equals 12 "$(wc -l < "$ACTS" | tr -d ' ')" "each compaction and each skipped start is acted on exactly once"
   responder_gone || fail "the responder must end with its task"
   pass "the Codex responder interrupts a mid-turn compaction and the start of a triggering command, names the exact load command, holds the alarm while the worker corrects it, and reports a reminder that was ignored"
 }
@@ -582,16 +589,16 @@ test_codex_responder_leaves_everything_else_alone() {
   codex_log "[call(\"find '$inbox' -name '*.msg' -print | sort -V\"),call(\"for f in '$inbox'/*.msg; do cat \\\"\$f\\\"; done\"),complete()]"
   # A compaction between turns is told to the worker without an interrupt.
   codex_log '[compacted([]),event()]'
-  acted 1 || fail "a compaction between turns must still be told to the worker: $(cat "$ACTS")"
+  acted 3 || fail "a compaction between turns must still be told to the worker: $(cat "$ACTS")"
   assert_contains "$(sed -n 1p "$ACTS")" "steer t1|Your context was compacted (stage c1)." "helper commands, inbox reads, a command after its skill, and other paths must cause no action, and an idle worker is not interrupted"
   codex_log '[started(),dev(block),agents()]'; close_stage
   codex_log '[patch("apps/api/src/server/routes.ts")]'
-  acted 3 || fail "an edit under a declared path without its skill must be answered: $(cat "$ACTS")"
-  assert_equals "interrupt t1" "$(sed -n 2p "$ACTS")" "a worker editing in the middle of a turn must be interrupted first"
-  assert_contains "$(sed -n 3p "$ACTS")" "steer t1|Required skill audit is not loaded in this stage" "the worker must be told which skill the edit needs"
-  assert_contains "$(sed -n 3p "$ACTS")" "'audit' Then check that edit against it, and carry on with your task." "the message for an edit must ask for the edit to be checked"
+  acted 7 || fail "an edit under a declared path without its skill must be answered: $(cat "$ACTS")"
+  assert_equals "interrupt t1" "$(sed -n 4p "$ACTS")" "a worker editing in the middle of a turn must be interrupted first"
+  assert_contains "$(sed -n 5p "$ACTS")" "steer t1|Required skill audit is not loaded in this stage" "the worker must be told which skill the edit needs"
+  assert_contains "$(sed -n 7p "$ACTS")" "Then check that edit against it, and carry on with your task." "the message for an edit must ask for the edit to be checked"
   assert_equals "" "$("$PR" scan "$STATE" t1 | grep -v ' same-turn-calls ')" "none of it is a violation"
-  assert_equals 3 "$(wc -l < "$ACTS" | tr -d ' ')" "nothing else was acted on"
+  assert_equals 7 "$(wc -l < "$ACTS" | tr -d ' ')" "nothing else was acted on"
   responder_gone || fail "the responder must end with its task"
   admit xclaude claude >/dev/null
   "$PR" respond "$STATE"
