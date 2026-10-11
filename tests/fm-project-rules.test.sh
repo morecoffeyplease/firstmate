@@ -212,6 +212,8 @@ test_claude_hook_verdicts() {
   allowed '{"tool_name":"Agent","tool_input":{"subagent_type":"general-purpose"}}' "a qualified child type must be allowed"
   denied '{"tool_name":"Bash","tool_input":{"command":"cd apps && bun run test"}}' "a triggered command before its skill" "serve"
   denied '{"tool_name":"Bash","tool_input":{"command":"sh -c \"bun run test\""}}' "a triggered command hidden in a quoted wrapper" "serve"
+  denied '{"tool_name":"Bash","tool_input":{"command":"cat >> notes.md <<EOF\nsome notes\nEOF\nbun run test"}}' "a triggered command on its own line of a longer script" "serve"
+  denied "$(node -e 'console.log(JSON.stringify({tool_name:"Bash",tool_input:{command:"cat >> notes.md <<EOF\n"+"filler line\n".repeat(900)+"EOF\nbun run test"}}))')" "a triggered command after a long here-document" "serve"
   denied "{\"tool_name\":\"Edit\",\"tool_input\":{\"file_path\":\"$COPY/apps/api/src/server/a/b.ts\"}}" "an edit on a triggered path before its skill" "audit"
   allowed "{\"tool_name\":\"Edit\",\"tool_input\":{\"file_path\":\"$COPY/apps/web/x.ts\"}}" "an edit outside the triggered paths must be allowed"
   read_all tests >/dev/null
@@ -378,14 +380,16 @@ test_codex_scan_reads_every_command_shape() {
     '[{type:"response_item",payload:{type:"custom_tool_call",name:"exec",input:"const c = \"bun run test\"; await tools.exec_command({cmd:c});"}}]' \
     '[{type:"response_item",payload:{type:"local_shell_call",action:{command:["sh","-c","bun run test"]}}}]' \
     '[{type:"response_item",payload:{type:"custom_tool_call",name:"exec",input:"const c = \"bun run test\"; await tools.exec_command({cmd:"+JSON.stringify(q(bin+"/fm-project-rules.sh")+" next")+"}); await tools.exec_command({cmd:c});"}}]' \
-    '[{type:"response_item",payload:{type:"custom_tool_call",name:"exec",input:"for (const c of [\"bun run test\"]) await tools.exec_command({cmd:`${c}`});"}}]'; do
+    '[{type:"response_item",payload:{type:"custom_tool_call",name:"exec",input:"for (const c of [\"bun run test\"]) await tools.exec_command({cmd:`${c}`});"}}]' \
+    '[call("cat >> notes.md <<EOF\n\n## A\nsome notes\nEOF\nbun run test")]' \
+    '[{type:"response_item",payload:{type:"custom_tool_call",name:"exec",input:"const c = \"echo start\\nbun run test\"; await tools.exec_command({cmd:c});"}}]'; do
     n=$((n + 1))
     admit "xshape$n" codex >/dev/null; codex_fixture "xshape$n"
     codex_log '[started(),dev(block),agents()]'; close_stage
     codex_log "$shape"
     assert_contains "$("$PR" scan "$STATE" t1)" "trigger-skipped tests c0" "Codex command shape $n must be recognized"
   done
-  pass "the Codex scan finds a triggering command in every call shape: JSON arguments, batches, each quote style, a variable, a variable beside a helper call, and a shell action"
+  pass "the Codex scan finds a triggering command in every call shape: JSON arguments, batches, each quote style, a variable, a variable beside a helper call, a shell action, and a line of its own in a longer script"
 }
 
 test_codex_read_then_run_in_one_call_is_in_order() {
@@ -614,6 +618,16 @@ test_codex_sub_agent_log_is_never_read_as_the_workers() {
   node -e 'const t=new Date(Date.now()-60000);require("fs").utimesSync(process.argv[1],t,t)' "$LOG"
   assert_contains "$("$PR" scan "$STATE" t1)" "scan-error the session that spawned sub-agent log" "a sub-agent log whose parent session cannot be found must be reported, not skipped"
   "$PR" ready "$STATE" t1 2>/dev/null && fail "a log that could not be traced to the worker's session must block readiness"
+  codex_log '[compacted([]),event()]'; FM_PROJECT_RULES_OBSERVE=1 "$PR" detect "$STATE" t1
+  assert_equals 2 "$(field compactions)" "the worker's own log is still read while a sub-agent log cannot be traced"
+  # A sub-agent log that names a session in some other copy.
+  mkdir -p "$TMP/xchild.other"
+  printf '%s\n' "{\"type\":\"session_meta\",\"payload\":{\"cwd\":\"$TMP/xchild.other\"}}" > "$(dirname "$LOG")/rollout-$(date +%Y-%m-%dT%H-%M-%S)-elsewhere.jsonl"
+  printf '%s\n' "{\"type\":\"session_meta\",\"payload\":{\"cwd\":\"$COPY\",\"thread_source\":\"subagent\",\"parent_thread_id\":\"elsewhere\"}}" > "$child"
+  node -e 'const t=new Date(Date.now()-60000);require("fs").utimesSync(process.argv[1],t,t)' "$LOG"
+  FM_PROJECT_RULES_OBSERVE=1 "$PR" detect "$STATE" t1
+  assert_equals "$LOG" "$(field log.file)" "a sub-agent log must not lead the scan to a session in another copy"
+  assert_contains "$(field scan_error)" "not a session in this task" "a trace that leaves the task's copy must be reported"
   pass "a sub-agent's session log in the same copy is never read as the worker's: the worker's log is found through it and read on from where it was, and one that cannot be traced is reported"
 }
 

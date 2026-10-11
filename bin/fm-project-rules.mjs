@@ -215,14 +215,16 @@ function helperWords(command, R) {
 }
 const helperCall = (command, R) => helperWords(command, R) !== null;
 
-// A project's pattern is matched under a time limit, and a pattern that runs
-// out of time counts as a match, so a slow pattern cannot stall the hook or
-// the watcher and cannot hide a command either. The command is also tried with
+// A project's pattern describes one command line, so every line of a command
+// is tried by itself: a script that runs the command on a line of its own, or
+// after a long here-document, is still matched. Each line is also tried with
 // its quoting and grouping characters blanked, so a wrapper such as
-// sh -c "..." does not hide it.
+// sh -c "..." does not hide it. The patterns are matched under a time limit,
+// and one that runs out of time counts as a match, so a slow pattern or a huge
+// command cannot stall the hook or the watcher and cannot hide a command either.
 function commandMatches(patterns, command) {
-  const text = String(command).slice(0, 8000);
-  const forms = [text, text.replace(/["'`(){}]/g, " ")];
+  const lines = String(command).split(/\r?\n|\\n/);
+  const forms = [...new Set([...lines, ...lines.map((line) => line.replace(/["'`(){}]/g, " "))])];
   return patterns.some((pattern) => {
     try {
       return vm.runInNewContext("forms.some((form) => re.test(form))", { re: commandPattern(pattern), forms }, { timeout: 100 });
@@ -722,9 +724,11 @@ function newLines(R, file) {
 
 // A sub-agent writes its own session log in the same copy, and for a while it
 // is the one written last. The task's log is the root session's, so a
-// sub-agent's log is followed back through the parent each one names. One
-// whose parent cannot be found is an error, never a silent skip.
-function rootLog(file) {
+// sub-agent's log is followed back through the parent each one names. The
+// parent it names is only a name to look up: the log found must be a session
+// in this task's own copy, and one that cannot be traced is an error, never a
+// silent skip.
+function rootLog(copy, file) {
   const inside = (dir) => fs.readdirSync(dir, { withFileTypes: true }).filter((entry) => entry.isDirectory()).map((entry) => path.join(dir, entry.name));
   for (let hops = 0; hops < 8; hops += 1) {
     let meta = {};
@@ -743,10 +747,14 @@ function rootLog(file) {
     } finally {
       fs.closeSync(handle);
     }
-    if (meta.thread_source !== "subagent" && !meta.source?.subagent) return file;
+    if (meta.thread_source !== "subagent" && !meta.source?.subagent) {
+      if (hops && real(meta.cwd ?? "") !== real(copy)) throw new Error(`sub-agent log traced to ${path.basename(file)}, which is not a session in this task's copy`);
+      return file;
+    }
     const parent = String(meta.source?.subagent?.thread_spawn?.parent_thread_id ?? meta.parent_thread_id ?? "");
+    const named = /^[A-Za-z0-9._-]+$/.test(parent);
     const found = inside(path.resolve(path.dirname(file), "../../..")).flatMap(inside).flatMap(inside)
-      .flatMap((day) => fs.readdirSync(day).filter((name) => parent && name.endsWith(`-${parent}.jsonl`)).map((name) => path.join(day, name)));
+      .flatMap((day) => fs.readdirSync(day).filter((name) => named && name.endsWith(`-${parent}.jsonl`)).map((name) => path.join(day, name)));
     if (found.length !== 1) throw new Error(`the session that spawned sub-agent log ${path.basename(file)} was not found`);
     [file] = found;
   }
@@ -988,7 +996,19 @@ function scanOne(state, id, rollout, report = true, act = "") {
     const before = R.compactions;
     const block = fs.readFileSync(path.join(dirPath(state, id), "block.txt"), "utf8").trimEnd();
     try {
-      if (R.tool === "codex" && rollout) scanCodex(R, block, rootLog(rollout));
+      if (R.tool === "codex" && rollout) {
+        // A log that cannot be traced to the worker's session is reported,
+        // and the log already being read is read on meanwhile.
+        let log = R.log.file;
+        let untraced = null;
+        try {
+          log = rootLog(R.copy, rollout);
+        } catch (error) {
+          untraced = error;
+        }
+        if (log) scanCodex(R, block, log);
+        if (untraced) throw untraced;
+      }
       if (R.tool === "claude") scanClaude(R, block);
       delete R.scan_error;
     } catch (error) {
@@ -1043,12 +1063,14 @@ function scanOne(state, id, rollout, report = true, act = "") {
 // resolves the log again, and at once when the task or this responder is replaced.
 function respond([state, id, rollout, pidfile, pid]) {
   const mine = () => fs.existsSync(recordPath(state, id)) && fs.existsSync(pidfile) && fs.readFileSync(pidfile, "utf8").trim() === pid;
-  // A log whose root cannot be found is still handed to the scan, which records the error.
-  let log = rollout;
+  // The scan itself records a log that cannot be traced; here the log already
+  // being read stays the one watched for growth.
+  const R = JSON.parse(fs.readFileSync(recordPath(state, id), "utf8"));
+  let log = R.log.file ?? rollout;
   try {
-    log = rootLog(rollout);
+    log = rootLog(R.copy, rollout);
   } catch {
-    log = rollout;
+    log = R.log.file ?? rollout;
   }
   let seen = -1;
   for (const until = Date.now() + 20000; Date.now() < until && mine(); sleep(250)) {

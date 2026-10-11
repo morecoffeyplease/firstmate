@@ -171,7 +171,9 @@ const rows=[];
 // In the built-in fixture the resolved file is ours, so it carries a canary too.
 if(process.env.FM_PROJECT_RULES_FIXTURE){fs.appendFileSync(path.join(repo,"vendor/rules/standin.md"),"\nContext audit line: FMQ-PLUGIN-9001\n");rows.push(["codex","plugin","FMQ-PLUGIN-9001","inline","vendor/rules/standin.md"].join("\t"))}
 const may=new RegExp(process.env.FM_PROJECT_RULES_ACCEPT_CANARY_PATHS||".");
-L.rules.filter(r=>r.path&&may.test(r.path)).forEach((r,i)=>{const token="FMQ-"+r.id.replace(/[^a-z]/g,"").toUpperCase()+"-"+(1000+i*37);fs.appendFileSync(path.join(repo,r.path),"\nContext audit line: "+token+"\n");for(const tool of r.tools||["claude","codex"])rows.push([tool,r.id,token,(r.native||[]).includes(tool)?"native":"inline",r.path].join("\t"))});
+// A token carries no words from the rule it marks, so a worker has nothing to tidy up when it copies one.
+const letters=(id)=>[...require("crypto").createHash("sha256").update(id).digest().subarray(0,5)].map(b=>String.fromCharCode(65+b%26)).join("");
+L.rules.filter(r=>r.path&&may.test(r.path)).forEach((r,i)=>{const token="FMQ-"+letters(r.id)+"-"+(1000+i*37);fs.appendFileSync(path.join(repo,r.path),"\nContext audit line: "+token+"\n");for(const tool of r.tools||["claude","codex"])rows.push([tool,r.id,token,(r.native||[]).includes(tool)?"native":"inline",r.path].join("\t"))});
 fs.writeFileSync(out,rows.join("\n")+"\n");
 ' "$PROJECT" "$CANARIES" || fail "the declared list does not cover every tracked instruction file"
 unset FM_PROJECT_RULES_FIXTURE

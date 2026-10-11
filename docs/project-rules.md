@@ -52,7 +52,7 @@ A file that does not parse, or that carries an unknown field, refuses the launch
 - `tools` limits an entry to `claude`, `codex`, or both; absent means both.
 - `native` names the tools that load the file by themselves at start and after compaction.
 - `skills` is the catalog. `invocation` is `model` when the tool may invoke the skill on its own and `manual` otherwise. `body` and each `references` entry is a `path` or a `resolve`.
-- `required` is optional and holds exactly one trigger: `{"at": "start"}`, `{"before_commands": [...]}` with POSIX extended patterns matched against a whole command line, or `{"on_paths": [...]}` with globs using `*`, `?` and `**`.
+- `required` is optional and holds exactly one trigger: `{"at": "start"}`, `{"before_commands": [...]}` with POSIX extended patterns matched against each line of a command, or `{"on_paths": [...]}` with globs using `*`, `?` and `**`.
 - `dispatched_child_types` lists the child agent types the project's skills dispatch. It informs the live guard and grants nothing.
 
 ## Admission, before the worker starts
