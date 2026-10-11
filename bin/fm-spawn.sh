@@ -5185,6 +5185,12 @@ if [ "$SPAWN_ROOT_ROUTE_LOCK_ACTIVE" = 1 ]; then
   SPAWN_ROOT_ROUTE_LOCK_ACTIVE=0
 fi
 
+# A Codex worker in a project with declared rules is followed by its responder
+# from its first turn; the watcher restarts one that stops (docs/project-rules.md).
+if [ "$HARNESS" = codex ] && [ "$PROJECT_RULES" -eq 1 ]; then
+  "$FM_ROOT/bin/fm-project-rules.sh" respond "$RULES_STATE" </dev/null >/dev/null 2>&1 || true
+fi
+
 SPAWN_DELIVERY=
 [ -z "$MODE" ] || SPAWN_DELIVERY=" mode=$MODE yolo=$YOLO"
 echo "spawned $ID harness=$HARNESS kind=$KIND$SPAWN_DELIVERY window=$META_WINDOW worktree=$WT"

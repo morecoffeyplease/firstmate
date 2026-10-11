@@ -590,6 +590,29 @@ test_codex_responder_leaves_everything_else_alone() {
   pass "the Codex responder acts only on a compaction and on declared triggers: not on helper commands, inbox reads, a command after its skill, other paths, or a Claude worker"
 }
 
+test_codex_sub_agent_log_is_never_read_as_the_workers() {
+  local child
+  admit xchild codex >/dev/null; codex_fixture xchild
+  codex_log '[started(),dev(block),agents()]'; close_stage
+  read_all tests >/dev/null
+  codex_log '[call("bun run test", new Date(Date.now()+2000).toISOString())]'
+  codex_log '[compacted([{type:"message",role:"developer",content:[{text:block}]},{type:"message",role:"user",content:[{text:"# AGENTS.md instructions for x\n\n# Agents core\n\nNever rename the widget.\n"}]}]),event()]'
+  FM_PROJECT_RULES_OBSERVE=1 "$PR" detect "$STATE" t1; close_stage
+  read_all tests >/dev/null
+  # A sub-agent's session log in the same copy, written after the worker's own.
+  child="$(dirname "$LOG")/rollout-$(date +%Y-%m-%dT%H-%M-%S)-child.jsonl"
+  printf '%s\n' "{\"type\":\"session_meta\",\"payload\":{\"cwd\":\"$COPY\",\"thread_source\":\"subagent\"}}" '{"type":"compacted","payload":{"replacement_history":[]}}' > "$child"
+  node -e 'const t=new Date(Date.now()-60000);require("fs").utimesSync(process.argv[1],t,t)' "$LOG"
+  # shellcheck source=bin/fm-busy-lib.sh
+  assert_equals "$child" "$( . "$ROOT/bin/fm-busy-lib.sh" && fm_busy_codex_rollout_log "$STATE" t1 )" "the sub-agent's log is the one written last, which is what makes it a candidate"
+  FM_PROJECT_RULES_OBSERVE=1 "$PR" detect "$STATE" t1
+  assert_equals "$LOG" "$(field log.file)" "a sub-agent's session log must never be adopted as the worker's"
+  assert_equals 1 "$(field compactions)" "a compaction record in a sub-agent's log is not the worker's compaction"
+  codex_log '[started(),call("bun run test", new Date(Date.now()+4000).toISOString())]'
+  assert_equals "" "$("$PR" scan "$STATE" t1 | grep -v ' same-turn-calls ')" "the worker's log is read on from where it was, so an earlier command is not judged again against a later read"
+  pass "a sub-agent's session log in the same copy is never read as the worker's, and the worker's log is not read again from its start"
+}
+
 test_a_slow_pattern_counts_as_a_match() {
   local rc=0
   admit slow claude >/dev/null
@@ -755,14 +778,19 @@ test_spawn_delivers_the_block_to_claude() {
 }
 
 test_spawn_delivers_the_block_to_codex() {
-  local launch
+  local launch tries=0
   spawn_case scodex codex
   expect_code 0 "$S_RC" "a codex spawn into a project with declared rules ($(tail -3 "$S_ERR" | tr '\n' ' '))"
   launch=$(cat "$S_LOG")
   assert_contains "$launch" "--disable hooks" "a codex worker must keep its hook layer off"
   assert_contains "$launch" "fm-project-rules.sh' emit '" "the codex launch must pass the block as developer instructions"
   assert_contains "$launch" "admission-brief.md" "a codex worker must be launched on the admission message, not on its task"
-  pass "fm-spawn gives a codex worker the block as developer instructions with hooks still off"
+  until [ -s "$S_HOME/state/rules-scodex.project-rules.d/responder.pid" ]; do
+    tries=$((tries + 1)); [ "$tries" -lt 50 ] || fail "fm-spawn must start the codex worker's responder with the worker"
+    sleep 0.1
+  done
+  rm -f "$S_HOME/state/rules-scodex.project-rules"
+  pass "fm-spawn gives a codex worker the block as developer instructions with hooks still off, and starts its responder"
 }
 
 test_spawn_refuses_when_admission_fails() {
@@ -798,6 +826,7 @@ test_codex_scan_is_idempotent_and_cursor_safe
 test_codex_missing_evidence_and_witness
 test_codex_responder_interrupts_a_compaction_and_a_skipped_trigger
 test_codex_responder_leaves_everything_else_alone
+test_codex_sub_agent_log_is_never_read_as_the_workers
 test_a_slow_pattern_counts_as_a_match
 test_drift_covers_skills_and_the_declaration
 test_failures_inside_the_hook_and_scan_are_never_silent

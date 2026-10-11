@@ -234,7 +234,7 @@ children_task() {
   if [ "$TOOL" = claude ]; then
     printf '%s' "Your supervisor authorizes these child agents for this audit step; they are a measurement, not delegation of your task. Then try to launch one Explore child agent with the task 'say hi' and append one line beginning EXPLORE: saying whether it was allowed or refused. Then launch one general-purpose child agent with exactly this task and nothing added: 'Before using any tool, list every token of the form FMQ-<LETTERS>-<digits> literally visible in your own context, one per line, or NONE. Then read only the first 3 lines of ${AREA_FILE:-README.md} and list every such token visible now.$first' and append its reply verbatim under a heading '## CHILD \$STAGE'."
   else
-    printf '%s' "Your supervisor authorizes exactly one sub-agent for this audit step; it is a measurement, not delegation of your task. Then spawn one sub-agent with exactly this task and nothing added: 'Before using any tool, list every token of the form FMQ-<LETTERS>-<digits> literally visible in your own context, one per line, or NONE.$first' and append its reply verbatim under a heading '## CHILD \$STAGE'."
+    printf '%s' "Your supervisor authorizes exactly one sub-agent for this audit step; it is a measurement, not delegation of your task. Then spawn one new sub-agent that starts without your conversation history (fork_turns none), with exactly this task and nothing added: 'Before using any tool, list every token of the form FMQ-<LETTERS>-<digits> literally visible in your own context, one per line, or NONE.$first' and append its reply verbatim under a heading '## CHILD \$STAGE'."
   fi
 }
 stage_task() {  # <stage letter>
@@ -253,21 +253,58 @@ send_stage() {  # <letter>
   say "First run your project rules next command and do everything it prints. After that, read the file $file and do exactly what it says."
 }
 
-# The watcher starts a Codex worker's responder. No watcher runs here, so the
-# guard starts it the same way, through the real control and steering planes.
-# A replayed session sits in a pane fm-spawn did not create, so there the
-# interrupt and the message are typed into that pane directly.
-start_responder() {  # [replay]
+# fm-spawn starts a Codex worker's responder, and for a worker it launched into
+# the lab that responder is the one under test. A replayed session sits in a
+# pane fm-spawn did not create, so the responder its capture started cannot
+# reach it: that one is replaced by one whose interrupt and message are typed
+# into the replayed pane directly.
+replay_responder() {
   [ "$TOOL" = codex ] || return 0
-  if [ "${1:-}" = replay ]; then
-    printf '#!/usr/bin/env bash\n%q run %q pane send-keys %q Escape >/dev/null\n' "$LAB_HELPER" "$LAB" "$PANE" > "$TMP/$ID.control"
-    printf '#!/usr/bin/env bash\n%q run %q pane send-text %q "$2" >/dev/null && sleep 1.5 && %q run %q pane send-keys %q Enter >/dev/null\n' "$LAB_HELPER" "$LAB" "$PANE" "$LAB_HELPER" "$LAB" "$PANE" > "$TMP/$ID.send"
-    chmod +x "$TMP/$ID.control" "$TMP/$ID.send"
-    FM_PROJECT_RULES_CONTROL="$TMP/$ID.control" FM_PROJECT_RULES_SEND="$TMP/$ID.send" "$PR" respond "$STATE"
-  else
-    env -u HERDR_ENV -u HERDR_PANE_ID -u HERDR_TAB_ID -u HERDR_WORKSPACE_ID -u HERDR_SOCKET_PATH -u HERDR_BIN_PATH -u FM_TASK_ID \
-      PATH="$SHIM:$PATH" HERDR_SESSION="$LAB" FM_HOME="$HOME_DIR" FM_ROOT_OVERRIDE="$ROOT" "$PR" respond "$STATE"
-  fi
+  local claim="$STATE/$ID.project-rules.d/responder.pid" old tries=0
+  until [ -s "$claim" ]; do tries=$((tries + 1)); [ "$tries" -lt 50 ] || fail "$TOOL: fm-spawn started no responder"; sleep 0.1; done
+  old=$(cat "$claim"); kill "$old" 2>/dev/null || true
+  while kill -0 "$old" 2>/dev/null; do sleep 0.1; done
+  printf '#!/usr/bin/env bash\n%q run %q pane send-keys %q Escape >/dev/null\n' "$LAB_HELPER" "$LAB" "$PANE" > "$TMP/$ID.control"
+  printf '#!/usr/bin/env bash\n%q run %q pane send-text %q "$2" >/dev/null && sleep 1.5 && %q run %q pane send-keys %q Enter >/dev/null\n' "$LAB_HELPER" "$LAB" "$PANE" "$LAB_HELPER" "$LAB" "$PANE" > "$TMP/$ID.send"
+  chmod +x "$TMP/$ID.control" "$TMP/$ID.send"
+  : > "$claim"
+  FM_PROJECT_RULES_CONTROL="$TMP/$ID.control" FM_PROJECT_RULES_SEND="$TMP/$ID.send" "$PR" respond "$STATE"
+}
+
+# report_interrupts <how>: every turn the responder stopped in this session,
+# timed from the record that caused it to the turn ending, in the tool's own log.
+report_interrupts() {
+  [ "$TOOL" = codex ] || return 0
+  node -e '
+const fs=require("fs");const [log,label,how]=process.argv.slice(1);let cause=null,n=0;
+for(const line of fs.readFileSync(log,"utf8").split("\n").filter(Boolean)){let e;try{e=JSON.parse(line)}catch{continue}const p=e.payload||{};
+if(e.type==="compacted")cause={what:"a compaction",at:Date.parse(e.timestamp)};
+else if(e.type==="response_item"&&/_call$/.test(p.type||""))cause={what:"the start of a command",at:Date.parse(e.timestamp)};
+else if(e.type==="event_msg"&&p.type==="turn_aborted"&&cause){n++;console.log("# "+label+": the responder stopped a turn "+(Date.parse(e.timestamp)-cause.at)+" ms after "+cause.what+" ("+how+")")}}
+if(!n)console.log("# "+label+": no turn needed stopping in this session")' "$(field log.file)" "$TOOL $VERSION $ID" "$1"
+}
+
+# The real control plane on a real worker: a turn waiting on a long command
+# must stop within seconds of an interrupt sent through bin/fm-control.sh.
+check_interrupt_latency() {
+  [ "$TOOL" = codex ] || return 0
+  local out
+  say "Run exactly \`sleep 45\` as one command, then append the status line 'working: P done' and end your turn."
+  out=$(env -u HERDR_ENV -u HERDR_PANE_ID -u HERDR_TAB_ID -u HERDR_WORKSPACE_ID -u HERDR_SOCKET_PATH -u HERDR_BIN_PATH -u FM_TASK_ID \
+    PATH="$SHIM:$PATH" HERDR_SESSION="$LAB" FM_HOME="$HOME_DIR" FM_ROOT_OVERRIDE="$ROOT" node -e '
+const fs=require("fs"),{spawnSync}=require("child_process");const [log,control,id]=process.argv.slice(1);
+const rows=()=>fs.readFileSync(log,"utf8").split("\n").filter(Boolean).flatMap((l)=>{try{return [JSON.parse(l)]}catch{return []}});
+const wait=(test,ms)=>{for(const end=Date.now()+ms;;){const hit=test(rows());if(hit)return hit;if(Date.now()>end)return null;Atomics.wait(new Int32Array(new SharedArrayBuffer(4)),0,0,100)}};
+const stops=(r)=>r.filter((e)=>e.type==="event_msg"&&e.payload&&e.payload.type==="turn_aborted");
+if(!wait((r)=>r.some((e)=>/_call$/.test((e.payload||{}).type||"")&&JSON.stringify(e.payload).includes("sleep 45")),90000)){console.log("the worker never started the long command");process.exit(1)}
+const before=stops(rows()).length,t0=Date.now();
+const c=spawnSync(control,[id,"interrupt"],{encoding:"utf8"});const returned=Date.now()-t0;
+if(c.status!==0){console.log("fm-control refused: "+String(c.stderr||c.stdout).trim().slice(0,300));process.exit(1)}
+const hit=wait((r)=>{const s=stops(r);return s.length>before?s[s.length-1]:null},10000);
+if(!hit){console.log("the turn did not stop within 10 s of the interrupt");process.exit(1)}
+console.log("the turn stopped "+(Date.parse(hit.timestamp)-t0)+" ms after the interrupt was sent, by the tool log; fm-control returned after "+returned+" ms")' "$(field log.file)" "$ROOT/bin/fm-control.sh" "$ID") \
+    || fail "$TOOL $VERSION: an interrupt through fm-control did not stop a running turn: $out"
+  pass "$TOOL $VERSION: an interrupt through fm-control stops a running turn: $out"
 }
 
 spawn_worker() {  # <tool> <run>
@@ -286,7 +323,6 @@ spawn_worker() {  # <tool> <run>
     || fail "$1: the real fm-spawn refused the worker: $(tail -5 "$TMP/$ID.spawn" | tr '\n' ' ')"
   PANE=$(sed -n 's/^herdr_pane_id=//p' "$STATE/$ID.meta")
   VERSION=$(field version)
-  start_responder
   [ -f "$(sed -n 's/^worktree=//p' "$STATE/$ID.meta")/.prepared" ] || [ -n "${FM_PROJECT_RULES_ACCEPT_REPO:-}" ] || fail "$1: the project prepare step did not run in the fresh copy"
 }
 
@@ -386,7 +422,7 @@ replay_worker() {  # <tool> <run>
   PANE=$(lab workspace create --label "auto-$1-$2" --cwd "$wt" --no-focus | jq -r '.result.root_pane.pane_id')
   lab pane run "$PANE" "$script" >/dev/null || fail "$1: could not start the replayed launch"
   VERSION=$(field version)
-  start_responder replay
+  replay_responder
 }
 
 # ---- checks that do not depend on a worker ---------------------------------
@@ -494,6 +530,8 @@ for TOOL_NAME in $TOOLS; do
       say "/compact"; wait_compactions 1
       send_stage B
       check_stage B 1
+      report_interrupts "through bin/fm-control.sh"
+      [ "$run" -ne 1 ] || check_interrupt_latency
       quit_worker
       run=$((run + 1))
     done
@@ -530,6 +568,7 @@ for TOOL_NAME in $TOOLS; do
         say "/compact"; wait_compactions "$((auto_gen + 1))"
         send_stage D
         check_stage D "$((auto_gen + 1))"
+        report_interrupts "through keys typed into the replayed pane"
       else
         note "$TOOL $VERSION: the lowered limit produced no automatic compaction"
         automatic=unknown

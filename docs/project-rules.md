@@ -138,7 +138,8 @@ Any failure inside that hook, such as a locked or unreadable record or a missing
 
 Codex has no hooks, so nothing can refuse a tool call.
 Each Codex worker instead has a responder: a detached process that reads the worker's session log as it grows and acts within about a second.
-The watcher starts one on every cycle for any Codex task that lacks it, and it ends with the task.
+`bin/fm-spawn.sh` starts it with the worker, the watcher starts one on every cycle for any Codex task that lacks it, and it ends with the task.
+The log it follows is the worker's own session: a sub-agent's session log in the same copy is never read as the worker's.
 
 - On a `compacted` record it interrupts the turn through `bin/fm-control.sh`, then steers the worker through its inbox to run `next`.
 - On the start of a command or an edit that matches a declared trigger whose skill is not read in the current generation, it interrupts the turn, then steers the worker to load that skill with the exact command and to run the command again.
