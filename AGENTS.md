@@ -88,6 +88,7 @@ config/stow-pass-horizon  optional presence flag opting this home in to /stow's 
 config/herdr-presentation-spaces  optional "off" opt-out from, or "on" opt-in to, Herdr's default-on disposable single-task visual projection, which is unconfigured-default-on only at or above a Herdr version floor; LOCAL, gitignored; inherited by secondmate homes; see docs/herdr-backend.md "Presentation spaces"
 config/trace-context  optional presence flag enabling default-off native W3C trace-context propagation to spawned agents; LOCAL, gitignored; inherited by secondmate homes; see docs/configuration.md "Trace context propagation" and docs/trace-context.md
 config/turnend-churn-absorb  optional presence flag opting this home into the default-off absorb of bare turn-end wakes on pane churn; LOCAL, gitignored, and not inherited; see docs/configuration.md "Turn-end pane-churn absorb"
+config/project-rules-qualified  tool, version, backend and child-type pairs that passed the project-rules live guard on this machine, written by that guard; LOCAL, gitignored; inherited by secondmate homes; see docs/project-rules.md "Qualification"
 config/stuck-board  optional per-home whole-number thresholds for deterministic worker-stuck rules; LOCAL, gitignored; see docs/configuration.md "Worker stuck board"
 config/cmux-socket-password  optional cmux control-socket password; LOCAL, gitignored; read fresh on every cmux CLI call and passed through without ever overriding an operator's own ambient CMUX_SOCKET_PASSWORD when absent (docs/cmux-backend.md "Setup")
 config/wedge-alarm  optional away-mode wedge-alarm active-alert directives; LOCAL, gitignored; absent means auto (macOS Notification Center when available); see docs/wedge-alarm.md
@@ -106,6 +107,7 @@ data/                personal fleet records; LOCAL, gitignored as a whole
 projects/            cloned repos; gitignored; read-only except under hard rule 1's concrete captain-approved project operation exception
 state/               runtime records and signals; gitignored
   <id>.status        appended by crewmates: "<state>: <note>" wake-event lines, not current-state truth
+  <id>.project-rules <id>.project-rules.d/  per-task record, rendered rules block and lock for a worker in a project that declares its rules; written by bin/fm-project-rules.sh, removed by teardown, never hand-edited (docs/project-rules.md)
   <id>.heartbeat <id>.started .stuck-<id>-<rule> .stuck-<id>-{push,progress,review,ready}-since .last-stuck-board .stuck-board-cursor .stuck-board-error  separate per-task worker heartbeat and lane-start records, once-per-episode rule markers and signal timers, plus the watcher's scan cadence, network fairness cursor, and deduplicated check-error episode; bin/fm-task-heartbeat.sh, bin/fm-stuck-board.sh, and bin/fm-watch.sh own their formats and lifecycle
   <id>.turn-ended    touched by turn-end hooks
   <id>.progress      touched for observed native-harness activity inside one Pi turn; bin/fm-busy-event.sh owns its generation binding and bin/fm-watch.sh reads it beside turn-ended for the busy-age bound only, never as a completed turn
@@ -585,6 +587,7 @@ These skills are not captain-invocable; load them only at their precise triggers
 - `diagnostic-reasoning` - load before scoping a reported bug and before acting on a diagnostic report.
 - `ask-user-authority` - load before deciding any ask-user finding.
 - `quota-array-dispatch` - load before choosing among a matched crew-dispatch profile array from current quota-axi default TOON.
+- `project-rules` - load on any `project-rules: <task-id> <alarm>` check wake, when a spawn is refused by project rules admission, and when `fm-pr-check.sh` or `fm-merge-local.sh` refuses a task for an owed receipt or skill read.
 - `harness-adapters` - load before spawning or recovering a crewmate or secondmate, handling a trust dialog, sending a harness-specific skill invocation, interrupting or exiting an agent, resuming an exited agent, or verifying a new harness adapter.
 - `firstmate-orca` - load before switching to Orca, spawning or supervising Orca-backed work, smoke-testing Orca backend behavior, debugging Orca task state, or reconciling Orca-backed task metadata.
 - `project-management` - load before adding, creating, removing, or initializing a project, and with `secondmate-provisioning` when establishing a project Firstmate authority for a registered project.

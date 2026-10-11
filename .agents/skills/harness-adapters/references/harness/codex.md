@@ -51,6 +51,7 @@ Writing Codex's own trust store to pre-accept it would manufacture an operator c
 So crewmate and scout launches disable Codex's hook layer outright (`bin/fm-spawn.sh`'s launch template owns the flag), which is the opposite of `--dangerously-bypass-hook-trust` - that flag RUNS the untrusted hooks.
 A crewmate loses nothing: its turn-end signal is the `-c notify=` program on the same launch, and the Firstmate hooks in a project's `.codex/hooks.json` are primary-session infrastructure that stands down in a child worktree.
 A secondmate is a primary in its own home and keeps its hooks, so an unanswerable modal there is still possible and is the operator's own hook review to settle.
+With hooks off, a project's declared rules reach a Codex worker as a `developer_instructions` override and its compactions are read from its session log; `../../../../../docs/project-rules.md` owns that contract.
 
 ## Skill popup
 

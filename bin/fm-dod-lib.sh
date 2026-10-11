@@ -42,6 +42,38 @@ Project instructions still govern the work wherever they do not conflict with th
 EOF
 }
 
+# fm_brief_project_rules_admission owns the launch message of a worker whose
+# project declares its rules (docs/project-rules.md): the worker role and the
+# admission step only. The task is handed over by the helper once every
+# required read is recorded, so a worker that has not finished reading has no
+# task to start on.
+fm_brief_project_rules_admission() {  # <helper> <state-dir> <task-id>
+  fm_brief_worker_role "$2" "$3"
+  cat <<EOF
+
+# Project rules admission
+This project declares rules that bind your work, and they are already in your instructions as a block titled "Project rules".
+Your task is not in this message.
+It is handed to you when admission is complete.
+Run \`'$1' next '$2' '$3'\` now and do everything it prints, in order.
+Every read is finished only when the helper prints RECORDED.
+When nothing more is owed, that same command hands you your task brief.
+EOF
+}
+
+# fm_brief_project_rules_gate owns the startup gate appended to a launch brief
+# when the project declares its rules (docs/project-rules.md).
+fm_brief_project_rules_gate() {  # <helper> <state-dir> <task-id>
+  cat <<EOF
+
+# Project rules gate
+This project declares rules that bind your work, and they are already in your instructions as a block titled "Project rules".
+Before your first project command or edit, run \`'$1' next '$2' '$3'\` and do everything it prints, in order.
+Run the same command again right after any context compaction, before any other action.
+Load a required skill only through the command it names, never from memory of an earlier read.
+EOF
+}
+
 fm_ship_rule_one() {  # <direct-PR|local-only> <task-id>
   local mode=$1 id=$2
   case "$mode" in
