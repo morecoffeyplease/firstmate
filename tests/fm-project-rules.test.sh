@@ -312,7 +312,7 @@ codex_fixture() {
   fm_write_meta "$STATE/t1.meta" "worktree=$COPY" "harness=codex" "kind=ship" "spawn_gen=s$(( $(date +%s) - 60 )).1.1"
 }
 codex_log() {
-  node -e 'const fs=require("fs");const [state,copy,bin,file,js]=process.argv.slice(1);const block=fs.readFileSync(state+"/t1.project-rules.d/block.txt","utf8");const dev=(t)=>({type:"response_item",payload:{type:"message",role:"developer",content:[{type:"input_text",text:t}]}});const agents=()=>({type:"response_item",payload:{type:"message",role:"user",content:[{type:"input_text",text:"# AGENTS.md instructions for "+copy+"\n\n# Agents core\n\nNever rename the widget.\n"}]}});const q=(t)=>"\x27"+t+"\x27";const call=(cmd,ts)=>({type:"response_item",timestamp:ts||new Date().toISOString(),payload:{type:"custom_tool_call",name:"exec",input:"text(await tools.exec_command({cmd:"+JSON.stringify(cmd)+"}));\n"}});const started=()=>({type:"event_msg",payload:{type:"task_started"}});const event=()=>({type:"event_msg",payload:{type:"item_completed",item:{type:"ContextCompaction"}}});const compacted=(history)=>({type:"compacted",payload:{replacement_history:history||[]}});const rows=eval(js);fs.appendFileSync(file,rows.map(r=>typeof r==="string"?r:JSON.stringify(r)).join("\n")+(process.env.NO_NEWLINE?"":"\n"))' "$STATE" "$COPY" "$ROOT/bin" "$LOG" "$1"
+  node -e 'const fs=require("fs");const [state,copy,bin,file,js]=process.argv.slice(1);const block=fs.readFileSync(state+"/t1.project-rules.d/block.txt","utf8");const dev=(t)=>({type:"response_item",payload:{type:"message",role:"developer",content:[{type:"input_text",text:t}]}});const agents=()=>({type:"response_item",payload:{type:"message",role:"user",content:[{type:"input_text",text:"# AGENTS.md instructions for "+copy+"\n\n# Agents core\n\nNever rename the widget.\n"}]}});const q=(t)=>"\x27"+t+"\x27";const call=(cmd,ts)=>({type:"response_item",timestamp:ts||new Date().toISOString(),payload:{type:"custom_tool_call",name:"exec",input:"text(await tools.exec_command({cmd:"+JSON.stringify(cmd)+"}));\n"}});const started=()=>({type:"event_msg",payload:{type:"task_started"}});const complete=()=>({type:"event_msg",payload:{type:"task_complete"}});const patch=(f)=>({type:"response_item",timestamp:new Date().toISOString(),payload:{type:"custom_tool_call",name:"apply_patch",input:"*** Begin Patch\n*** Update File: "+f+"\n@@\n-a\n+b\n*** End Patch"}});const event=()=>({type:"event_msg",payload:{type:"item_completed",item:{type:"ContextCompaction"}}});const compacted=(history)=>({type:"compacted",payload:{replacement_history:history||[]}});const rows=eval(js);fs.appendFileSync(file,rows.map(r=>typeof r==="string"?r:JSON.stringify(r)).join("\n")+(process.env.NO_NEWLINE?"":"\n"))' "$STATE" "$COPY" "$ROOT/bin" "$LOG" "$1"
 }
 
 test_codex_scan_start_and_mid_turn_compaction() {
@@ -488,6 +488,108 @@ test_codex_missing_evidence_and_witness() {
   pass "the Codex scan alarms on a missing block, a missing native file, and disagreeing compaction records"
 }
 
+# responder <case>: start the task's responder the way the watcher does, with
+# the control and steering planes replaced by one ordered record; sets ACTS.
+ACTS=
+responder() {
+  ACTS="$TMP/$1.acts"; : > "$ACTS"
+  printf '#!/bin/sh\nprintf "interrupt %%s\\n" "$1" >> "%s"\n' "$ACTS" > "$TMP/$1.control"
+  printf '#!/bin/sh\nprintf "steer %%s|%%s\\n" "$1" "$2" >> "%s"\n' "$ACTS" > "$TMP/$1.send"
+  chmod +x "$TMP/$1.control" "$TMP/$1.send"
+  FM_PROJECT_RULES_CONTROL="$TMP/$1.control" FM_PROJECT_RULES_SEND="$TMP/$1.send" "$PR" respond "$STATE"
+  local tries=0
+  until [ -s "$STATE/t1.project-rules.d/responder.pid" ]; do
+    tries=$((tries + 1)); [ "$tries" -lt 50 ] || fail "the responder never claimed its task"
+    sleep 0.1
+  done
+}
+# acted <count>: wait for that many actions; the responder acts within about a
+# second, and five are allowed.
+acted() {
+  local tries=0
+  until [ "$(wc -l < "$ACTS" | tr -d ' ')" -ge "$1" ]; do
+    tries=$((tries + 1)); [ "$tries" -lt 50 ] || return 1
+    sleep 0.1
+  done
+}
+# The responder ends with its task, so no test leaves one running.
+responder_gone() {
+  local pid tries=0
+  pid=$(cat "$STATE/t1.project-rules.d/responder.pid")
+  rm -f "$STATE/t1.project-rules"
+  while kill -0 "$pid" 2>/dev/null; do
+    tries=$((tries + 1)); [ "$tries" -lt 50 ] || return 1
+    sleep 0.1
+  done
+}
+
+test_codex_responder_interrupts_a_compaction_and_a_skipped_trigger() {
+  local claim
+  admit xresp codex >/dev/null; codex_fixture xresp
+  codex_log '[started(),dev(block),agents()]'; close_stage
+  responder xresp
+  claim=$(cat "$STATE/t1.project-rules.d/responder.pid")
+  "$PR" respond "$STATE"
+  assert_equals "$claim" "$(cat "$STATE/t1.project-rules.d/responder.pid")" "a task that has a live responder must not be given a second one"
+  codex_log '[call("bun run test")]'
+  acted 2 || fail "the start of a triggering command without its skill must be answered within seconds: $(cat "$ACTS")"
+  assert_equals "interrupt t1" "$(sed -n 1p "$ACTS")" "the worker must be interrupted before it is told what to load"
+  assert_contains "$(sed -n 2p "$ACTS")" "steer t1|Required skill tests is not loaded in this stage" "the worker must be told which skill the command needs"
+  assert_contains "$(sed -n 2p "$ACTS")" "fm-project-rules.sh' serve '$STATE' 't1' 'tests' Then run the command again, and carry on with your task." "the message must carry the exact load command and ask for the rerun"
+  assert_equals "" "$("$PR" scan "$STATE" t1)" "a skip the responder caught at its start is not reported while the worker has time to correct it"
+  "$PR" ready "$STATE" t1 2>/dev/null && fail "a caught skip must block readiness until it is corrected"
+  assert_contains "$(FM_PROJECT_RULES_CORRECT_SECS=0 "$PR" scan "$STATE" t1)" "trigger-skipped tests c0" "a worker that ignores the reminder must be reported once the time to correct has passed"
+  read_all tests >/dev/null
+  codex_log '[started(),call("bun run test", new Date(Date.now()+2000).toISOString())]'
+  "$PR" ready "$STATE" t1 || fail "readiness must pass once the skill is read and the command was started again"
+  codex_log '[compacted([{type:"message",role:"developer",content:[{text:block}]},{type:"message",role:"user",content:[{text:"# AGENTS.md instructions for x\n\n# Agents core\n\nNever rename the widget.\n"}]}]),event()]'
+  acted 4 || fail "a compaction inside a turn must be answered within seconds: $(cat "$ACTS")"
+  assert_equals "interrupt t1" "$(sed -n 3p "$ACTS")" "a worker compacted in the middle of a turn must be interrupted before the message, and a command run after its skill causes no action"
+  assert_contains "$(sed -n 4p "$ACTS")" "steer t1|Your context was compacted (stage c1). Before any other action run: " "the worker must be told to refresh"
+  close_stage
+  codex_log '[started(),call("bun run test", new Date(Date.now()+4000).toISOString())]'
+  acted 6 || fail "a skill read before a compaction no longer covers the command after it: $(cat "$ACTS")"
+  assert_contains "$(sed -n 6p "$ACTS")" "steer t1|Required skill tests is not loaded in this stage" "the skill must be asked for again after the compaction"
+  read_all tests >/dev/null
+  codex_log '[call("bun run test", new Date(Date.now()+6000).toISOString())]'
+  "$PR" ready "$STATE" t1 || fail "readiness must pass once the second skip is corrected"
+  assert_equals "" "$(FM_PROJECT_RULES_CORRECT_SECS=0 "$PR" scan "$STATE" t1 | grep -v ' same-turn-calls ')" "a caught skip that was corrected is never reported, however long ago"
+  assert_equals 6 "$(wc -l < "$ACTS" | tr -d ' ')" "each compaction and each skipped start is acted on exactly once"
+  responder_gone || fail "the responder must end with its task"
+  pass "the Codex responder interrupts a mid-turn compaction and the start of a triggering command, names the exact load command, holds the alarm while the worker corrects it, and reports a reminder that was ignored"
+}
+
+test_codex_responder_leaves_everything_else_alone() {
+  local inbox
+  admit xquiet codex >/dev/null; codex_fixture xquiet
+  inbox="$STATE/t1.inbox"
+  codex_log '[started(),dev(block),agents()]'; close_stage
+  read_all tests >/dev/null
+  responder xquiet
+  # Helper commands, the shapes workers use to follow the doorbell, a command
+  # whose skill is read, a command no pattern names, and an edit outside every
+  # declared path.
+  codex_log '[call(q(bin+"/fm-project-rules.sh")+" next "+q(state)+" t1"),call("bun run test", new Date(Date.now()+2000).toISOString()),call("bun run build"),patch("README.md")]'
+  codex_log "[call(\"find '$inbox' -name '*.msg' -print | sort -V\"),call(\"for f in '$inbox'/*.msg; do cat \\\"\$f\\\"; done\"),complete()]"
+  # A compaction between turns is told to the worker without an interrupt.
+  codex_log '[compacted([]),event()]'
+  acted 1 || fail "a compaction between turns must still be told to the worker: $(cat "$ACTS")"
+  assert_contains "$(sed -n 1p "$ACTS")" "steer t1|Your context was compacted (stage c1)." "helper commands, inbox reads, a command after its skill, and other paths must cause no action, and an idle worker is not interrupted"
+  codex_log '[started(),dev(block),agents()]'; close_stage
+  codex_log '[patch("apps/api/src/server/routes.ts")]'
+  acted 3 || fail "an edit under a declared path without its skill must be answered: $(cat "$ACTS")"
+  assert_equals "interrupt t1" "$(sed -n 2p "$ACTS")" "a worker editing in the middle of a turn must be interrupted first"
+  assert_contains "$(sed -n 3p "$ACTS")" "steer t1|Required skill audit is not loaded in this stage" "the worker must be told which skill the edit needs"
+  assert_contains "$(sed -n 3p "$ACTS")" "'audit' Then check that edit against it, and carry on with your task." "the message for an edit must ask for the edit to be checked"
+  assert_equals "" "$("$PR" scan "$STATE" t1 | grep -v ' same-turn-calls ')" "none of it is a violation"
+  assert_equals 3 "$(wc -l < "$ACTS" | tr -d ' ')" "nothing else was acted on"
+  responder_gone || fail "the responder must end with its task"
+  admit xclaude claude >/dev/null
+  "$PR" respond "$STATE"
+  assert_absent "$STATE/t1.project-rules.d/responder.pid" "a Claude worker keeps its hook and gets no responder"
+  pass "the Codex responder acts only on a compaction and on declared triggers: not on helper commands, inbox reads, a command after its skill, other paths, or a Claude worker"
+}
+
 test_a_slow_pattern_counts_as_a_match() {
   local rc=0
   admit slow claude >/dev/null
@@ -659,7 +761,6 @@ test_spawn_delivers_the_block_to_codex() {
   launch=$(cat "$S_LOG")
   assert_contains "$launch" "--disable hooks" "a codex worker must keep its hook layer off"
   assert_contains "$launch" "fm-project-rules.sh' emit '" "the codex launch must pass the block as developer instructions"
-  assert_contains "$launch" "fm-project-rules.sh' detect '" "the codex turn-end program must also check for a compaction"
   assert_contains "$launch" "admission-brief.md" "a codex worker must be launched on the admission message, not on its task"
   pass "fm-spawn gives a codex worker the block as developer instructions with hooks still off"
 }
@@ -695,6 +796,8 @@ test_codex_helper_spelled_through_a_variable
 test_codex_admission_then_work_in_one_call_is_in_order
 test_codex_scan_is_idempotent_and_cursor_safe
 test_codex_missing_evidence_and_witness
+test_codex_responder_interrupts_a_compaction_and_a_skipped_trigger
+test_codex_responder_leaves_everything_else_alone
 test_a_slow_pattern_counts_as_a_match
 test_drift_covers_skills_and_the_declaration
 test_failures_inside_the_hook_and_scan_are_never_silent

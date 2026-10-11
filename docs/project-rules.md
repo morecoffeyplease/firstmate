@@ -127,8 +127,8 @@ A read is recorded for the current compaction generation and lapses at the next 
 | Trigger | Claude | Codex |
 |---|---|---|
 | `at: start` | gates the stage | gates the stage |
-| `before_commands` | a matching command is refused until the skill is read | a matching command without the read is reported and blocks readiness |
-| `on_paths` | a matching edit is refused until the skill is read | checked at readiness against the work's changed files |
+| `before_commands` | a matching command is refused until the skill is read | a matching command without the read is interrupted at its start, the worker is told what to load, and readiness is blocked until it is corrected |
+| `on_paths` | a matching edit is refused until the skill is read | a matching edit without the read is interrupted and the worker is told what to load; also checked at readiness against the work's changed files |
 
 ## Compaction
 
@@ -137,8 +137,15 @@ While a stage is open, Claude's `PreToolUse` hook refuses every tool except the 
 Any failure inside that hook, such as a locked or unreadable record or a missing `node`, also refuses the call, because Claude treats only exit 2 as a refusal.
 
 Codex has no hooks, so nothing can refuse a tool call.
-A compaction is detected from the `compacted` record in the session log, at each turn end and on the watcher's cadence.
-Each newly detected compaction is steered to the worker once through its inbox, telling it to run `next`.
+Each Codex worker instead has a responder: a detached process that reads the worker's session log as it grows and acts within about a second.
+The watcher starts one on every cycle for any Codex task that lacks it, and it ends with the task.
+
+- On a `compacted` record it interrupts the turn through `bin/fm-control.sh`, then steers the worker through its inbox to run `next`.
+- On the start of a command or an edit that matches a declared trigger whose skill is not read in the current generation, it interrupts the turn, then steers the worker to load that skill with the exact command and to run the command again.
+
+A worker that is between turns is steered without an interrupt.
+The responder acts on nothing else: only the declared patterns and paths are matched, and a Claude worker keeps its hook and has no responder.
+The watcher's scan and the readiness check deliver the same actions when they see them first, so a responder that is not running delays an action and does not lose it.
 Calls made in the same turn as a compaction inside that turn are counted and reported.
 A project call in a later turn, before the stage is answered, is reported as a violation.
 
@@ -170,7 +177,7 @@ A child's own compaction is not measured.
 | `witness-mismatch` | the two compaction signals for the tool disagree |
 | `rules-changed` | the declaration, a rule file, or a skill body or reference changed on disk after the session was given it; a changed skill also loses its recorded read |
 | `scan-error`, `scan-failed` | the tool's own log, or the task's record, could not be read |
-| `trigger-skipped` | Codex ran a triggering command without the required skill |
+| `trigger-skipped` | Codex ran a triggering command without the required skill; when the responder caught it at its start, this is raised only if the worker has not read the skill and run the command again within 180 seconds |
 | `worked-before-admission`, `worked-before-refresh` | Codex made a project call before a stage was answered |
 | `same-turn-calls` | the count of calls between a compaction inside a turn and its refresh |
 | `receipt-table-exhausted` | all 64 rows are used and the task needs a relaunch |

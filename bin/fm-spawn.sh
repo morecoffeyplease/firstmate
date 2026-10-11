@@ -1865,9 +1865,9 @@ launch_template() {
   # release that drops this flag fails the launch loudly instead of silently
   # restoring the modal.
   # With hooks off, a project's declared rules reach a codex worker as
-  # developer instructions (__RULESBLOCK__) and compactions are detected from
-  # its session log at each turn end (__RULESNOTIFY__); docs/project-rules.md
-  # owns both, and both are empty when the project declares no rules.
+  # developer instructions (__RULESBLOCK__), empty when the project declares no
+  # rules, and the watcher's responder follows its session log for compactions
+  # and required-skill triggers; docs/project-rules.md owns both.
   # A secondmate is a firstmate PRIMARY in its own home, and its turn-end guard,
   # session-start digest, and cd/arm seatbelts are exactly those project hooks
   # (docs/turnend-guard.md, docs/sessionstart-nudge.md, docs/cd-guard.md), so the
@@ -1876,7 +1876,7 @@ launch_template() {
     if [ "$kind" = secondmate ]; then
       printf '%s' 'codex __MODELFLAG____EFFORTFLAG__--dangerously-bypass-approvals-and-sandbox "$(__OPINPUT__ encode launch-brief < __BRIEF__)"'
     else
-      printf '%s' 'codex __MODELFLAG____EFFORTFLAG__--dangerously-bypass-approvals-and-sandbox --disable hooks -c "notify=[\"bash\",\"-c\",\"touch __TURNEND____RULESNOTIFY__\"]" __RULESBLOCK__"$(__OPINPUT__ encode launch-brief < __BRIEF__)"'
+      printf '%s' 'codex __MODELFLAG____EFFORTFLAG__--dangerously-bypass-approvals-and-sandbox --disable hooks -c "notify=[\"bash\",\"-c\",\"touch __TURNEND__\"]" __RULESBLOCK__"$(__OPINPUT__ encode launch-brief < __BRIEF__)"'
     fi
     ;;
   opencode) printf '%s' 'OPENCODE_CONFIG_CONTENT='\''{"permission":{"*":"allow"}}'\'' opencode __MODELFLAG__--prompt "$(__OPINPUT__ encode launch-brief < __BRIEF__)"' ;;
@@ -4864,14 +4864,11 @@ if [ "$HARNESS" = claude ]; then
   fi
   LAUNCH=${LAUNCH//__CLAUDEAPPEND__/"$CLAUDE_APPEND"}
 fi
-RULES_NOTIFY=
 RULES_BLOCK=
 if [ "$HARNESS" = codex ] && [ "$PROJECT_RULES" -eq 1 ]; then
   sq_rules="$(shell_quote "$FM_ROOT/bin/fm-project-rules.sh")"
-  RULES_NOTIFY="; FM_HOME=$(shell_quote "$FM_HOME") $sq_rules detect $(shell_quote "$RULES_STATE") $(shell_quote "$ID") >/dev/null 2>&1"
   RULES_BLOCK="-c \"\$($sq_rules emit $(shell_quote "$RULES_STATE") $(shell_quote "$ID"))\" "
 fi
-LAUNCH=${LAUNCH//__RULESNOTIFY__/"$RULES_NOTIFY"}
 LAUNCH=${LAUNCH//__RULESBLOCK__/"$RULES_BLOCK"}
 if [ "$HARNESS" = rovo ]; then
   ROVOCONFIGOVERRIDE=$(rovo_config_override_flag "$EFFORT" "$DATA" "$STATE" "$ID" "$PROJECT_MEMORY_DIR") || {

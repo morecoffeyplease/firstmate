@@ -14,6 +14,7 @@ const PART = 10000;
 const ROWS = 64;
 const STAGE_SECS = Number(process.env.FM_PROJECT_RULES_STAGE_SECS || 900);
 const GRACE_SECS = Number(process.env.FM_PROJECT_RULES_GRACE_SECS ?? 60);
+const CORRECT_SECS = Number(process.env.FM_PROJECT_RULES_CORRECT_SECS ?? 180);
 const TOOLS = ["claude", "codex"];
 const EDIT_TOOLS = ["Edit", "Write", "MultiEdit", "NotebookEdit"];
 const HELPER = process.env.FM_PROJECT_RULES_HELPER || "";
@@ -720,7 +721,45 @@ function newLines(R, file) {
 }
 
 function violate(R, kind, detail) {
-  if (!R.violations.some((entry) => entry.kind === kind && entry.detail === detail)) R.violations.push({ kind, detail, at: new Date().toISOString() });
+  let entry = R.violations.find((item) => item.kind === kind && item.detail === detail);
+  if (!entry) R.violations.push((entry = { kind, detail, at: new Date().toISOString() }));
+  return entry;
+}
+
+// A triggering command that started without its skill is a violation, and is
+// also left for whoever acts on this task next to interrupt and correct.
+function skip(R, name, gen, ran) {
+  Object.assign(violate(R, "trigger-skipped", `${name} c${gen}`), { skill: name }).ran ??= ran;
+  (R.nudges ??= {})[name] = gen;
+}
+
+// A skip the responder caught at its start is settled without an alarm once
+// the skill is read and the command has been started again after it.
+const corrected = (R, entry) => Boolean(entry.caught) && Date.parse(R.ran_after_read?.[entry.skill] ?? "") >= entry.ran;
+
+// What the worker must be told right now. A compaction is dropped once the
+// worker has started its refresh by itself, and a trigger once its skill is read.
+function actions(R, caught) {
+  const stage = R.stage;
+  const say = [];
+  if (R.compact_nudge === stage.gen && !stage.closed && !R.first_helper?.[stage.gen]) {
+    say.push(`Your context was compacted (stage ${stage.name}). Before any other action run: ${helperCommand(R, "next")} It confirms your rules again and lists the required skills to load again. Then carry on with your task.`);
+  }
+  for (const [name, gen] of Object.entries(R.nudges ?? {})) {
+    if (gen !== R.compactions || answered(R, name)) continue;
+    const edit = R.skills.find((skill) => skill.name === name)?.required?.on_paths;
+    say.push(`Required skill ${name} is not loaded in this stage, and what you just started needs it. Load it now with: ${helperCommand(R, "serve", q(name))} Then ${edit ? "check that edit against it" : "run the command again"}, and carry on with your task.`);
+    if (caught) for (const entry of R.violations) if (entry.skill === name && entry.detail === `${name} c${gen}`) entry.caught ??= now();
+  }
+  delete R.compact_nudge;
+  delete R.nudges;
+  // A worker in the middle of a turn is stopped first, so the message is the
+  // next thing it reads. The turn then counts as over until the log shows a
+  // new one, so two actions close together interrupt once.
+  const lines = say.map((text) => `fm-steer: ${text}`);
+  if (lines.length && R.log.busy) lines.unshift("fm-interrupt");
+  if (lines.length) R.log.busy = false;
+  return lines;
 }
 
 function noteNative(R, text, gen, wanted) {
@@ -768,7 +807,10 @@ function codexCommands(payload) {
   const edits = /patch|edit|write/i.test(String(payload.name ?? ""));
   const bare = sites > found.length || (!found.length && edits);
   const raw = bare || found.some((command) => command.includes("${")) ? strings([payload.input, payload.arguments, payload.action]).join(" ") : "";
-  return { literals: found, bare, raw, sites };
+  // An edit names its files in the patch itself, wherever the call carries it.
+  const patch = [...found, ...strings([args, payload.input, payload.action])].join("\n");
+  const edited = [...patch.matchAll(/(?:^|\n)\*\*\* (?:Add File|Update File|Delete File|Move to): ([^\n]+)/g)].map((match) => match[1].trim());
+  return { literals: found, bare, raw, sites, edited };
 }
 
 function scanCodex(R, block, file) {
@@ -786,6 +828,9 @@ function scanCodex(R, block, file) {
       R.log.events += 1;
     } else if (entry.type === "event_msg" && payload.type === "task_started") {
       R.log.turn += 1;
+      R.log.busy = true;
+    } else if (entry.type === "event_msg" && ["task_complete", "turn_aborted"].includes(payload.type)) {
+      R.log.busy = false;
     } else if (entry.type === "response_item" && payload.type === "message") {
       const text = (Array.isArray(payload.content) ? payload.content : []).map((item) => item?.text ?? "").join("\n");
       if (payload.role === "developer" && text.includes(block)) R.log.evidence[gen] = true;
@@ -795,7 +840,8 @@ function scanCodex(R, block, file) {
       const closed = Date.parse(R.closed?.[gen] ?? "") || Infinity;
       // A helper call written as a template, with its arguments filled from a
       // loop, is still a helper call; anything else unreadable is work.
-      const { literals, bare, raw, sites } = codexCommands(payload);
+      const { literals, bare, raw, sites, edited } = codexCommands(payload);
+      const read = (name) => R.answers[name]?.gen === gen && Date.parse(R.answers[name].at) <= at;
       // Its placeholders must be filled from plain words: any other string in
       // the call that holds a space or a shell character makes it ordinary work.
       const plain = !/\$\{/.test(raw) || [...raw.replace(/`[^`]*`/g, "").matchAll(/"((?:[^"\\]|\\.)*)"|'((?:[^'\\]|\\.)*)'/g)].every((match) => /^[\w:.-]*$/.test(match[1] ?? match[2] ?? ""));
@@ -831,8 +877,7 @@ function scanCodex(R, block, file) {
         const hit = all.findIndex((command, index) => (index >= literals.length || !helper(command)) && commandMatches(skill.required.before_commands, command));
         if (hit < 0) continue;
         R.triggered[skill.name] = (R.triggered[skill.name] ?? 0) + 1;
-        const answer = R.answers[skill.name];
-        if (answer?.gen === gen && Date.parse(answer.at) <= at) {
+        if (read(skill.name)) {
           (R.ran_after_read ??= {})[skill.name] = new Date(at).toISOString();
           continue;
         }
@@ -843,15 +888,21 @@ function scanCodex(R, block, file) {
           const words = helperWords(command, R);
           return words !== null && words[1] === "serve" && words[4] === skill.name;
         });
-        if (readFirst && payload.call_id) defer({ gen, skill: skill.name });
-        else violate(R, "trigger-skipped", `${skill.name} c${gen}`);
+        if (readFirst && payload.call_id) defer({ gen, skill: skill.name, at });
+        else skip(R, skill.name, gen, at);
+      }
+      for (const skill of R.skills.filter((item) => item.required?.on_paths)) {
+        const hit = edited.some((file) => skill.required.on_paths.some((glob) => pathPattern(glob).test(path.relative(R.copy, path.resolve(R.copy, file)))));
+        if (!hit) continue;
+        R.triggered[skill.name] = (R.triggered[skill.name] ?? 0) + 1;
+        if (!read(skill.name)) (R.nudges ??= {})[skill.name] = gen;
       }
     } else if (entry.type === "response_item" && /_call_output$/.test(payload.type ?? "") && R.log.pending?.[payload.call_id]) {
       const done = Date.parse(entry.timestamp ?? "") || Date.now();
       for (const item of R.log.pending[payload.call_id]) {
         if (item.skill) {
           const answer = R.answers[item.skill];
-          if (!(answer?.gen === item.gen && Date.parse(answer.at) <= done)) violate(R, "trigger-skipped", `${item.skill} c${item.gen}`);
+          if (!(answer?.gen === item.gen && Date.parse(answer.at) <= done)) skip(R, item.skill, item.gen, item.at);
         } else if (item.unread && (R.helper_runs ?? []).some((run) => Date.parse(run) >= item.at - 1000 && Date.parse(run) <= done + 1000)) {
           continue;
         } else if (!(Date.parse(R.closed?.[item.gen] ?? "") <= done)) {
@@ -896,9 +947,9 @@ function noteDrift(R) {
   R.drift = drift;
 }
 
-function scanOne(state, id, rollout, report = true) {
+function scanOne(state, id, rollout, report = true, act = "") {
   const out = [];
-  let steer = "";
+  let steps = [];
   withRecord(state, id, (R) => {
     if (!R) return;
     const before = R.compactions;
@@ -911,11 +962,10 @@ function scanOne(state, id, rollout, report = true) {
       R.scan_error = String(error.message).slice(0, 160);
     }
     noteDrift(R);
-    // Codex has no hook to tell the worker, so the caller steers it once per
-    // newly detected compaction.
-    if (R.tool === "codex" && R.compactions > before) {
-      steer = `Your context was compacted (stage ${R.stage.name}). Before any other action run: ${helperCommand(R, "next")}`;
-    }
+    // Codex has no hook to tell the worker, so a newly detected compaction is
+    // kept on the record until a caller that may act on the worker takes it.
+    if (R.tool === "codex" && R.compactions > before) R.compact_nudge = R.compactions;
+    if (act) steps = actions(R, act === "caught");
     if (!report) return;
     const alarm = (key, text) => {
       if (R.alarms[key]) return;
@@ -945,11 +995,27 @@ function scanOne(state, id, rollout, report = true) {
     }
     if (R.scan_error) alarm(`scan-error:${R.scan_error}`, `scan-error ${R.scan_error} (${where})`);
     for (const label of R.drift) alarm(`changed:${label}`, `rules-changed ${label} differs on disk from what this session was given; relaunch needed`);
-    for (const entry of R.violations) alarm(`violation:${entry.kind}:${entry.detail}`, `${entry.kind} ${entry.detail} (${where})`);
+    for (const entry of R.violations) {
+      if (entry.caught && (corrected(R, entry) || now() - entry.caught < CORRECT_SECS)) continue;
+      alarm(`violation:${entry.kind}:${entry.detail}`, `${entry.kind} ${entry.detail} (${where})`);
+    }
     if (R.same_turn_calls && stage.closed) alarm(`same-turn:${stage.gen}`, `same-turn-calls ${R.same_turn_calls} tool call(s) ran between a mid-turn compaction and its refresh (${where})`);
   });
-  for (const line of out) process.stdout.write(`project-rules: ${id} ${line}\n`);
-  if (steer) process.stdout.write(`fm-steer: ${steer}\n`);
+  // Written at once, since the responder's loop never yields to pending output.
+  fs.writeSync(1, [...steps, ...out.map((line) => `project-rules: ${id} ${line}`)].map((line) => `${line}\n`).join(""));
+}
+
+// One Codex worker's responder: it reads the session log each time it grows
+// and prints what is due at once. It returns after a short while so its caller
+// resolves the log again, and at once when the task or this responder is replaced.
+function respond([state, id, rollout, pidfile, pid]) {
+  const mine = () => fs.existsSync(recordPath(state, id)) && fs.existsSync(pidfile) && fs.readFileSync(pidfile, "utf8").trim() === pid;
+  let seen = -1;
+  for (const until = Date.now() + 20000; Date.now() < until && mine(); sleep(250)) {
+    const size = fs.statSync(rollout, { throwIfNoEntry: false })?.size ?? -1;
+    if (size !== seen) scanOne(state, id, rollout, false, "caught");
+    seen = size;
+  }
 }
 
 // ---- readiness, size, status ---------------------------------------------
@@ -966,7 +1032,7 @@ function ready([state, id]) {
       if (stage.closed && R.log.native[`${stage.gen}:${rule.id}`] !== true) open.push(`the tool's own log does not show ${rule.label}, which the project declares it loads by itself`);
     }
     for (const entry of R.violations) {
-      if (!R.alarms[`violation:${entry.kind}:${entry.detail}`]) open.push(`${entry.kind} ${entry.detail} has not reached the supervisor yet; it is reported on the next scan`);
+      if (!R.alarms[`violation:${entry.kind}:${entry.detail}`] && !corrected(R, entry)) open.push(`${entry.kind} ${entry.detail} has not reached the supervisor yet; it is reported on the next scan`);
     }
     const changed = [
       ...spawnSync("git", ["-C", R.copy, "diff", "--name-only", R.head, "HEAD"], { encoding: "utf8" }).stdout.split("\n"),
@@ -1035,10 +1101,10 @@ function mergeSettings([file, state, id]) {
 
 const [verb, ...args] = process.argv.slice(2);
 const verbs = {
-  admit, next, ack, serve, hook, ready, size, status, emit,
+  admit, next, ack, serve, hook, ready, size, status, emit, respond,
   "merge-settings": mergeSettings,
-  scan: ([state, id, rollout]) => scanOne(state, id, rollout),
-  detect: ([state, id, rollout]) => scanOne(state, id, rollout, false),
+  scan: ([state, id, rollout, act]) => scanOne(state, id, rollout, true, act),
+  detect: ([state, id, rollout, act]) => scanOne(state, id, rollout, false, act),
 };
 if (!verbs[verb]) die(`unknown verb ${verb ?? ""}`);
 if (verb === "hook" && args[2] !== "session-start") failCode = 2;

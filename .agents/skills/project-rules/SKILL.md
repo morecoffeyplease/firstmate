@@ -26,7 +26,7 @@ The worker must take those from its own context, or the receipt proves nothing.
 | `native-missing` | The project's declared list claims a file the tool did not load. Relaunch does not fix it; report the rule id to the project's owner as a defect in the list or the tool version. |
 | `witness-mismatch` | A compaction was seen by one signal only. Check that the stage for that compaction exists and is answered; if the hook or log format changed, run the live guard and report the tool version. |
 | `rules-changed` | A rule file changed under a running session. Relaunch the worker so it is admitted on the new content. |
-| `trigger-skipped` | A Codex worker ran a triggering command without the required skill. Steer it to load the skill named in the alarm, and judge the work done in between against that skill before accepting it. |
+| `trigger-skipped` | A Codex worker ran a triggering command without the required skill, and was already told which skill to load when that was seen. Steer it again to load the skill named in the alarm and run the command again, and judge the work done in between against that skill before accepting it. |
 | `worked-before-admission`, `worked-before-refresh` | A Codex worker acted before answering a stage. Steer it to run `next`, and review what it did in that window. |
 | `same-turn-calls` | Informational: note the count beside the task and review that window if the work touched an area with a required skill. |
 | `receipt-table-exhausted` | Relaunch the worker; a relaunch renders a new table. |

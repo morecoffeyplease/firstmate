@@ -12,6 +12,8 @@
 #   fm-project-rules.sh scan [<state> [<id>]]        Read the tool's own log; print one
 #     "project-rules: <id> <alarm>" line per new alarm episode.
 #   fm-project-rules.sh detect <state> <id>          The same read, with no alarm output.
+#   fm-project-rules.sh respond <state> [<id>]       Start the responder of every Codex task
+#     that has none; with an id, be that task's responder until the task ends.
 #   fm-project-rules.sh ready <state> <id>           Nonzero while a stage or a required skill is owed.
 #   fm-project-rules.sh size <copy> <tool>           Payload and block bytes for a prepared copy.
 #   fm-project-rules.sh status <state> <id>          The task's record, without its receipt codes.
@@ -31,7 +33,7 @@ esac
 case "$1" in
   admit) [ -e "${4:-}/.agents/project-rules.json" ] || { rm -rf -- "${2:-/nonexistent}/${3:-x}.project-rules" "${2:-/nonexistent}/${3:-x}.project-rules.d"; exit 3; } ;;
   next | ready | detect | hook | status | serve | ack) [ -e "${2:-}/${3:-}.project-rules" ] || { [ "$1" != next ] || echo "Project rules: nothing is declared for this task."; exit 0; } ;;
-  scan) [ -n "${3:-}" ] || ls "${2:-${FM_STATE_OVERRIDE:-${FM_HOME:-$SCRIPT_DIR/..}/state}}"/*.project-rules >/dev/null 2>&1 || exit 0 ;;
+  scan | respond) [ -n "${3:-}" ] || ls "${2:-${FM_STATE_OVERRIDE:-${FM_HOME:-$SCRIPT_DIR/..}/state}}"/*.project-rules >/dev/null 2>&1 || exit 0 ;;
 esac
 if ! command -v node >/dev/null 2>&1; then
   echo "fm-project-rules: node is required and was not found on PATH" >&2
@@ -57,14 +59,29 @@ rollout_for() {  # <state> <id>
   ( . "$SCRIPT_DIR/fm-busy-lib.sh" && fm_busy_codex_rollout_log "$1" "$2" ) 2>/dev/null || true
 }
 
-# Read one task's log. A newly detected Codex compaction comes back as one
-# "fm-steer:" line, which is delivered through the task's steering inbox since
-# Codex has no hook that could tell the worker itself.
+# Act on a Codex worker, since it has no hook that could: "fm-interrupt" stops
+# its turn through the control plane and each "fm-steer:" line is delivered
+# through its steering inbox. Every other line is passed on.
+act() {  # <state> <id>
+  local line home="${FM_HOME:-$(dirname "$1")}"
+  while IFS= read -r line; do
+    case "$line" in
+      fm-interrupt) FM_HOME="$home" "${FM_PROJECT_RULES_CONTROL:-$SCRIPT_DIR/fm-control.sh}" "$2" interrupt >/dev/null 2>&1 || true ;;
+      "fm-steer: "*) FM_HOME="$home" "${FM_PROJECT_RULES_SEND:-$SCRIPT_DIR/fm-send.sh}" "$2" "${line#fm-steer: }" >/dev/null 2>&1 || true ;;
+      '') ;;
+      *) printf '%s\n' "$line" ;;
+    esac
+  done
+}
+
+# Read one task's log and act on what it shows, unless FM_PROJECT_RULES_OBSERVE
+# is set, which leaves acting to the task's responder.
 # A read that fails outright is reported once per distinct failure, so a locked
 # or corrupt record reaches the supervisor instead of vanishing.
 read_log() {  # <scan|detect> <state> <id>
-  local line out rc=0 failed="$2/$3.project-rules.scan-failed" reason
-  out=$(engine "$1" "$2" "$3" "$(rollout_for "$2" "$3")" 2>"$failed.new") || rc=$?
+  local out rc=0 failed="$2/$3.project-rules.scan-failed" reason may=act
+  [ -z "${FM_PROJECT_RULES_OBSERVE:-}" ] || may=
+  out=$(engine "$1" "$2" "$3" "$(rollout_for "$2" "$3")" "$may" 2>"$failed.new") || rc=$?
   rm -f -- "$2/$3.project-rules.detect-failed"
   if [ "$rc" -ne 0 ]; then
     : > "$2/$3.project-rules.detect-failed"
@@ -75,17 +92,25 @@ read_log() {  # <scan|detect> <state> <id>
     rm -f -- "$failed"
   fi
   rm -f -- "$failed.new"
-  while IFS= read -r line; do
-    case "$line" in
-      "fm-steer: "*)
-        FM_HOME="${FM_HOME:-$(dirname "$2")}" "${FM_PROJECT_RULES_SEND:-$SCRIPT_DIR/fm-send.sh}" "$3" "${line#fm-steer: }" >/dev/null 2>&1 || true
-        ;;
-      '') ;;
-      *) printf '%s\n' "$line" ;;
-    esac
-  done <<EOF_LOG
+  act "$2" "$3" <<EOF_LOG
 $out
 EOF_LOG
+}
+
+# The responder of one Codex task follows that task's session log and acts on
+# it within about a second. It ends with the task, or when a relaunch or
+# another responder replaces its claim.
+respond_task() {  # <state> <id>
+  local claim="$1/$2.project-rules.d/responder.pid" rollout
+  printf '%s\n' "$$" > "$claim" || return 1
+  while [ -e "$1/$2.project-rules" ] && [ "$(cat "$claim" 2>/dev/null)" = "$$" ]; do
+    rollout=$(rollout_for "$1" "$2")
+    if [ -n "$rollout" ]; then
+      engine respond "$1" "$2" "$rollout" "$claim" "$$" | act "$1" "$2"
+      [ "${PIPESTATUS[0]}" -ne 0 ] || continue
+    fi
+    sleep 1
+  done
 }
 
 verb=$1
@@ -101,6 +126,23 @@ case "$verb" in
         read_log scan "$state" "$(basename "$record" .project-rules)"
       done
     fi
+    ;;
+  respond)
+    state=${1:-${FM_STATE_OVERRIDE:-${FM_HOME:-$SCRIPT_DIR/..}/state}}
+    if [ -n "${2:-}" ]; then
+      respond_task "$state" "$2"
+      exit 0
+    fi
+    # Claude keeps its hook, so only a task bound to a Codex session log gets a
+    # responder. Each is detached from the watcher cycle that started it, in
+    # its own process group, so it outlives that cycle.
+    for record in "$state"/*.project-rules; do
+      id=$(basename "$record" .project-rules)
+      [ -f "$record" ] && [ -e "$state/$id.codex-session" ] || continue
+      pid=$(cat "$record.d/responder.pid" 2>/dev/null) || pid=
+      case "$pid" in '' | *[!0-9]*) ;; *) ps -o command= -p "$pid" 2>/dev/null | grep -q 'fm-project-rules.sh respond ' && continue ;; esac
+      ( set -m 2>/dev/null || true; nohup "$0" respond "$state" "$id" </dev/null >/dev/null 2>&1 & )
+    done
     ;;
   next)
     # The worker is already asking, so a compaction found here needs no steer.

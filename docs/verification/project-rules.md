@@ -102,5 +102,5 @@ $ bash tests/fm-project-rules.test.sh | tail -1
 # all fm-project-rules tests passed
 ```
 
-`tests/fm-project-rules.test.sh` (32 cases) covers admission refusals, the block, receipts, chained reads, Claude hook verdicts, every Codex command shape, both log formats, drift, readiness, failures inside the hook and the scan, the settings merge, and three cases that drive the real `bin/fm-spawn.sh` against a fake pane.
+`tests/fm-project-rules.test.sh` (34 cases) covers admission refusals, the block, receipts, chained reads, Claude hook verdicts, every Codex command shape, both log formats, the Codex responder and what it must leave alone, drift, readiness, failures inside the hook and the scan, the settings merge, and three cases that drive the real `bin/fm-spawn.sh` against a fake pane.
 It touches no real tool.

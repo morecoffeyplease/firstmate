@@ -2155,6 +2155,11 @@ while :; do
     reconcile_requests_detached
   fi
 
+  # A Codex worker in a project with declared rules has no hook, so a detached
+  # responder follows its session log; bin/fm-project-rules.sh owns it and
+  # starts only the ones that are missing.
+  FM_HOME="$FM_HOME" "$SCRIPT_DIR/fm-project-rules.sh" respond "$STATE" </dev/null >/dev/null 2>&1 || true
+
   # Parent-owned secondmate pending-reply reconciliation: resolve correlated
   # parent reports, observe backend busy/idle turn completion, send one recovery
   # repost after grace, and escalate once if the recovery turn is also missed.

@@ -59,7 +59,7 @@ fm_live_gate opt-in FM_PROJECT_RULES_LIVE_E2E herdr jq node treehouse git
 
 note() { printf '# %s\n' "$1"; }
 PR="$ROOT/bin/fm-project-rules.sh"
-export FM_PROJECT_RULES_SEND=true  # this guard's own log reads must not steer the worker under test
+export FM_PROJECT_RULES_OBSERVE=1  # this guard's own log reads leave acting on the worker to its responder
 TOOLS=${FM_PROJECT_RULES_LIVE_TOOLS:-claude codex}
 RUNS=${FM_PROJECT_RULES_LIVE_RUNS:-2}
 TMP=$(fm_test_tmproot fm-project-rules-live)
@@ -253,6 +253,23 @@ send_stage() {  # <letter>
   say "First run your project rules next command and do everything it prints. After that, read the file $file and do exactly what it says."
 }
 
+# The watcher starts a Codex worker's responder. No watcher runs here, so the
+# guard starts it the same way, through the real control and steering planes.
+# A replayed session sits in a pane fm-spawn did not create, so there the
+# interrupt and the message are typed into that pane directly.
+start_responder() {  # [replay]
+  [ "$TOOL" = codex ] || return 0
+  if [ "${1:-}" = replay ]; then
+    printf '#!/usr/bin/env bash\n%q run %q pane send-keys %q Escape >/dev/null\n' "$LAB_HELPER" "$LAB" "$PANE" > "$TMP/$ID.control"
+    printf '#!/usr/bin/env bash\n%q run %q pane send-text %q "$2" >/dev/null && sleep 1.5 && %q run %q pane send-keys %q Enter >/dev/null\n' "$LAB_HELPER" "$LAB" "$PANE" "$LAB_HELPER" "$LAB" "$PANE" > "$TMP/$ID.send"
+    chmod +x "$TMP/$ID.control" "$TMP/$ID.send"
+    FM_PROJECT_RULES_CONTROL="$TMP/$ID.control" FM_PROJECT_RULES_SEND="$TMP/$ID.send" "$PR" respond "$STATE"
+  else
+    env -u HERDR_ENV -u HERDR_PANE_ID -u HERDR_TAB_ID -u HERDR_WORKSPACE_ID -u HERDR_SOCKET_PATH -u HERDR_BIN_PATH -u FM_TASK_ID \
+      PATH="$SHIM:$PATH" HERDR_SESSION="$LAB" FM_HOME="$HOME_DIR" FM_ROOT_OVERRIDE="$ROOT" "$PR" respond "$STATE"
+  fi
+}
+
 spawn_worker() {  # <tool> <run>
   TOOL=$1; ID="rules-$1-$2"; REPORT="$HOME_DIR/data/$ID/report.md"
   FM_HOME="$HOME_DIR" FM_ROOT_OVERRIDE="$ROOT" "$ROOT/bin/fm-brief.sh" "$ID" project --scout >/dev/null || fail "could not scaffold a brief"
@@ -269,6 +286,7 @@ spawn_worker() {  # <tool> <run>
     || fail "$1: the real fm-spawn refused the worker: $(tail -5 "$TMP/$ID.spawn" | tr '\n' ' ')"
   PANE=$(sed -n 's/^herdr_pane_id=//p' "$STATE/$ID.meta")
   VERSION=$(field version)
+  start_responder
   [ -f "$(sed -n 's/^worktree=//p' "$STATE/$ID.meta")/.prepared" ] || [ -n "${FM_PROJECT_RULES_ACCEPT_REPO:-}" ] || fail "$1: the project prepare step did not run in the fresh copy"
 }
 
@@ -277,7 +295,7 @@ check_stage() {
   local stage=$1 gen=$2 section child token kind alarms probe
   local waited=0
   wait_status "working: $stage written" 600
-  # A Codex compaction is steered at the turn end, so give the refresh time to land.
+  # A Codex compaction is answered by the responder, so give the refresh time to land.
   while [ "$waited" -lt 300 ]; do
     "$PR" detect "$STATE" "$ID" >/dev/null 2>&1 || true
     [ "$(field stage.closed)" = null ] || break
@@ -368,6 +386,7 @@ replay_worker() {  # <tool> <run>
   PANE=$(lab workspace create --label "auto-$1-$2" --cwd "$wt" --no-focus | jq -r '.result.root_pane.pane_id')
   lab pane run "$PANE" "$script" >/dev/null || fail "$1: could not start the replayed launch"
   VERSION=$(field version)
+  start_responder replay
 }
 
 # ---- checks that do not depend on a worker ---------------------------------
@@ -439,7 +458,7 @@ check_refused_launch() {
 # here once per tool as a leg of their own.
 check_negatives() {
   check_refused_launch "$1"
-  bash "$ROOT/tests/fm-project-rules.test.sh" > "$TMP/portable-$1.log" 2>&1 || fail "$1: the deterministic refusal suite failed: $(grep '^not ok' "$TMP/portable-$1.log" | head -3 | tr '\n' ' ')"
+  env -u FM_PROJECT_RULES_OBSERVE bash "$ROOT/tests/fm-project-rules.test.sh" > "$TMP/portable-$1.log" 2>&1 || fail "$1: the deterministic refusal suite failed: $(grep '^not ok' "$TMP/portable-$1.log" | head -3 | tr '\n' ' ')"
   pass "$1: wrong and reused rows, skipped parts, skipped triggers, double compactions, a missed hook and an oversized block are all refused"
 }
 
@@ -488,7 +507,14 @@ for TOOL_NAME in $TOOLS; do
       replay_worker "$TOOL_NAME" "$run"
       group=1
       while :; do
-        wait_status "working: F$group done" 600
+        # A turn that compacts is interrupted by the responder, so a group ends
+        # when it is reported done or the compaction is on record.
+        waited=0
+        until grep -qF "working: F$group done" "$STATE/$ID.status" 2>/dev/null || [ "$(field compactions)" -ge 1 ] 2>/dev/null; do
+          "$PR" detect "$STATE" "$ID" >/dev/null 2>&1 || true
+          sleep 2; waited=$((waited + 2))
+          [ "$waited" -lt 600 ] || fail "$TOOL $VERSION: filler group $group neither finished nor compacted"
+        done
         "$PR" detect "$STATE" "$ID" >/dev/null 2>&1 || true
         [ "$(field compactions)" -lt 1 ] 2>/dev/null || break
         group=$((group + 1)); [ "$group" -le "$GROUPS_MAX" ] || break
