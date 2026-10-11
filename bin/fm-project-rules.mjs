@@ -722,25 +722,35 @@ function newLines(R, file) {
 
 // A sub-agent writes its own session log in the same copy, and for a while it
 // is the one written last. The task's log is the root session's, so a
-// sub-agent's log is never adopted in its place.
-function childLog(file) {
-  let handle;
-  try {
-    handle = fs.openSync(file, "r");
-    const buffer = Buffer.alloc(65536);
-    let first = "";
-    for (let at = 0; !first.includes("\n") && at < 4 << 20; at += buffer.length) {
-      const got = fs.readSync(handle, buffer, 0, buffer.length, at);
-      if (!got) break;
-      first += buffer.subarray(0, got).toString("latin1");
+// sub-agent's log is followed back through the parent each one names. One
+// whose parent cannot be found is an error, never a silent skip.
+function rootLog(file) {
+  const inside = (dir) => fs.readdirSync(dir, { withFileTypes: true }).filter((entry) => entry.isDirectory()).map((entry) => path.join(dir, entry.name));
+  for (let hops = 0; hops < 8; hops += 1) {
+    let meta = {};
+    const handle = fs.openSync(file, "r");
+    try {
+      const buffer = Buffer.alloc(65536);
+      let first = "";
+      for (let at = 0; !first.includes("\n") && at < 4 << 20; at += buffer.length) {
+        const got = fs.readSync(handle, buffer, 0, buffer.length, at);
+        if (!got) break;
+        first += buffer.subarray(0, got).toString("latin1");
+      }
+      meta = JSON.parse(first.split("\n")[0]).payload ?? {};
+    } catch {
+      meta = {};
+    } finally {
+      fs.closeSync(handle);
     }
-    const meta = JSON.parse(first.split("\n")[0]).payload ?? {};
-    return meta.thread_source === "subagent" || Boolean(meta.source?.subagent);
-  } catch {
-    return false;
-  } finally {
-    if (handle !== undefined) fs.closeSync(handle);
+    if (meta.thread_source !== "subagent" && !meta.source?.subagent) return file;
+    const parent = String(meta.source?.subagent?.thread_spawn?.parent_thread_id ?? meta.parent_thread_id ?? "");
+    const found = inside(path.resolve(path.dirname(file), "../../..")).flatMap(inside).flatMap(inside)
+      .flatMap((day) => fs.readdirSync(day).filter((name) => parent && name.endsWith(`-${parent}.jsonl`)).map((name) => path.join(day, name)));
+    if (found.length !== 1) throw new Error(`the session that spawned sub-agent log ${path.basename(file)} was not found`);
+    [file] = found;
   }
+  throw new Error("sub-agent session logs nest too deeply");
 }
 
 function violate(R, kind, detail) {
@@ -978,8 +988,7 @@ function scanOne(state, id, rollout, report = true, act = "") {
     const before = R.compactions;
     const block = fs.readFileSync(path.join(dirPath(state, id), "block.txt"), "utf8").trimEnd();
     try {
-      const log = rollout && childLog(rollout) ? R.log.file : rollout;
-      if (R.tool === "codex" && log) scanCodex(R, block, log);
+      if (R.tool === "codex" && rollout) scanCodex(R, block, rootLog(rollout));
       if (R.tool === "claude") scanClaude(R, block);
       delete R.scan_error;
     } catch (error) {
@@ -1034,10 +1043,16 @@ function scanOne(state, id, rollout, report = true, act = "") {
 // resolves the log again, and at once when the task or this responder is replaced.
 function respond([state, id, rollout, pidfile, pid]) {
   const mine = () => fs.existsSync(recordPath(state, id)) && fs.existsSync(pidfile) && fs.readFileSync(pidfile, "utf8").trim() === pid;
-  const log = childLog(rollout) ? JSON.parse(fs.readFileSync(recordPath(state, id), "utf8")).log.file : rollout;
+  // A log whose root cannot be found is still handed to the scan, which records the error.
+  let log = rollout;
+  try {
+    log = rootLog(rollout);
+  } catch {
+    log = rollout;
+  }
   let seen = -1;
   for (const until = Date.now() + 20000; Date.now() < until && mine(); sleep(250)) {
-    const size = (log && fs.statSync(log, { throwIfNoEntry: false })?.size) ?? -1;
+    const size = fs.statSync(log, { throwIfNoEntry: false })?.size ?? -1;
     if (size !== seen) scanOne(state, id, rollout, false, "caught");
     seen = size;
   }

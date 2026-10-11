@@ -601,7 +601,7 @@ test_codex_sub_agent_log_is_never_read_as_the_workers() {
   read_all tests >/dev/null
   # A sub-agent's session log in the same copy, written after the worker's own.
   child="$(dirname "$LOG")/rollout-$(date +%Y-%m-%dT%H-%M-%S)-child.jsonl"
-  printf '%s\n' "{\"type\":\"session_meta\",\"payload\":{\"cwd\":\"$COPY\",\"thread_source\":\"subagent\"}}" '{"type":"compacted","payload":{"replacement_history":[]}}' > "$child"
+  printf '%s\n' "{\"type\":\"session_meta\",\"payload\":{\"cwd\":\"$COPY\",\"thread_source\":\"subagent\",\"parent_thread_id\":\"x\"}}" '{"type":"compacted","payload":{"replacement_history":[]}}' > "$child"
   node -e 'const t=new Date(Date.now()-60000);require("fs").utimesSync(process.argv[1],t,t)' "$LOG"
   # shellcheck source=bin/fm-busy-lib.sh
   assert_equals "$child" "$( . "$ROOT/bin/fm-busy-lib.sh" && fm_busy_codex_rollout_log "$STATE" t1 )" "the sub-agent's log is the one written last, which is what makes it a candidate"
@@ -610,7 +610,11 @@ test_codex_sub_agent_log_is_never_read_as_the_workers() {
   assert_equals 1 "$(field compactions)" "a compaction record in a sub-agent's log is not the worker's compaction"
   codex_log '[started(),call("bun run test", new Date(Date.now()+4000).toISOString())]'
   assert_equals "" "$("$PR" scan "$STATE" t1 | grep -v ' same-turn-calls ')" "the worker's log is read on from where it was, so an earlier command is not judged again against a later read"
-  pass "a sub-agent's session log in the same copy is never read as the worker's, and the worker's log is not read again from its start"
+  printf '%s\n' "{\"type\":\"session_meta\",\"payload\":{\"cwd\":\"$COPY\",\"thread_source\":\"subagent\",\"parent_thread_id\":\"gone\"}}" > "$child"
+  node -e 'const t=new Date(Date.now()-60000);require("fs").utimesSync(process.argv[1],t,t)' "$LOG"
+  assert_contains "$("$PR" scan "$STATE" t1)" "scan-error the session that spawned sub-agent log" "a sub-agent log whose parent session cannot be found must be reported, not skipped"
+  "$PR" ready "$STATE" t1 2>/dev/null && fail "a log that could not be traced to the worker's session must block readiness"
+  pass "a sub-agent's session log in the same copy is never read as the worker's: the worker's log is found through it and read on from where it was, and one that cannot be traced is reported"
 }
 
 test_a_slow_pattern_counts_as_a_match() {
