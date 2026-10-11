@@ -67,10 +67,10 @@ read_all() {
   out=$("$PR" serve "$STATE" t1 "$what") || return 1
   while :; do
     parts=$((parts + 1))
+    case "$out" in *"RECORDED: $what is fully read"*) break ;; esac
     code=$(printf '%s\n' "$out" | sed -n "s/.*Run this exact command now: .* '$what' \([0-9a-f]\{8\}\) ===\$/\1/p" | tail -1)
     [ -n "$code" ] || return 1
     out=$("$PR" serve "$STATE" t1 "$what" "$code") || return 1
-    case "$out" in RECORDED:*) break ;; esac
   done
   printf '%s\n' "$parts"
 }
@@ -182,6 +182,9 @@ test_a_skipped_part_cannot_complete() {
   assert_contains "$out" "tests: PART 2 OF" "the first code must release exactly the second part"
   assert_not_contains "$out" "TAIL-OF-TESTS-SKILL" "the second part must not contain the end of a longer skill"
   assert_equals undefined "$(field 'answers.tests')" "a partly read skill must not be recorded"
+  out=$("$PR" serve "$STATE" t1 flow)
+  assert_contains "$out" "RECORDED: flow is fully read (1 part(s))." "serving the last part must record the read, with nothing left to run after it"
+  assert_equals 0 "$(field 'answers.flow.gen')" "a one-part skill is recorded by the read that served it"
   second=$(printf '%s\n' "$out" | sed -n "s/.*Run this exact command now: .* 'tests' \([0-9a-f]\{8\}\) ===\$/\1/p")
   assert_not_equals "$first" "$second" "each part must carry its own code"
   pass "a skill is recorded only after every part was requested in order"
@@ -357,7 +360,10 @@ test_codex_scan_between_turn_compaction_and_triggers() {
   out=$("$PR" scan "$STATE" t1)
   assert_contains "$out" "trigger-skipped tests c1" "a triggered command without its skill must alarm on Codex, even when it mentions the helper"
   "$PR" ready "$STATE" t1 2>/dev/null && fail "a reported violation must still block readiness while its skill is unread"
-  read_all tests >/dev/null; "$PR" ready "$STATE" t1 || fail "readiness must pass once the violation is reported and the skill is read after it"
+  read_all tests >/dev/null
+  "$PR" ready "$STATE" t1 2>/dev/null && fail "a skipped trigger must block readiness until the command is run again after the skill is read"
+  codex_log '[call("bun run test", new Date(Date.now()+2000).toISOString())]'
+  "$PR" ready "$STATE" t1 || fail "readiness must pass once the skill is read and the command was run again after it"
   pass "the Codex scan accepts next-turn evidence and catches a triggered command run without its skill"
 }
 

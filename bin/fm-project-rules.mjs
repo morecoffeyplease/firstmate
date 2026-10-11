@@ -590,13 +590,17 @@ function serve([state, id, what, given]) {
       done = parts.findIndex((_, index) => code(index + 1) === given) + 1;
       if (!done) die(`that code does not belong to ${what} at this stage; start again with: ${helperCommand(R, "serve", q(what))}`);
     }
-    if (done === parts.length) {
+    if (done === parts.length) return process.stdout.write(`RECORDED: ${what} is already fully read (${parts.length} part(s)).\n`);
+    const part = done + 1;
+    // Serving the last part records the read, so there is no step after it
+    // for a worker to miss; every earlier part still has to be asked for by
+    // the code its predecessor ended with.
+    if (part === parts.length) {
       if (what === "brief") R.stage.brief = true;
       else R.answers[what] = { gen: R.compactions, at: new Date().toISOString() };
       settle(R);
-      return process.stdout.write(`RECORDED: ${what} is fully read (${parts.length} part(s)).${owed(R).length ? ` Next: ${helperCommand(R, "next")}` : ""}\n`);
+      return process.stdout.write(`=== ${what}: PART ${part} OF ${parts.length}, the last part. ===\n${parts[part - 1]}RECORDED: ${what} is fully read (${parts.length} part(s)).${owed(R).length ? ` Next, run: ${helperCommand(R, "next")}` : " Nothing more is owed."}\n`);
     }
-    const part = done + 1;
     const run = helperCommand(R, "serve", q(what), code(part));
     process.stdout.write(`=== ${what}: PART ${part} OF ${parts.length}. NOT FINISHED until the helper prints RECORDED; the exact next command is on the last line. ===\n${parts[part - 1]}=== PART ${part} OF ${parts.length} - NOT FINISHED. Nothing is recorded yet. Run this exact command now: ${run} ===\n`);
   });
@@ -764,7 +768,7 @@ function codexCommands(payload) {
   const edits = /patch|edit|write/i.test(String(payload.name ?? ""));
   const bare = sites > found.length || (!found.length && edits);
   const raw = bare || found.some((command) => command.includes("${")) ? strings([payload.input, payload.arguments, payload.action]).join(" ") : "";
-  return { literals: found, bare, raw };
+  return { literals: found, bare, raw, sites };
 }
 
 function scanCodex(R, block, file) {
@@ -791,7 +795,7 @@ function scanCodex(R, block, file) {
       const closed = Date.parse(R.closed?.[gen] ?? "") || Infinity;
       // A helper call written as a template, with its arguments filled from a
       // loop, is still a helper call; anything else unreadable is work.
-      const { literals, bare, raw } = codexCommands(payload);
+      const { literals, bare, raw, sites } = codexCommands(payload);
       // Its placeholders must be filled from plain words: any other string in
       // the call that holds a space or a shell character makes it ordinary work.
       const plain = !/\$\{/.test(raw) || [...raw.replace(/`[^`]*`/g, "").matchAll(/"((?:[^"\\]|\\.)*)"|'((?:[^'\\]|\\.)*)'/g)].every((match) => /^[\w:.-]*$/.test(match[1] ?? match[2] ?? ""));
@@ -818,7 +822,8 @@ function scanCodex(R, block, file) {
         // A command the scan could not read may be the helper itself, spelled
         // through a variable; that too is judged at the call's output, against
         // the helper runs the engine noted.
-        const unread = literals.every((command) => helper(command));
+        // Only a call holding a single command can be explained by one helper run.
+        const unread = sites === 1 && literals.every((command) => helper(command));
         if (payload.call_id && (unread || literals.slice(0, firstWork).some((command) => helper(command)))) defer({ gen, turn: R.log.turn, at, unread });
         else early();
       }
@@ -827,7 +832,10 @@ function scanCodex(R, block, file) {
         if (hit < 0) continue;
         R.triggered[skill.name] = (R.triggered[skill.name] ?? 0) + 1;
         const answer = R.answers[skill.name];
-        if (answer?.gen === gen && Date.parse(answer.at) <= at) continue;
+        if (answer?.gen === gen && Date.parse(answer.at) <= at) {
+          (R.ran_after_read ??= {})[skill.name] = new Date(at).toISOString();
+          continue;
+        }
         // One call can finish reading the skill and then run the command. That
         // is in order only when the read comes first in the same call, so it
         // is judged when the call's output is logged.
@@ -967,8 +975,11 @@ function ready([state, id]) {
     for (const skill of R.skills.filter((entry) => entry.required && !entry.required.at)) {
       const answer = R.answers[skill.name];
       const touched = skill.required.on_paths?.some((glob) => changed.some((file) => pathPattern(glob).test(file)));
-      // A command that ran without its skill stays owed until the skill is read afterwards.
-      const skipped = R.violations.some((entry) => entry.kind === "trigger-skipped" && entry.detail.startsWith(`${skill.name} `) && !(answer && Date.parse(answer.at) >= Date.parse(entry.at)));
+      // A command that ran without its skill in the current generation stays
+      // owed until the skill is read and the command is run again after it;
+      // being reported to the supervisor does not settle it.
+      const rerun = Date.parse(R.ran_after_read?.[skill.name] ?? "");
+      const skipped = R.violations.some((entry) => entry.kind === "trigger-skipped" && entry.detail === `${skill.name} c${R.compactions}` && !(answer && rerun >= Date.parse(answer.at)));
       if ((touched && !answered(R, skill.name)) || skipped) open.push(`required skill ${skill.name} was due and is not loaded: ${helperCommand(R, "serve", q(skill.name))}`);
     }
     return open;

@@ -103,7 +103,8 @@ The worker is launched on an admission message alone: its role, and the instruct
 Its task is not in that message.
 `next` lists the receipt row and the required reads, and offers the task brief only once those are recorded, so a worker that has not finished reading has no task to start on.
 The brief itself carries a short gate that sends the worker back to `next` after any compaction.
-Every part the helper serves ends with a line saying it is not finished and naming the exact next command, and a read counts only when the helper prints `RECORDED`.
+Every part but the last ends with a line saying it is not finished and naming the exact next command.
+Serving the last part records the read and ends with `RECORDED`, so no step follows it for a worker to miss.
 
 A quoted row shows that the end of the block is in context, or that its text was copied into a summary, so it is supporting evidence only.
 The proof is the tool's own log holding the whole block for that generation, compared after removing trailing newlines:
@@ -119,8 +120,8 @@ Each stage uses a new row, so after 64 stages the task needs a relaunch, which r
 The catalog is in the block, so a worker knows which skills exist at start and after every compaction.
 Reading a skill is the worker's choice unless the list marks it required.
 
-A required skill is read through `fm-project-rules.sh serve`, which delivers the declared body and references in parts of about 6 KB.
-Each part ends with the code that requests the next one, so no part can be skipped and a part cut short by a tool's output limit breaks the chain.
+A required skill is read through `fm-project-rules.sh serve`, which delivers the declared body and references in parts of about 10 KB.
+Each part but the last ends with the code that requests the next one, so no earlier part can be skipped and one cut short by a tool's output limit breaks the chain.
 A read is recorded for the current compaction generation and lapses at the next compaction.
 
 | Trigger | Claude | Codex |
@@ -185,7 +186,7 @@ The two compaction signals are the hook and the transcript's `compact_boundary` 
 - the tool's own log does not show the block, or a file declared native, for the current generation;
 - a declared source changed on disk, or the tool's own log or the task's record could not be read;
 - a violation has been recorded but has not yet reached the supervisor as an alarm;
-- a command ran without its required skill and the skill has not been read since;
+- a command ran without its required skill in the current generation, and the skill has not since been read and the command run again after it;
 - the work changed files under a required skill's paths and that skill is not read in the current generation.
 
 ## Qualification (`config/project-rules-qualified`)
