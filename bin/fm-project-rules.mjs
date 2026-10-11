@@ -219,11 +219,13 @@ const helperCall = (command, R) => helperWords(command, R) !== null;
 // is tried by itself: a script that runs the command on a line of its own, or
 // after a long here-document, is still matched. Each line is also tried with
 // its quoting and grouping characters blanked, so a wrapper such as
-// sh -c "..." does not hide it. The patterns are matched under a time limit,
+// sh -c "..." does not hide it. A line continued with a backslash is joined
+// first, as a shell would, and a tab counts as the space a pattern is written
+// with. The patterns are matched under a time limit,
 // and one that runs out of time counts as a match, so a slow pattern or a huge
 // command cannot stall the hook or the watcher and cannot hide a command either.
 function commandMatches(patterns, command) {
-  const lines = String(command).split(/\r?\n|\\n/);
+  const lines = String(command).replace(/\\\r?\n/g, "").replace(/\t/g, " ").split(/\r?\n|\\n/);
   const forms = [...new Set([...lines, ...lines.map((line) => line.replace(/["'`(){}]/g, " "))])];
   return patterns.some((pattern) => {
     try {
@@ -546,8 +548,13 @@ function ack([state, id, code]) {
     noteHelper(R);
     const stage = R.stage;
     if (stage.closed || stage.acked) return process.stdout.write("That receipt row is already recorded.\n");
-    if (stage.row < 0 || String(code ?? "").trim().toUpperCase() !== R.table[stage.row]) {
-      die(`that is not the code on row ${String(stage.row).padStart(2, "0")}; read it from the receipt rows at the end of your project rules block`);
+    const given = String(code ?? "").trim().toUpperCase();
+    if (stage.row < 0 || given !== R.table[stage.row]) {
+      // A worker that read the neighbouring line is told which row its code is
+      // on; it supplied that code itself, so nothing about the asked row is given away.
+      const row = (index) => String(index).padStart(2, "0");
+      const other = R.table.indexOf(given);
+      die(`that is ${other >= 0 ? `the code on row ${row(other)}, not` : "not the code on"} row ${row(stage.row)}; read row ${row(stage.row)} from the receipt rows at the end of your project rules block`);
     }
     stage.acked = true;
     settle(R);
@@ -731,7 +738,7 @@ function newLines(R, file) {
 function rootLog(copy, file) {
   const inside = (dir) => fs.readdirSync(dir, { withFileTypes: true }).filter((entry) => entry.isDirectory()).map((entry) => path.join(dir, entry.name));
   for (let hops = 0; hops < 8; hops += 1) {
-    let meta = {};
+    let meta = null;
     const handle = fs.openSync(file, "r");
     try {
       const buffer = Buffer.alloc(65536);
@@ -741,12 +748,15 @@ function rootLog(copy, file) {
         if (!got) break;
         first += buffer.subarray(0, got).toString("latin1");
       }
-      meta = JSON.parse(first.split("\n")[0]).payload ?? {};
+      meta = JSON.parse(first.split("\n")[0]).payload;
     } catch {
-      meta = {};
+      meta = null;
     } finally {
       fs.closeSync(handle);
     }
+    // A log whose first record cannot be read names no session at all, so it
+    // is not taken for the worker's.
+    if (!meta || typeof meta !== "object") throw new Error(`session log ${path.basename(file)} does not start with a readable session record`);
     if (meta.thread_source !== "subagent" && !meta.source?.subagent) {
       if (hops && real(meta.cwd ?? "") !== real(copy)) throw new Error(`sub-agent log traced to ${path.basename(file)}, which is not a session in this task's copy`);
       return file;

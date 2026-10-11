@@ -155,6 +155,9 @@ test_block_receipt_and_chained_reads() {
   "$PR" serve "$STATE" t1 brief >/dev/null 2>&1 && fail "the task brief must be refused before the receipt row and start skills are recorded"
   "$PR" ack "$STATE" t1 ZZZZZZ >/dev/null 2>&1 || rc=$?
   expect_code 1 "$rc" "a wrong receipt code"
+  out=$("$PR" ack "$STATE" t1 "$(node -e 'const r=JSON.parse(require("fs").readFileSync(process.argv[1],"utf8"));process.stdout.write(r.table[(r.stage.row+1)%r.table.length])' "$STATE/t1.project-rules")" 2>&1) && fail "the code of a neighbouring row must be refused"
+  assert_contains "$out" "that is the code on row " "a worker that quoted the neighbouring row must be told which row its code is on"
+  assert_equals false "$(field stage.acked)" "a neighbouring row's code must not record the receipt"
   "$PR" ack "$STATE" t1 "$(row_code)" >/dev/null || fail "the right receipt code must be accepted"
   "$PR" ready "$STATE" t1 2>/dev/null && fail "readiness must fail while the brief and start skill are owed"
   rc=0; "$PR" serve "$STATE" t1 tests deadbeef >/dev/null 2>&1 || rc=$?
@@ -214,6 +217,8 @@ test_claude_hook_verdicts() {
   denied '{"tool_name":"Bash","tool_input":{"command":"sh -c \"bun run test\""}}' "a triggered command hidden in a quoted wrapper" "serve"
   denied '{"tool_name":"Bash","tool_input":{"command":"cat >> notes.md <<EOF\nsome notes\nEOF\nbun run test"}}' "a triggered command on its own line of a longer script" "serve"
   denied "$(node -e 'console.log(JSON.stringify({tool_name:"Bash",tool_input:{command:"cat >> notes.md <<EOF\n"+"filler line\n".repeat(900)+"EOF\nbun run test"}}))')" "a triggered command after a long here-document" "serve"
+  denied '{"tool_name":"Bash","tool_input":{"command":"bun run \\\ntest"}}' "a triggered command continued across lines with a backslash" "serve"
+  denied '{"tool_name":"Bash","tool_input":{"command":"ls;\tbun\trun\ttest"}}' "a triggered command written with tabs" "serve"
   denied "{\"tool_name\":\"Edit\",\"tool_input\":{\"file_path\":\"$COPY/apps/api/src/server/a/b.ts\"}}" "an edit on a triggered path before its skill" "audit"
   allowed "{\"tool_name\":\"Edit\",\"tool_input\":{\"file_path\":\"$COPY/apps/web/x.ts\"}}" "an edit outside the triggered paths must be allowed"
   read_all tests >/dev/null
@@ -628,6 +633,11 @@ test_codex_sub_agent_log_is_never_read_as_the_workers() {
   FM_PROJECT_RULES_OBSERVE=1 "$PR" detect "$STATE" t1
   assert_equals "$LOG" "$(field log.file)" "a sub-agent log must not lead the scan to a session in another copy"
   assert_contains "$(field scan_error)" "not a session in this task" "a trace that leaves the task's copy must be reported"
+  printf 'not a session record\n' > "$(dirname "$LOG")/rollout-$(date +%Y-%m-%dT%H-%M-%S)-broken.jsonl"
+  printf '%s\n' "{\"type\":\"session_meta\",\"payload\":{\"cwd\":\"$COPY\",\"thread_source\":\"subagent\",\"parent_thread_id\":\"broken\"}}" > "$child"
+  node -e 'const t=new Date(Date.now()-60000);require("fs").utimesSync(process.argv[1],t,t)' "$LOG"
+  FM_PROJECT_RULES_OBSERVE=1 "$PR" detect "$STATE" t1
+  assert_contains "$(field scan_error)" "does not start with a readable session record" "a parent log that names no session must be reported, not taken for the worker's"
   pass "a sub-agent's session log in the same copy is never read as the worker's: the worker's log is found through it and read on from where it was, and one that cannot be traced is reported"
 }
 

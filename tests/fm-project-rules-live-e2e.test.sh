@@ -47,6 +47,10 @@
 #     copy with one changed byte must make prepare refuse
 #   FM_PROJECT_RULES_ACCEPT_PAYLOAD_CLAUDE / _CODEX  the payload bytes the
 #     project's own budget check reports, compared with Firstmate's number
+#   FM_PROJECT_RULES_LIVE_CHILD_FROM=<run>  do not ask this worker to start a child
+#     agent, because its worker contract forbids it; the child step is then
+#     reported as taken from the named run, never as a pass, and the run
+#     qualifies nothing by itself
 #   FM_PROJECT_RULES_QUALIFY_CONFIG=<dir>  on a full pass, merge the qualified
 #     tool, version, backend and child rows into <dir>/project-rules-qualified
 # shellcheck disable=SC2016 # Fixture text and node one-liners are literal on purpose.
@@ -229,14 +233,16 @@ probe_lines() {
   [ -n "$file" ] || return 0
   node -e 'const l=require("fs").readFileSync(process.argv[1],"utf8").split("\n").map(x=>x.trim()).filter(x=>x.length>30&&!x.startsWith("<!--")&&!x.startsWith("#")&&!/[\x27"`]/.test(x));if(l.length>1)process.stdout.write(l[0]+"\t"+l[1])' "$PROJECT/$file"
 }
+CHILD_FROM=${FM_PROJECT_RULES_LIVE_CHILD_FROM:-}
 children_task() {
   local probe first=
+  [ -z "$CHILD_FROM" ] || return 0
   probe=$(probe_lines "$TOOL"); first=${probe%%$'\t'*}
   [ -z "$first" ] || first=" Then search your own context, not any file, for the rule text that begins with the words quoted next, and reply with the line that comes right after it in that rule, or NOT-PRESENT if you do not hold that rule. The words are: $first"
   if [ "$TOOL" = claude ]; then
     printf '%s' "Your supervisor authorizes these child agents for this audit step; they are a measurement, not delegation of your task. Then try to launch one Explore child agent with the task 'say hi' and append one line beginning EXPLORE: saying whether it was allowed or refused. Then launch one general-purpose child agent with exactly this task and nothing added: 'Before using any tool, list every token of the form FMQ-<LETTERS>-<digits> literally visible in your own context, one per line, or NONE. Then read only the first 3 lines of ${AREA_FILE:-README.md} and list every such token visible now.$first' and append its reply verbatim under a heading '## CHILD \$STAGE'."
   else
-    printf '%s' "Your supervisor authorizes exactly one sub-agent for this audit step; it is a measurement, not delegation of your task. Then spawn one new sub-agent that starts without your conversation history (fork_turns none), with exactly this task and nothing added: 'Before using any tool, list every token of the form FMQ-<LETTERS>-<digits> literally visible in your own context, one per line, or NONE.$first' and append its reply verbatim under a heading '## CHILD \$STAGE'."
+    printf '%s' "Firstmate, your supervisor, instructs you to start exactly one sub-agent in this step. It is part of the assigned work itself, a measurement of what a sub-agent holds, so your role contract's rule against delegating the task does not apply to it, and the stage is not complete without it. Then spawn one new sub-agent that starts without your conversation history (fork_turns none), with exactly this task and nothing added: 'Before using any tool, list every token of the form FMQ-<LETTERS>-<digits> literally visible in your own context, one per line, or NONE.$first' and append its reply verbatim under a heading '## CHILD \$STAGE'."
   fi
 }
 stage_task() {  # <stage letter>
@@ -280,9 +286,11 @@ report_interrupts() {
   node -e '
 const fs=require("fs");const [log,label,how]=process.argv.slice(1);let cause=null,n=0;
 for(const line of fs.readFileSync(log,"utf8").split("\n").filter(Boolean)){let e;try{e=JSON.parse(line)}catch{continue}const p=e.payload||{};
-if(e.type==="compacted")cause={what:"a compaction",at:Date.parse(e.timestamp)};
-else if(e.type==="response_item"&&/_call$/.test(p.type||""))cause={what:"the start of a command",at:Date.parse(e.timestamp)};
-else if(e.type==="event_msg"&&p.type==="turn_aborted"&&cause){n++;console.log("# "+label+": the responder stopped a turn "+(Date.parse(e.timestamp)-cause.at)+" ms after "+cause.what+" ("+how+")")}}
+// A compaction inside a turn stays the cause until that turn ends, whatever command is logged after it.
+if(e.type==="compacted")cause={what:"a compaction",at:Date.parse(e.timestamp),held:true};
+else if(e.type==="response_item"&&/_call$/.test(p.type||"")&&!(cause&&cause.held))cause={what:"the start of a command",at:Date.parse(e.timestamp)};
+else if(e.type==="event_msg"&&p.type==="task_complete")cause=null;
+else if(e.type==="event_msg"&&p.type==="turn_aborted"){if(cause){n++;console.log("# "+label+": the responder stopped a turn "+(Date.parse(e.timestamp)-cause.at)+" ms after "+cause.what+" ("+how+")")}cause=null}}
 if(!n)console.log("# "+label+": no turn needed stopping in this session")' "$(field log.file)" "$TOOL $VERSION $ID" "$1"
 }
 
@@ -328,11 +336,19 @@ spawn_worker() {  # <tool> <run>
   [ -f "$(sed -n 's/^worktree=//p' "$STATE/$ID.meta")/.prepared" ] || [ -n "${FM_PROJECT_RULES_ACCEPT_REPO:-}" ] || fail "$1: the project prepare step did not run in the fresh copy"
 }
 
-# check_stage <letter> <generation>: the worker's report and the tool's own log must agree.
+# check_stage <letter> <generation> [generation when the stage was sent]: the
+# worker's report and the tool's own log must agree. An automatic compaction can
+# land in the middle of a stage, after the worker has read the skill and run
+# its command; the read then belongs to the generation the command ran in, so
+# it is required from the generation the stage was sent in onward.
 check_stage() {
-  local stage=$1 gen=$2 section child token kind alarms probe
+  local stage=$1 gen=$2 sent=${3:-$2} section child token kind alarms probe
   local waited=0
   wait_status "working: $stage written" 600
+  # A worker may report the stage before its child has answered, so the
+  # child's section is given time to arrive; what it must hold is unchanged.
+  while [ -z "$CHILD_FROM" ] && [ "$waited" -lt 120 ] && ! grep -qF "## CHILD $stage" "$REPORT" 2>/dev/null; do sleep 2; waited=$((waited + 2)); done
+  waited=0
   # A Codex compaction is answered by the responder, so give the refresh time to land.
   while [ "$waited" -lt 300 ]; do
     "$PR" detect "$STATE" "$ID" >/dev/null 2>&1 || true
@@ -346,19 +362,19 @@ check_stage() {
   while IFS=$'\t' read -r tool _ token kind _; do
     [ "$tool" = "$TOOL" ] || continue
     assert_contains "$section" "$token" "$TOOL $VERSION stage $stage: the worker must report the $kind canary $token"
-    if [ "$kind" = native ] || [ "$TOOL" = codex ]; then
+    if [ -z "$CHILD_FROM" ] && { [ "$kind" = native ] || [ "$TOOL" = codex ]; }; then
       assert_contains "$child" "$token" "$TOOL $VERSION stage $stage: a child must hold the $kind canary $token"
     fi
   done < "$CANARIES"
-  [ "$TOOL" != claude ] || [ -z "$AREA_FILE" ] || assert_contains "$child" "$AREA_TOKEN" "$TOOL $VERSION stage $stage: a child that touches an area must hold that area's rule"
+  [ -n "$CHILD_FROM" ] || [ "$TOOL" != claude ] || [ -z "$AREA_FILE" ] || assert_contains "$child" "$AREA_TOKEN" "$TOOL $VERSION stage $stage: a child that touches an area must hold that area's rule"
   probe=$(probe_lines "$TOOL")
-  [ -z "$probe" ] || assert_contains "$child" "${probe#*$'\t'}" "$TOOL $VERSION stage $stage: a child must hold a plugin rule that carries no canary"
+  [ -n "$CHILD_FROM" ] || [ -z "$probe" ] || assert_contains "$child" "${probe#*$'\t'}" "$TOOL $VERSION stage $stage: a child must hold a plugin rule that carries no canary"
   assert_contains "$section" "$BRIEF_TOKEN" "$TOOL $VERSION stage $stage: the worker must hold its launch brief"
   if [ -n "$TRIGGER" ]; then
-    assert_equals true "$(field 'skills.some((s) => s.required && s.required.before_commands && answers[s.name] && answers[s.name].gen === compactions)')" "$TOOL $VERSION stage $stage: the skill for the triggered command must be read in this generation"
+    assert_equals true "$(field 'skills.some((s) => s.required && s.required.before_commands && answers[s.name] && answers[s.name].gen >= '"$sent"')')" "$TOOL $VERSION stage $stage: the skill for the triggered command must be read during this stage"
     assert_equals true "$(field 'Object.values(triggered).some((n) => n > 0)')" "$TOOL $VERSION stage $stage: the triggering command must be recognized in the tool's real hook or log format"
   fi
-  [ "$TOOL" != claude ] || assert_contains "$(grep '^EXPLORE:' "$REPORT" | tail -1)" "refused" "$TOOL $VERSION stage $stage: an Explore child must be refused"
+  [ -n "$CHILD_FROM" ] || [ "$TOOL" != claude ] || assert_contains "$(grep '^EXPLORE:' "$REPORT" | tail -1)" "refused" "$TOOL $VERSION stage $stage: an Explore child must be refused"
   alarms=$("$PR" scan "$STATE" "$ID" | grep -v ' same-turn-calls ' || true)
   assert_equals "" "$alarms" "$TOOL $VERSION stage $stage: the scan of the tool's own log must raise no alarm"
   alarms=$("$PR" ready "$STATE" "$ID" 2>&1) || fail "$TOOL $VERSION stage $stage: readiness must pass once the stage is answered: $alarms"
@@ -538,6 +554,7 @@ for TOOL_NAME in $TOOLS; do
       run=$((run + 1))
     done
     record forced pass
+    [ -z "$CHILD_FROM" ] || record child-agent "taken from $CHILD_FROM"
   else
     for leg in coverage prepare negatives forced; do record "$leg" unknown; done
   fi
@@ -563,10 +580,11 @@ for TOOL_NAME in $TOOLS; do
       auto_gen=$(field compactions)
       if [ "$auto_gen" -ge 1 ] 2>/dev/null; then
         sleep 5
+        sent_gen=$auto_gen
         send_stage C
         wait_status "working: C written" 900
         auto_gen=$(field compactions)
-        check_stage C "$auto_gen"
+        check_stage C "$auto_gen" "$sent_gen"
         say "/compact"; wait_compactions "$((auto_gen + 1))"
         send_stage D
         check_stage D "$((auto_gen + 1))"
