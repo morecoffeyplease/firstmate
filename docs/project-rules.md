@@ -219,3 +219,5 @@ Run the guard again after a tool update.
 - Supervisors are not workers and receive nothing here.
 - The operator's own global instruction files are not part of a project's rules.
 - Codex workers run with hooks off, so a project's own Codex hooks do not run for them.
+- A command pattern is matched on the text of a command, so it holds a worker that forgot a skill, not one that disguises the command.
+- A command run by a Codex sub-agent is not read.

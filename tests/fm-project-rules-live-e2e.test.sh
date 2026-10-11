@@ -216,6 +216,19 @@ wait_compactions() {  # <count>
   done
   fail "$TOOL $VERSION: the forced compaction never appeared on record"
 }
+# A slash command typed while a Codex turn is still running is discarded, and a
+# worker can append its status line a few seconds before its turn ends. The
+# forced compaction is therefore requested only once the tool's own log shows
+# the turn over.
+compact_now() {
+  local waited=0
+  while [ "$TOOL" = codex ] && [ "$waited" -lt 60 ]; do
+    "$PR" detect "$STATE" "$ID" >/dev/null 2>&1 || true
+    [ "$(field log.busy)" = true ] || break
+    sleep 1; waited=$((waited + 1))
+  done
+  say "/compact"
+}
 wait_status() {  # <line> <seconds>
   local waited=0
   while [ "$waited" -lt "$2" ]; do
@@ -545,7 +558,7 @@ for TOOL_NAME in $TOOLS; do
         check_prepare; check_sizes; record prepare pass
         check_negatives "$TOOL_NAME"; record negatives pass
       fi
-      say "/compact"; wait_compactions 1
+      compact_now; wait_compactions 1
       send_stage B
       check_stage B 1
       report_interrupts "through bin/fm-control.sh"
@@ -585,7 +598,7 @@ for TOOL_NAME in $TOOLS; do
         wait_status "working: C written" 900
         auto_gen=$(field compactions)
         check_stage C "$auto_gen" "$sent_gen"
-        say "/compact"; wait_compactions "$((auto_gen + 1))"
+        compact_now; wait_compactions "$((auto_gen + 1))"
         send_stage D
         check_stage D "$((auto_gen + 1))"
         report_interrupts "through keys typed into the replayed pane"

@@ -90,10 +90,40 @@ The Claude and Codex results come from two invocations on the same engine code, 
 Automatic compaction was produced by lowering the tool's own limit on a replay of the launch `fm-spawn` builds: `CLAUDE_CODE_AUTO_COMPACT_WINDOW=160000` for Claude and `-c model_auto_compact_token_limit=60000` for Codex.
 An earlier Claude session under the same setting compacted twice by itself and then once on request, and passed at generation 3.
 
+## Codex responder
+
+Measured on 2026-10-11 with codex-cli 0.161.0 and 0.162.1 on the Herdr backend, from the tool's own session log.
+
+- A tool call is logged at its start: its `custom_tool_call` or `function_call` record precedes its output record, so a command is seen before it finishes.
+- A sub-agent writes its own session log in the same working directory; its first record carries `thread_source` `subagent` and a `parent_thread_id`, and the spawning session's log file name ends with that id.
+- A forced `/compact` on an idle worker wrote its `compacted` and `task_complete` records 4 ms apart, and an automatic compaction inside a turn was followed by the next tool call about 4 seconds later.
+- A `/compact` typed about a second before a turn ended produced no compaction.
+
+The live guard times a real interrupt, and reports every turn the responder stopped, from that log.
+These lines are from its run on codex-cli 0.161.0 against a throwaway clone of ButterTrip at 88aced24 with `--model gpt-6-luna --effort medium`.
+
+```console
+ok - codex 0.161.0: an interrupt through fm-control stops a running turn: the turn stopped 419 ms after the interrupt was sent, by the tool log; fm-control returned after 614 ms
+# codex 0.161.0 rules-codex-1: the responder stopped a turn 568 ms after the start of a command (through bin/fm-control.sh)
+# codex 0.161.0 auto-codex-1: the responder stopped a turn 391 ms after a compaction (through keys typed into the replayed pane)
+```
+
+Across that day's sessions on both versions the interrupt through `bin/fm-control.sh` took 419 to 540 ms, a turn that compacted was stopped 305 to 521 ms after the compaction record, and a turn that started a required-skill command without its skill was stopped through `bin/fm-control.sh` 568 to 672 ms after the command's record.
+The command in the second line was such a command, started after a forced compaction; the worker then read the skill, ran the command again, and the stage raised no alarm.
+
+## ButterTrip's own declared list
+
+On 2026-10-11 the guard ran against a throwaway clone of ButterTrip at 88aced24, with that project's own declared list, its real prepare step, and this machine's plugin store.
+Claude 2.1.296 as `claude-opus-5-5` and Codex 0.162.1 as `gpt-6.1-sol` passed every leg, in 2 sessions per live leg.
+The Claude forced legs ran one commit before its automatic leg.
+Codex 0.162.1 as `gpt-6-luna` passed every leg with `FM_PROJECT_RULES_LIVE_CHILD_FROM` naming the `gpt-6.1-sol` run, so its child step is taken from that run and is not a pass of its own.
+Its forced and automatic legs come from separate invocations, and one further automatic session raised `worked-before-refresh` for the mistyped helper command described under "Not yet measured".
+The rendered block was 37,884 bytes for Claude and 64,588 for Codex.
+
 ## Not yet measured
 
-A child's own compaction, plugin-defined Claude child types, and block sizes above 79 KB.
-The live guard has not yet run against ButterTrip's own declared list, which is the acceptance run that lifts the pause.
+A child's own compaction, a command run by a Codex sub-agent, plugin-defined Claude child types, and block sizes above 79 KB.
+A mistyped helper command that runs nothing is still counted as project work before a stage is answered; `gpt-6-luna` did this in 2 of its sessions.
 
 ## Suites
 
