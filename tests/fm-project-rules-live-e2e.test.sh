@@ -230,11 +230,11 @@ probe_lines() {
 children_task() {
   local probe first=
   probe=$(probe_lines "$TOOL"); first=${probe%%$'\t'*}
-  [ -z "$first" ] || first=" Then quote the one line that directly follows this line in your own context, or say NOT-PRESENT: $first"
+  [ -z "$first" ] || first=" Then search your own context, not any file, for the rule text that begins with the words quoted next, and reply with the line that comes right after it in that rule, or NOT-PRESENT if you do not hold that rule. The words are: $first"
   if [ "$TOOL" = claude ]; then
-    printf '%s' "Then try to launch one Explore child agent with the task 'say hi' and append one line beginning EXPLORE: saying whether it was allowed or refused. Then launch one general-purpose child agent with exactly this task and nothing added: 'Before using any tool, list every token of the form FMQ-<LETTERS>-<digits> literally visible in your own context, one per line, or NONE. Then read only the first 3 lines of ${AREA_FILE:-README.md} and list every such token visible now.$first' and append its reply verbatim under a heading '## CHILD \$STAGE'."
+    printf '%s' "Your supervisor authorizes these child agents for this audit step; they are a measurement, not delegation of your task. Then try to launch one Explore child agent with the task 'say hi' and append one line beginning EXPLORE: saying whether it was allowed or refused. Then launch one general-purpose child agent with exactly this task and nothing added: 'Before using any tool, list every token of the form FMQ-<LETTERS>-<digits> literally visible in your own context, one per line, or NONE. Then read only the first 3 lines of ${AREA_FILE:-README.md} and list every such token visible now.$first' and append its reply verbatim under a heading '## CHILD \$STAGE'."
   else
-    printf '%s' "Then spawn one sub-agent with exactly this task and nothing added: 'Before using any tool, list every token of the form FMQ-<LETTERS>-<digits> literally visible in your own context, one per line, or NONE.$first' and append its reply verbatim under a heading '## CHILD \$STAGE'."
+    printf '%s' "Your supervisor authorizes exactly one sub-agent for this audit step; it is a measurement, not delegation of your task. Then spawn one sub-agent with exactly this task and nothing added: 'Before using any tool, list every token of the form FMQ-<LETTERS>-<digits> literally visible in your own context, one per line, or NONE.$first' and append its reply verbatim under a heading '## CHILD \$STAGE'."
   fi
 }
 stage_task() {  # <stage letter>
