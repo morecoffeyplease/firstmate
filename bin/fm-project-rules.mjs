@@ -34,6 +34,7 @@ const q = (text) => `'${String(text).replace(/'/g, `'\\''`)}'`;
 const recordPath = (state, id) => path.join(state, `${id}.project-rules`);
 const dirPath = (state, id) => `${recordPath(state, id)}.d`;
 const helperCommand = (R, verb, ...rest) => [q(HELPER), verb, q(R.state), q(R.task), ...rest].join(" ");
+const commandMessage = (before, command, after = "") => `${before}\n${command}${after ? `\n${after}` : ""}`;
 
 function sleep(ms) {
   Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
@@ -315,9 +316,9 @@ function renderBlock(R, resolved, table) {
     "The files below are this repository's own instructions, delivered in full because your tool does not load them by itself.",
     "They bind your work exactly as the files themselves do, and they stay here after any context compaction.",
     "",
-    `- Before your first project command or edit, and again right after any context compaction, run: ${helperCommand(R, "next")}`,
+    commandMessage("- Before your first project command or edit, and again right after any context compaction, run:", helperCommand(R, "next")),
     "  Do what it prints before anything else.",
-    `- Your launch brief can be read again at any time with: ${helperCommand(R, "serve", "brief")}`,
+    commandMessage("- Your launch brief can be read again at any time with:", helperCommand(R, "serve", "brief")),
     "- Load a required skill only through its command below, at the moment named.",
     "- A child agent does not receive this block. Use only general-purpose children, and run required-skill commands such as product tests yourself, not in a child.",
   ];
@@ -335,7 +336,7 @@ function renderBlock(R, resolved, table) {
       let when = "at start, as part of admission";
       if (skill.required.before_commands) when = `before you run any command matching ${skill.required.before_commands.map((pattern) => `\`${pattern}\``).join(" or ")}`;
       if (skill.required.on_paths) when = `before you edit any path matching ${skill.required.on_paths.join(", ")}`;
-      lines.push(`- ${skill.name}: ${when}. Load it with: ${helperCommand(R, "serve", q(skill.name))}`);
+      lines.push(commandMessage(`- ${skill.name}: ${when}. Load it with:`, helperCommand(R, "serve", q(skill.name))));
     }
   }
   lines.push("", "## Receipt rows (quote one only when the helper asks for it by number)", "");
@@ -512,13 +513,13 @@ function owed(R) {
   const steps = [];
   if (!stage.closed) {
     if (stage.row < 0) steps.push("The receipt table is used up; tell your supervisor this task needs a relaunch.");
-    else if (!stage.acked) steps.push(`Quote receipt row ${String(stage.row).padStart(2, "0")} from the end of your project rules block: ${helperCommand(R, "ack")} <the 6-character code>`);
+    else if (!stage.acked) steps.push(commandMessage(`Quote receipt row ${String(stage.row).padStart(2, "0")} from the end of your project rules block, replacing CODE with its six-character code:`, `${helperCommand(R, "ack")} CODE`));
     for (const skill of startSkills(R).filter((entry) => !answered(R, entry.name))) {
-      steps.push(`Load required skill ${skill.name}: ${helperCommand(R, "serve", q(skill.name))}`);
+      steps.push(commandMessage(`Load required skill ${skill.name}:`, helperCommand(R, "serve", q(skill.name))));
     }
     // The brief comes last and only once everything else is recorded, so a
     // worker that has not finished its reads has no task to start on.
-    if (!steps.length && !stage.brief) steps.push(`${stage.gen ? "Read your task brief again" : "Everything required is recorded. Receive your task brief"}: ${helperCommand(R, "serve", "brief")}`);
+    if (!steps.length && !stage.brief) steps.push(commandMessage(`${stage.gen ? "Read your task brief again" : "Everything required is recorded. Receive your task brief"}:`, helperCommand(R, "serve", "brief")));
   }
   return steps;
 }
@@ -530,14 +531,17 @@ function next([state, id]) {
     const steps = owed(R);
     if (steps.length) {
       process.stdout.write(`Project rules admission (stage ${R.stage.name}) is OPEN. Do these now, in order, before any other action:\n`);
-      steps.forEach((step, index) => process.stdout.write(`${index + 1}. ${step}\n`));
+      steps.forEach((step, index) => {
+        const [instruction, command] = step.split("\n");
+        process.stdout.write(`${index + 1}. ${instruction}\n${command}\n`);
+      });
       process.stdout.write("Each read is finished only when the helper prints RECORDED. Admission stays OPEN until this command prints that nothing is owed, so run it again when you think you are done.\n");
       return;
     }
     process.stdout.write("Project rules: nothing is owed right now.\n");
     for (const skill of R.skills.filter((entry) => entry.required && !entry.required.at && !answered(R, entry.name))) {
       const when = skill.required.before_commands ? `running any command matching ${skill.required.before_commands.join(" or ")}` : `editing any path matching ${skill.required.on_paths.join(", ")}`;
-      process.stdout.write(`Before ${when}, load ${skill.name}: ${helperCommand(R, "serve", q(skill.name))}\n`);
+      process.stdout.write(`${commandMessage(`Before ${when}, load ${skill.name}:`, helperCommand(R, "serve", q(skill.name)))}\n`);
     }
   });
 }
@@ -558,7 +562,7 @@ function ack([state, id, code]) {
     }
     stage.acked = true;
     settle(R);
-    process.stdout.write(`Receipt row recorded.${owed(R).length ? ` Next: ${helperCommand(R, "next")}` : " Admission is complete."}\n`);
+    process.stdout.write(`${owed(R).length ? commandMessage("Receipt row recorded. Next:", helperCommand(R, "next")) : "Receipt row recorded. Admission is complete."}\n`);
   });
 }
 
@@ -591,14 +595,14 @@ function serve([state, id, what, given]) {
     if (!R) die("no project rules are declared for this task");
     noteHelper(R);
     if (what === "brief" && !R.stage.closed && (!R.stage.acked || !startSkills(R).every((skill) => answered(R, skill.name)))) {
-      die(`your task brief is handed over once the receipt row and every required skill are recorded; run: ${helperCommand(R, "next")}`);
+      die(commandMessage("Your task brief is handed over once the receipt row and every required skill are recorded; run:", helperCommand(R, "next")));
     }
     const parts = partsOf(R, what);
     const code = (part) => crypto.createHmac("sha256", R.secret).update(`${what}|${R.compactions}|${part}`).digest("hex").slice(0, 8);
     let done = 0;
     if (given) {
       done = parts.findIndex((_, index) => code(index + 1) === given) + 1;
-      if (!done) die(`that code does not belong to ${what} at this stage; start again with: ${helperCommand(R, "serve", q(what))}`);
+      if (!done) die(commandMessage(`That code does not belong to ${what} at this stage; start again with:`, helperCommand(R, "serve", q(what))));
     }
     if (done === parts.length) return process.stdout.write(`RECORDED: ${what} is already fully read (${parts.length} part(s)).\n`);
     const part = done + 1;
@@ -609,10 +613,11 @@ function serve([state, id, what, given]) {
       if (what === "brief") R.stage.brief = true;
       else R.answers[what] = { gen: R.compactions, at: new Date().toISOString() };
       settle(R);
-      return process.stdout.write(`=== ${what}: PART ${part} OF ${parts.length}, the last part. ===\n${parts[part - 1]}RECORDED: ${what} is fully read (${parts.length} part(s)).${owed(R).length ? ` Next, run: ${helperCommand(R, "next")}` : " Nothing more is owed."}\n`);
+      const next = owed(R).length ? commandMessage("Next, run:", helperCommand(R, "next")) : "Nothing more is owed.";
+      return process.stdout.write(`=== ${what}: PART ${part} OF ${parts.length}, the last part. ===\n${parts[part - 1]}RECORDED: ${what} is fully read (${parts.length} part(s)).\n${next}\n`);
     }
     const run = helperCommand(R, "serve", q(what), code(part));
-    process.stdout.write(`=== ${what}: PART ${part} OF ${parts.length}. NOT FINISHED until the helper prints RECORDED; the exact next command is on the last line. ===\n${parts[part - 1]}=== PART ${part} OF ${parts.length} - NOT FINISHED. Nothing is recorded yet. Run this exact command now: ${run} ===\n`);
+    process.stdout.write(`=== ${what}: PART ${part} OF ${parts.length}. NOT FINISHED until the helper prints RECORDED; the exact next command is on the last line. ===\n${parts[part - 1]}=== PART ${part} OF ${parts.length} - NOT FINISHED. Nothing is recorded yet. Run this exact command now:\n${run}\n`);
   });
 }
 
@@ -633,7 +638,7 @@ function hook([state, id, event]) {
         R.hook_compactions = (R.hook_compactions ?? 0) + 1;
         if (R.hook_compactions > R.compactions) openStage(R, "compact");
       }
-      if (owed(R).length) process.stdout.write(`Project rules admission (stage ${R.stage.name}) is open. Before any other action run: ${helperCommand(R, "next")}\n`);
+      if (owed(R).length) process.stdout.write(`${commandMessage(`Project rules admission (stage ${R.stage.name}) is open. Before any other action run:`, helperCommand(R, "next"))}\n`);
     });
     return;
   }
@@ -650,7 +655,7 @@ function hook([state, id, event]) {
     if (!R) return "";
     ours = helperCall(command, R);
     if (!R.stage.closed && !ours && !["Read", "Glob", "Grep"].includes(tool)) {
-      return `Project rules admission (stage ${R.stage.name}) is open, so this tool call is refused. Run: ${helperCommand(R, "next")}`;
+      return commandMessage(`Project rules admission (stage ${R.stage.name}) is open, so this tool call is refused. Run:`, helperCommand(R, "next"));
     }
     if (["Agent", "Task"].includes(tool)) {
       const type = input.subagent_type || "general-purpose";
@@ -669,7 +674,7 @@ function hook([state, id, event]) {
       R.triggered[skill.name] = (R.triggered[skill.name] ?? 0) + 1;
       // A child never inherits the worker's own read of a skill.
       if (payload.agent_id) return `This requires skill ${skill.name}, which a child agent cannot be shown to hold. Do it from the main worker.`;
-      if (!answered(R, skill.name)) return `This requires skill ${skill.name}, not yet loaded since the last compaction. Run: ${helperCommand(R, "serve", q(skill.name))}`;
+      if (!answered(R, skill.name)) return commandMessage(`This requires skill ${skill.name}, not yet loaded since the last compaction. Run:`, helperCommand(R, "serve", q(skill.name)));
     }
     return "";
   });
@@ -794,12 +799,12 @@ function actions(R, caught) {
   const stage = R.stage;
   const say = [];
   if (R.compact_nudge === stage.gen && !stage.closed && !R.first_helper?.[stage.gen]) {
-    say.push(`Your context was compacted (stage ${stage.name}). Before any other action run: ${helperCommand(R, "next")} It confirms your rules again and lists the required skills to load again. Then carry on with your task.`);
+    say.push(commandMessage(`Your context was compacted (stage ${stage.name}). Before any other action run:`, helperCommand(R, "next"), "It confirms your rules again and lists the required skills to load again. Then carry on with your task."));
   }
   for (const [name, gen] of Object.entries(R.nudges ?? {})) {
     if (gen !== R.compactions || answered(R, name)) continue;
     const edit = R.skills.find((skill) => skill.name === name)?.required?.on_paths;
-    say.push(`Required skill ${name} is not loaded in this stage, and what you just started needs it. Load it now with: ${helperCommand(R, "serve", q(name))} Then ${edit ? "check that edit against it" : "run the command again"}, and carry on with your task.`);
+    say.push(commandMessage(`Required skill ${name} is not loaded in this stage, and what you just started needs it. Load it now with:`, helperCommand(R, "serve", q(name)), `Then ${edit ? "check that edit against it" : "run the command again"}, and carry on with your task.`));
     if (caught) for (const entry of R.violations) if (entry.skill === name && entry.detail === `${name} c${gen}`) entry.caught ??= now();
   }
   delete R.compact_nudge;
@@ -807,7 +812,7 @@ function actions(R, caught) {
   // A worker in the middle of a turn is stopped first, so the message is the
   // next thing it reads. The turn then counts as over until the log shows a
   // new one, so two actions close together interrupt once.
-  const lines = say.map((text) => `fm-steer: ${text}`);
+  const lines = say.flatMap((text) => text.split("\n").map((line) => `fm-steer: ${line}`));
   if (lines.length && R.log.busy) lines.unshift("fm-interrupt");
   if (lines.length) R.log.busy = false;
   return lines;
@@ -1118,7 +1123,7 @@ function ready([state, id]) {
       // being reported to the supervisor does not settle it.
       const rerun = Date.parse(R.ran_after_read?.[skill.name] ?? "");
       const skipped = R.violations.some((entry) => entry.kind === "trigger-skipped" && entry.detail === `${skill.name} c${R.compactions}` && !(answer && rerun >= Date.parse(answer.at)));
-      if ((touched && !answered(R, skill.name)) || skipped) open.push(`required skill ${skill.name} was due and is not loaded: ${helperCommand(R, "serve", q(skill.name))}`);
+      if ((touched && !answered(R, skill.name)) || skipped) open.push(commandMessage(`required skill ${skill.name} was due and is not loaded:`, helperCommand(R, "serve", q(skill.name))));
     }
     return open;
   });
